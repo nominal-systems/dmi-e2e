@@ -25,14 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout dmi-e2e
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: dmi-e2e
 
       # Requires a secret PAT (DMI_API_REPO_TOKEN) that can read the private dmi-api repo. The
       # default GITHUB_TOKEN is scoped to this repo only and cannot.
       - name: Checkout dmi-api
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: nominal-systems/dmi-api
           ref: ${{ env.DMI_API_REF }}
@@ -40,7 +40,7 @@ jobs:
           path: dmi-api
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
 
