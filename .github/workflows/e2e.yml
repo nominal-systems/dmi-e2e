@@ -1,0 +1,71 @@
+name: e2e
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20.x'
+  # dmi-api is a separate private repo. CI checks it out and runs it in-process, the same way the
+  # harness does locally. An alternative — pulling the published image from the ACR that
+  # dmi-api's build-and-push-to-registry.yml targets — is cleaner (tests the shipped artifact) but
+  # needs registry-pull credentials as secrets; revisit once those exist. See README / plan log.
+  DMI_API_REF: main
+
+jobs:
+  harness:
+    name: Integration harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dmi-e2e
+        uses: actions/checkout@v4
+        with:
+          path: dmi-e2e
+
+      # Requires a secret PAT (DMI_API_REPO_TOKEN) that can read the private dmi-api repo. The
+      # default GITHUB_TOKEN is scoped to this repo only and cannot.
+      - name: Checkout dmi-api
+        uses: actions/checkout@v4
+        with:
+          repository: nominal-systems/dmi-api
+          ref: ${{ env.DMI_API_REF }}
+          token: ${{ secrets.DMI_API_REPO_TOKEN }}
+          path: dmi-api
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install harness dependencies
+        working-directory: dmi-e2e
+        run: npm install --no-audit --no-fund
+
+      # dmi-api resolves @nominal-systems/* from GitHub Packages; needs a read:packages token.
+      - name: Install dmi-api dependencies
+        working-directory: dmi-api
+        run: npm install --no-audit --no-fund
+        env:
+          GHP_TOKEN: ${{ secrets.GHP_TOKEN }}
+
+      - name: Typecheck harness
+        working-directory: dmi-e2e
+        run: npm run typecheck
+
+      - name: Run the harness
+        working-directory: dmi-e2e
+        run: npm run test:harness
+        env:
+          DMI_API_DIR: ${{ github.workspace }}/dmi-api
+
+      - name: Dump container logs on failure
+        if: failure()
+        working-directory: dmi-e2e
+        run: docker compose logs --no-color --tail=200
