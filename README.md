@@ -136,9 +136,10 @@ scenarios/
 
 ## Findings
 
-The harness was built to test tenant isolation. Reading dmi-api's source turned up five distinct
-places where it appears to be missing. **None are fixed here** — that is out of scope, and they
-want a considered fix plus a data-exposure review, not a drive-by patch.
+Tenant isolation was the first scenario this harness exercised — not the reason it exists (it is a
+general-purpose real-services suite for the platform). That first pass immediately turned up six
+distinct places where dmi-api's isolation or auth is missing. **None are fixed here** — that is out
+of scope, and they want a considered fix plus a data-exposure review, not a drive-by patch.
 
 Each finding has a test that asserts the *correct* behaviour and is marked `it.failing`. That keeps
 CI green while the defect exists, and turns the test red the moment someone fixes it — at which
