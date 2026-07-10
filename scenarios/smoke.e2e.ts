@@ -45,12 +45,22 @@ describe('smoke', () => {
     expect([401, 403]).toContain(response.status)
   })
 
-  it('rejects an unauthenticated POST /users', async () => {
+  /* DEFECT F6 — dmi-api's HTTP Basic auth is non-functional. `BasicStrategy`
+   * (src/common/auth/basic.strategy.ts) is defined but appears in no module's `providers`, so
+   * `@nestjs/passport` never registers it and every `POST /users` / `GET /users` throws
+   * 500 "Unknown authentication strategy 'basic'" before any auth logic runs. A correct app
+   * rejects an unauthenticated create with 401. This blocks the documented user-provisioning
+   * flow; the seeder works around it with a direct SQL insert (see src/sql.ts). The existing
+   * dmi-api "e2e" specs stub the guard, which is why this went unnoticed. Remove `.failing`
+   * once Basic auth is registered. */
+  it.failing('rejects an unauthenticated POST /users', async () => {
     const response = await api.post('/users', { email: 'nobody@example.test', password: 'nope' })
     expect(response.status).toBe(401)
   })
 
-  it('rejects the wrong admin password on POST /users', async () => {
+  /* DEFECT F6 (same root cause) — with the strategy unregistered, even a well-formed Basic header
+   * carrying the wrong password 500s instead of a clean 401. */
+  it.failing('rejects the wrong admin password on POST /users', async () => {
     const response = await api
       .withBasicAuth(env.admin.username, 'definitely-not-the-password')
       .post('/users', { email: 'nobody@example.test', password: 'nope' })

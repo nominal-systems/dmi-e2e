@@ -144,23 +144,34 @@ Each finding has a test that asserts the *correct* behaviour and is marked `it.f
 CI green while the defect exists, and turns the test red the moment someone fixes it — at which
 point the `.failing` marker should be deleted in the same commit.
 
-| # | Route | Defect | Status |
-|---|---|---|---|
-| F1 | `GET /events` | `getEventsForOrganization` takes an `organization` and never reads it. Returns **every tenant's** events. | SUSPECTED |
-| F2 | `GET /reports/*` | `ReportsController` has **no guard**, and there is no global guard. Reachable **unauthenticated**. | SUSPECTED |
-| F3 | `GET /reports/:id` | `getReport(id, _organization)` ignores the organization (has a `TODO` admitting it). | SUSPECTED |
-| F4 | `POST /orders`, `POST /integrations` | Neither takes an `@Organization()`; referenced IDs are never checked for ownership. Cross-tenant **writes**. | SUSPECTED |
-| F5 | `GET /orders/:id/report` | `getOrderReport(organization, orderId)` ignores the organization. | SUSPECTED |
+| # | Route | Defect | Observed | Status |
+|---|---|---|---|---|
+| F1 | `GET /events` | `getEventsForOrganization` takes an `organization` and never reads it. Returns **every tenant's** events. | org B → **200**, sees org A's events; counts identical | **CONFIRMED** |
+| F2 | `GET /reports/*` | `ReportsController` has **no guard**, and there is no global guard. Reachable **unauthenticated**. | anon → **200** | **CONFIRMED** |
+| F3 | `GET /reports/:id` | `getReport(id, _organization)` ignores the organization (has a `TODO` admitting it). | org B → **200** | **CONFIRMED** |
+| F4 | `POST /orders`, `POST /integrations` | Neither takes an `@Organization()`; referenced IDs are never checked for ownership. Cross-tenant **writes**. | org B → **201 Created** | **CONFIRMED** |
+| F5 | `GET /orders/:id/report` | `getOrderReport(organization, orderId)` ignores the organization. | org B → **200** | **CONFIRMED** |
+| F6 | `POST /users`, `GET /users` | HTTP Basic auth is unregistered: `BasicStrategy` is in no module's `providers`, so Passport has no `basic` strategy. | any → **500** "Unknown authentication strategy 'basic'" | **CONFIRMED** |
 
 **SUSPECTED** = read from dmi-api source. **CONFIRMED** = reproduced by this suite against a running
-app. As of writing, all five are SUSPECTED: the suite has not yet been executed end-to-end (the
-dmi-api checkout it drives has no dependencies installed — see Requirements). The
-`HARNESS_IMPLEMENTATION_PLAN.md` log tracks their status.
+app. As of the last run, **all six are CONFIRMED** — the suite executed end-to-end against a live
+dmi-api and every defect reproduced with the status codes above. The `HARNESS_IMPLEMENTATION_PLAN.md`
+log records the full probe output.
 
 F1 is the most serious: `GET /events` is reachable with any valid API key, and `event.data` for an
 `order:created` event embeds the whole order — patient name, client name, veterinarian. F2 needs no
 credentials at all, though report IDs are UUIDv4 and so are not enumerable. F4 compounds: on
 success, org B binds its own practice to org A's provider configuration.
+
+F6 is a functional break rather than a data leak, but it blocks the documented user-provisioning
+flow entirely. Because of it, the seeder cannot create users over HTTP; it inserts each user row via
+`sql.ts` (a constant `argon2id` password hash) and then runs the rest of the quickstart — login,
+org, keys, provider config, practice, integration, order — over real HTTP. Only user creation is
+faked.
+
+Correctly scoped, and asserted as ordinary passing tests: `GET /orders/:id` (org B → **403**, *not*
+404), `GET /orders/:id/result.json` (**403**), and all of `/orders`, `/practices`, `/integrations`,
+`/providers/configurations`, `/organizations/:id/keys`.
 
 ### Do not "fix" a red build by relaxing an assertion
 

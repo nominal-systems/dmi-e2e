@@ -55,6 +55,31 @@ export async function insertReport (orderId: string, status = 'REGISTERED'): Pro
   return id
 }
 
+/* F6 workaround. dmi-api's `POST /users` is non-functional — `BasicStrategy` is defined but
+ * registered with Passport nowhere, so the endpoint 500s "Unknown authentication strategy basic"
+ * (see README). Creating a user is the one step of the documented seed flow the harness cannot
+ * drive over HTTP, so it inserts the row directly; everything downstream (login, org, keys,
+ * provider config, practice, integration, orders) stays real HTTP.
+ *
+ * `password` must be an argon2id hash: dmi-api verifies it with `argon2.verify` at
+ * `POST /users/auth`, and its `UserSubscriber` — which would hash a plaintext on insert — is
+ * bypassed by a raw INSERT. The constant below is `argon2id('harness-password')`; the embedded
+ * salt is random but verification is salt- and parameter-independent, so one constant suffices.
+ * Regenerate with: node -e "const a=require('argon2');a.hash('harness-password',{type:a.argon2id}).then(console.log)". */
+export const HARNESS_USER_PASSWORD = 'harness-password'
+const HARNESS_USER_PASSWORD_HASH =
+  '$argon2id$v=19$m=4096,t=3,p=1$L7qY2hNdZ3GO+Sq8UUwtiw$nEzYjyCkVxpn0l6bJUlP0fX965jf8owcWVbUOf+UMvc'
+
+export async function insertUser (email: string): Promise<string> {
+  const id = randomUUID()
+  await query('INSERT INTO `user` (`id`, `email`, `password`) VALUES (?, ?, ?)', [
+    id,
+    email,
+    HARNESS_USER_PASSWORD_HASH,
+  ])
+  return id
+}
+
 export async function countOrdersForOrganization (organizationId: string): Promise<number> {
   const rows = await query<{ count: number }>(
     'SELECT COUNT(*) AS count FROM `order` o' +

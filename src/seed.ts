@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { ApiClient, expectOk } from './api-client'
-import { env } from './env'
+import { HARNESS_USER_PASSWORD, insertUser } from './sql'
 
 /* Drives the developer-quickstart flow over plain HTTP, exactly as an integrator would:
  *
@@ -12,8 +12,6 @@ import { env } from './env'
  * One organization per user is a hard rule in dmi-api ("You already have an organization"), so
  * two tenants means two users. Every name is suffixed uniquely, so repeated runs against a warm
  * database never collide. */
-
-const PASSWORD = 'harness-password'
 
 /* The demo lab is never contacted: dmi-api runs under NODE_ENV=seed, which returns from
  * createOrder before the engine round-trip. `.invalid` is reserved by RFC 2606 and guarantees a
@@ -49,11 +47,12 @@ export async function seedOrganization (root: ApiClient, label: string): Promise
   const suffix = unique(label)
   const email = `harness-${suffix}@example.test`
 
-  const admin = root.withBasicAuth(env.admin.username, env.admin.password)
-  expectOk(await admin.post('/users', { email, password: PASSWORD }), `create user ${email}`)
+  /* F6: dmi-api's POST /users is broken (see sql.insertUser). Insert the user row directly; the
+   * rest of the flow below is real HTTP. */
+  await insertUser(email)
 
   const auth = expectOk<{ token: string }>(
-    await root.post('/users/auth', { email, password: PASSWORD }),
+    await root.post('/users/auth', { email, password: HARNESS_USER_PASSWORD }),
     `authenticate ${email}`,
   )
   const jwt = root.withBearer(auth.token)

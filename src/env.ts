@@ -53,7 +53,7 @@ export interface HarnessEnv {
   manageApp: boolean
   build: boolean
   keepUp: boolean
-  timeouts: { depsReadyMs: number, appReadyMs: number, requestMs: number }
+  timeouts: { depsReadyMs: number, appReadyMs: number, requestMs: number, migrationsMs: number }
 }
 
 const harnessRoot = path.resolve(__dirname, '..')
@@ -95,6 +95,9 @@ export const env: HarnessEnv = {
     depsReadyMs: int('HARNESS_DEPS_READY_MS', 180_000),
     appReadyMs: int('HARNESS_APP_READY_MS', 180_000),
     requestMs: int('HARNESS_REQUEST_MS', 30_000),
+    /* Cold-start migrations are slow: dmi-api ships large data migrations (breed/ref tables,
+     * hundreds of thousands of rows) that TypeORM logs line by line. Generous by default. */
+    migrationsMs: int('HARNESS_MIGRATIONS_MS', 900_000),
   },
 }
 
