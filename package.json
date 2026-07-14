@@ -1,0 +1,27 @@
+{
+  "name": "dmi-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Black-box end-to-end test harness for the DMI platform. Drives a running dmi-api over real HTTP against containerised dependencies.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "jest",
+    "test:harness": "jest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint \"{src,scenarios}/**/*.ts\""
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "mysql2": "^3.11.0",
+    "ts-jest": "^29.3.2",
+    "typescript": "^5.3.3"
+  }
+}
