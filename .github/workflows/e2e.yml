@@ -11,6 +11,12 @@ concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
+# GITHUB_TOKEN needs packages:read to install @nominal-systems/dmi-engine-common once that
+# package grants this repo Actions access (its package settings → "Manage Actions access").
+permissions:
+  contents: read
+  packages: read
+
 env:
   NODE_VERSION: '20.x'
   # dmi-api is a separate private repo. CI checks it out and runs it in-process, the same way the
@@ -29,31 +35,49 @@ jobs:
         with:
           path: dmi-e2e
 
-      # Requires a secret PAT (DMI_API_REPO_TOKEN) that can read the private dmi-api repo. The
-      # default GITHUB_TOKEN is scoped to this repo only and cannot.
+      # The default GITHUB_TOKEN is scoped to this repo only and cannot read dmi-api. An org-owned
+      # GitHub App (contents:read on dmi-api alone) mints a short-lived token per run instead.
+      # Until the app is configured (DMI_CI_APP_ID variable + DMI_CI_APP_PRIVATE_KEY secret), this
+      # step is skipped and the checkout falls back to the legacy DMI_API_REPO_TOKEN PAT.
+      - name: Mint dmi-api checkout token
+        id: app-token
+        if: vars.DMI_CI_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DMI_CI_APP_ID }}
+          private-key: ${{ secrets.DMI_CI_APP_PRIVATE_KEY }}
+          owner: nominal-systems
+          repositories: dmi-api
+
       - name: Checkout dmi-api
         uses: actions/checkout@v5
         with:
           repository: nominal-systems/dmi-api
           ref: ${{ env.DMI_API_REF }}
-          token: ${{ secrets.DMI_API_REPO_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.DMI_API_REPO_TOKEN }}
           path: dmi-api
 
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            dmi-e2e/package-lock.json
+            dmi-api/package-lock.json
 
       - name: Install harness dependencies
         working-directory: dmi-e2e
         run: npm install --no-audit --no-fund
 
-      # dmi-api resolves @nominal-systems/* from GitHub Packages; needs a read:packages token.
+      # dmi-api resolves @nominal-systems/dmi-engine-common from GitHub Packages. GITHUB_TOKEN
+      # covers this once the package grants this repo read access; until then (and only while the
+      # GHP_TOKEN secret still exists) the legacy PAT takes precedence.
       - name: Install dmi-api dependencies
         working-directory: dmi-api
         run: npm install --no-audit --no-fund
         env:
-          GHP_TOKEN: ${{ secrets.GHP_TOKEN }}
+          GHP_TOKEN: ${{ secrets.GHP_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Typecheck harness
         working-directory: dmi-e2e
