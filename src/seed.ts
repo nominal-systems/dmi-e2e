@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
 import { ApiClient, expectOk } from './api-client'
+import { env } from './env'
 import { HARNESS_USER_PASSWORD, insertUser } from './sql'
 
 /* Drives the developer-quickstart flow over plain HTTP, exactly as an integrator would:
@@ -43,9 +44,33 @@ function unique (label: string): string {
   return `${label}-${randomUUID().slice(0, 8)}`
 }
 
-export async function seedOrganization (root: ApiClient, label: string): Promise<SeededOrg> {
+/* Mint an X-Api-Key from the demo vendor (GET /demo/keys). Full-stack mode hands this to the
+ * integration as its credential so it authenticates to the vendor as itself; the fast suite never
+ * calls this (its vendor URL is unreachable by design). */
+export async function mintDemoKey (): Promise<string> {
+  const demo = ApiClient.create(env.demoProvider.baseUrl)
+  const created = expectOk<{ key: string }>(await demo.get('/keys'), 'mint demo vendor API key')
+  return created.key
+}
+
+export interface SeedOrgOptions {
+  /* provider-configuration `url`. Default is an unreachable .invalid host — fast mode never contacts
+   * the vendor. Full-stack mode passes the demo vendor's compose-network URL. */
+  providerUrl?: string
+  /* integrationOptions merged into the create-integration body. Default is a dummy apiKey; full-stack
+   * mode passes a real key minted from the demo vendor (see mintDemoKey). */
+  integrationOptions?: Record<string, unknown>
+}
+
+export async function seedOrganization (
+  root: ApiClient,
+  label: string,
+  options: SeedOrgOptions = {},
+): Promise<SeededOrg> {
   const suffix = unique(label)
   const email = `harness-${suffix}@example.test`
+  const providerUrl = options.providerUrl ?? DEMO_LAB_URL
+  const integrationOptions = options.integrationOptions ?? { apiKey: `demo-key-${suffix}` }
 
   /* F6: dmi-api's POST /users is broken (see sql.insertUser). Insert the user row directly; the
    * rest of the flow below is real HTTP. */
@@ -69,7 +94,7 @@ export async function seedOrganization (root: ApiClient, label: string): Promise
   const api = root.withApiKey(keys.prodKey)
 
   const providerConfiguration = expectOk<{ id: string }>(
-    await api.post('/providers/demo/configurations', { configuration: { url: DEMO_LAB_URL } }),
+    await api.post('/providers/demo/configurations', { configuration: { url: providerUrl } }),
     'configure the demo provider',
   )
 
@@ -82,7 +107,7 @@ export async function seedOrganization (root: ApiClient, label: string): Promise
     await api.post('/integrations', {
       practiceId: practice.id,
       providerConfigurationId: providerConfiguration.id,
-      integrationOptions: { apiKey: `demo-key-${suffix}` },
+      integrationOptions,
     }),
     'create integration',
   )

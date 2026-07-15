@@ -99,21 +99,57 @@ async function waitForTcp (
   throw new Error(`${label} at ${host}:${port} not ready within ${timeoutMs}ms: ${String(lastError)}`)
 }
 
+/* The full-stack services (redis, demo-provider-api + its MySQL, demo integration) live behind a
+ * `full-stack` compose profile, so the default fast suite brings up only MySQL/Mongo/ActiveMQ.
+ * `--profile` is a top-level flag and must precede the subcommand. */
+function composeBaseArgs (): string[] {
+  const args = ['compose', '-f', env.composeFile]
+  if (env.fullStack) args.push('--profile', 'full-stack')
+  return args
+}
+
 export async function composeUp (): Promise<void> {
-  await run('docker', ['compose', '-f', env.composeFile, 'up', '-d'], {
+  /* `--build` in full-stack mode: the two integration/vendor images are built from their own
+   * (Node-14-era) Dockerfiles, which need a GHP_TOKEN build-arg to reach GitHub Packages. Layer
+   * caching keeps rebuilds cheap after the first. Give the first cold build a generous budget. */
+  const args = [...composeBaseArgs(), 'up', '-d']
+  if (env.fullStack) args.push('--build')
+  await run('docker', args, {
     cwd: env.harnessRoot,
-    timeoutMs: 300_000,
+    timeoutMs: env.fullStack ? 900_000 : 300_000,
   })
 }
 
 export async function composeDown (removeVolumes: boolean): Promise<void> {
-  const args = ['compose', '-f', env.composeFile, 'down']
+  const args = [...composeBaseArgs(), 'down']
   if (removeVolumes) args.push('-v')
   await run('docker', args, { cwd: env.harnessRoot, timeoutMs: 120_000 })
 }
 
+/* Poll an HTTP endpoint until it answers 2xx. Used for the demo-provider vendor, whose port opens
+ * only after its NestJS app has connected to its own MySQL (TypeORM is in the module graph), so a
+ * 2xx from /status means "really ready", not merely "port bound". */
+async function waitForHttpOk (url: string, label: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) })
+      if (response.ok) return
+      lastError = new Error(`HTTP ${response.status}`)
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  throw new Error(`${label} at ${url} not ready within ${timeoutMs}ms: ${String(lastError)}`)
+}
+
 /* Polled rather than slept: generous readiness timeouts, no fixed sleeps. MySQL is the slow one —
- * mysql:8 bounces the server once during first-boot initialisation. */
+ * mysql:8 bounces the server once during first-boot initialisation. In full-stack mode the demo
+ * vendor is added: the harness mints an API key from it during seeding, so it must be up first.
+ * (Redis and the demo integration have no harness-facing endpoint; the broker/queue clients inside
+ * the integration reconnect on their own, and the scenario's completion wait absorbs their start.) */
 export async function waitForDependencies (): Promise<void> {
   const { depsReadyMs } = env.timeouts
   const mongo = new URL(env.mongoUri)
@@ -121,6 +157,9 @@ export async function waitForDependencies (): Promise<void> {
   /* A mongodb:// URI may omit the port, in which case URL.port is '' and Number('') is 0. */
   await waitForTcp(mongo.hostname, Number(mongo.port !== '' ? mongo.port : 27017), 'Mongo', depsReadyMs)
   await waitForTcp(env.activemq.hostname, env.activemq.port, 'ActiveMQ', depsReadyMs)
+  if (env.fullStack) {
+    await waitForHttpOk(`${env.demoProvider.baseUrl}/status`, 'demo-provider-api', depsReadyMs)
+  }
 }
 
 /* Running dmi-api's migrations explicitly also regression-tests that they produce a working schema

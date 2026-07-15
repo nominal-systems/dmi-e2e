@@ -38,6 +38,9 @@ export interface HarnessEnv {
   /* Root of a dmi-api checkout. Only used for process orchestration. */
   dmiApiDir: string
   composeFile: string
+  /* Host that published container ports are reachable on. A single knob (default 127.0.0.1) so the
+   * suite can run against a remote docker host unchanged; the per-service *_HOST vars default to it. */
+  host: string
   appPort: number
   baseUrl: string
   admin: { username: string, password: string }
@@ -47,6 +50,18 @@ export interface HarnessEnv {
   mysql: MysqlEnv
   mongoUri: string
   activemq: { hostname: string, port: number }
+  /* HARNESS_FULL_STACK=1 selects the full-system suite: dmi-api under a normal NODE_ENV against the
+   * real demo provider stack (redis + demo-provider-api + demo integration), instead of the default
+   * fast suite (NODE_ENV=seed, dmi-api alone). */
+  fullStack: boolean
+  demoProvider: {
+    /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
+     * demo-provider-api's `/demo` global prefix. */
+    baseUrl: string
+    /* Compose-network base URL the integration container uses to reach the vendor. Stored verbatim
+     * in the dmi-api provider configuration, so it must resolve inside the compose network. */
+    internalUrl: string
+  }
   /* Orchestration. Set HARNESS_BASE_URL to point at a dmi-api you started yourself, in which case
    * the harness neither builds nor spawns one, and never touches DMI_API_DIR. */
   manageContainers: boolean
@@ -57,15 +72,18 @@ export interface HarnessEnv {
 }
 
 const harnessRoot = path.resolve(__dirname, '..')
+const host = str('HARNESS_HOST', '127.0.0.1')
 const appPort = int('HARNESS_APP_PORT', 3010)
+const demoProviderPort = int('HARNESS_DEMO_PROVIDER_PORT', 3011)
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
 
 export const env: HarnessEnv = {
   harnessRoot,
   dmiApiDir: path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api'))),
   composeFile: path.join(harnessRoot, 'docker-compose.yml'),
+  host,
   appPort,
-  baseUrl: str('HARNESS_BASE_URL', `http://127.0.0.1:${appPort}`),
+  baseUrl: str('HARNESS_BASE_URL', `http://${host}:${appPort}`),
   admin: {
     username: str('HARNESS_ADMIN_USERNAME', 'admin'),
     password: str('HARNESS_ADMIN_PASSWORD', 'admin'),
@@ -73,7 +91,7 @@ export const env: HarnessEnv = {
   secretKey: str('HARNESS_SECRET_KEY', 'harness_secret_key_exactly_32_by'),
   jwtSecretKey: str('HARNESS_JWT_SECRET_KEY', 'harness-jwt-secret'),
   mysql: {
-    host: str('HARNESS_MYSQL_HOST', '127.0.0.1'),
+    host: str('HARNESS_MYSQL_HOST', host),
     port: int('HARNESS_MYSQL_PORT', 3307),
     user: str('HARNESS_MYSQL_USER', 'root'),
     password: str('HARNESS_MYSQL_PASSWORD', 'harness'),
@@ -81,11 +99,16 @@ export const env: HarnessEnv = {
   },
   mongoUri: str(
     'HARNESS_MONGO_URI',
-    `mongodb://127.0.0.1:${int('HARNESS_MONGO_PORT', 27018)}/dmi_harness`,
+    `mongodb://${host}:${int('HARNESS_MONGO_PORT', 27018)}/dmi_harness`,
   ),
   activemq: {
-    hostname: str('HARNESS_ACTIVEMQ_HOST', '127.0.0.1'),
+    hostname: str('HARNESS_ACTIVEMQ_HOST', host),
     port: int('HARNESS_ACTIVEMQ_PORT', 1884),
+  },
+  fullStack: flag('HARNESS_FULL_STACK', false),
+  demoProvider: {
+    baseUrl: str('HARNESS_DEMO_PROVIDER_URL', `http://${host}:${demoProviderPort}/demo`),
+    internalUrl: str('HARNESS_DEMO_PROVIDER_INTERNAL_URL', 'http://dmi-demo-provider-api:3000/demo'),
   },
   manageContainers: flag('HARNESS_MANAGE_CONTAINERS', true),
   manageApp: flag('HARNESS_MANAGE_APP', explicitBaseUrl == null),
@@ -126,14 +149,23 @@ export function requireDmiApiDir (): string {
   return env.dmiApiDir
 }
 
-/* Environment handed to dmi-api's `migration:run` and to the app process. NODE_ENV=seed is
- * load-bearing: dmi-api's orders.service short-circuits before the MQTT round-trip to the engine,
- * which is not part of this harness. dotenv (via dmi-api's loadEnv) never overwrites keys already
- * present in the environment, so these win over any .env the checkout happens to have. */
+/* Environment handed to dmi-api's `migration:run` and to the app process. dotenv (via dmi-api's
+ * loadEnv) never overwrites keys already present in the environment, so these win over any .env the
+ * checkout happens to have.
+ *
+ * Fast mode (default): NODE_ENV=seed is load-bearing — dmi-api's orders.service short-circuits
+ * before the MQTT round-trip to the engine, which is not part of that suite.
+ *
+ * Full-stack mode (HARNESS_FULL_STACK=1): a normal NODE_ENV so createOrder actually RPCs the engine
+ * over MQTT, and a modest ENGINE_RESPONSE_TIMEOUT so an unanswered engine fails in ~10s rather than
+ * hanging for dmi-api's 90s default. 'development' (not 'production') keeps fastify cookies non-
+ * secure over the harness's plain HTTP; only `=== 'seed'` changes order behaviour, so any non-seed
+ * value is "normal" here. */
 export function appEnv (): NodeJS.ProcessEnv {
+  const { fullStack } = env
   return {
     ...process.env,
-    NODE_ENV: 'seed',
+    NODE_ENV: fullStack ? 'development' : 'seed',
     PORT: String(env.appPort),
     BASE_URL: '',
     JWT_SECRET_KEY: env.jwtSecretKey,
@@ -157,7 +189,8 @@ export function appEnv (): NodeJS.ProcessEnv {
     ACTIVEMQ_USERNAME: '',
     ACTIVEMQ_PASSWORD: '',
     STATSIG_ENABLED: 'false',
-    /* The engine is absent; fail fast instead of hanging for dmi-api's 90s default. */
-    ENGINE_RESPONSE_TIMEOUT: '2000',
+    /* Fast mode: the engine is absent; fail fast. Full-stack: a real engine RPC round-trips, so
+     * allow ~10s (still well under the 90s default) before giving up on it. */
+    ENGINE_RESPONSE_TIMEOUT: fullStack ? '10000' : '2000',
   }
 }
