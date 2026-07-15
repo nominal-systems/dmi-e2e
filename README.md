@@ -66,6 +66,33 @@ HARNESS_BUILD=0   npm run test:harness   # skip `npm run build` in the checkout
 HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:harness
 ```
 
+### Full-system mode
+
+The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1` selects a second
+jest project — `scenarios/full-stack-*.e2e.ts` — that runs dmi-api under a **normal `NODE_ENV`**
+(so `createOrder` actually RPCs the engine over MQTT) against the real demo provider loop: ActiveMQ,
+Redis, the demo vendor API (`dmi-demo-provider-api`, with its own MySQL) and the demo provider
+integration (`dmi-engine-demo-provider-integration`), all behind the `full-stack` compose profile.
+
+```bash
+# builds the two Node-14 integration/vendor images (needs a GitHub Packages read token) and boots
+# ~7 containers alongside dmi-api:
+GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 npm run test:harness
+```
+
+The two app images build from sibling checkouts (`../dmi-demo-provider-api`,
+`../dmi-engine-demo-provider-integration`; override with `DMI_DEMO_PROVIDER_DIR` /
+`DMI_DEMO_INTEGRATION_DIR`) and their `npm install` resolves `@nominal-systems/*` from GitHub
+Packages, so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the
+Docker build. The fast suite needs no token.
+
+**Status: the full-stack demo scenario is blocked upstream.** The end-to-end order→report loop cannot
+close today because the demo integration on `main` is not compatible with the current dmi-api. The
+dmi-api handlers, the vendor sim and this harness's plumbing are all sound — the gap is entirely in
+the demo integration, and its fix is tracked privately (routed upstream), not in this repo. So
+`full-stack-smoke.e2e.ts` ships with its completion assertions `describe.skip`ped and an active test
+that *confirms* the break; the fast suite remains the default and is unaffected.
+
 ### Ports
 
 Shifted off dmi-api's defaults so a developer's dev stack can keep running alongside the harness.
@@ -77,6 +104,14 @@ Shifted off dmi-api's defaults so a developer's dev stack can keep running along
 | Mongo    | 27018   | 27017           |
 | ActiveMQ | 1884    | 1883            |
 
+Full-stack-only services (behind the `full-stack` compose profile):
+
+| Service            | Harness | Notes |
+|--------------------|---------|-------|
+| demo-provider-api  | 3011    | the simulated vendor; harness mints keys here |
+| Redis              | 6380    | the integration's Bull queues |
+| demo-provider MySQL| 3308    | the vendor's own database |
+
 ## Environment
 
 Every variable has a working default; the table exists so CI and debugging are not guesswork.
@@ -84,6 +119,8 @@ Every variable has a working default; the table exists so CI and debugging are n
 | Variable | Default | Purpose |
 |---|---|---|
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
+| `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
+| `HARNESS_FULL_STACK` | `0` | `1` selects the full-system suite (the demo provider loop) instead of the default fast suite. See "Full-system mode". |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -93,6 +130,11 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_MONGO_URI` | `mongodb://127.0.0.1:27018/dmi_harness` | |
 | `HARNESS_MONGO_PORT` | `27018` | Host port published by the Mongo container. |
 | `HARNESS_ACTIVEMQ_HOST` / `_PORT` | `127.0.0.1` / `1884` | |
+| `HARNESS_DEMO_PROVIDER_PORT` | `3011` | full-stack only. Host port for the demo vendor API (where the harness mints an X-Api-Key). |
+| `HARNESS_DEMO_PROVIDER_URL` | `http://$HARNESS_HOST:3011/demo` | full-stack only. Host-facing demo vendor base URL (includes its `/demo` prefix). |
+| `HARNESS_DEMO_PROVIDER_INTERNAL_URL` | `http://dmi-demo-provider-api:3000/demo` | full-stack only. URL the integration container uses to reach the vendor; stored verbatim in the dmi-api provider configuration, so it must resolve inside the compose network. |
+| `HARNESS_REDIS_PORT` | `6380` | full-stack only. Host port for Redis (the integration's Bull queues). |
+| `HARNESS_DEMO_MYSQL_PORT` / `_PASSWORD` / `_DATABASE` | `3308` / `demo` / `demo_provider` | full-stack only. The demo vendor's own MySQL (auto-synchronised schema). |
 | `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. |
 | `HARNESS_MANAGE_APP` | `1` unless `HARNESS_BASE_URL` is set | `0` to bring your own dmi-api. |
 | `HARNESS_BUILD` | `1` | `0` to reuse an existing `dist/` in the checkout. |
@@ -119,19 +161,21 @@ directory is the only write the harness makes inside the dmi-api checkout.
 ## Layout
 
 ```
-docker-compose.yml            MySQL + Mongo + ActiveMQ, own project & volumes
+docker-compose.yml            base MySQL + Mongo + ActiveMQ; + a `full-stack` profile adding redis,
+                              the demo vendor API (+ its MySQL) and the demo integration
 src/
-  env.ts                      all configuration, resolved once
-  containers.ts               compose up/down, readiness polling, dmi-api migrations
+  env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK
+  containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
-  seed.ts                     the quickstart flow; two independent organizations
+  seed.ts                     the quickstart flow; two independent orgs; demo-key minting
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite
+  full-stack-smoke.e2e.ts     the demo provider loop (HARNESS_FULL_STACK=1); gate blocked upstream
 ```
 
 ## Findings
@@ -180,10 +224,21 @@ If a test in `tenant-isolation.e2e.ts` fails with *"Failing test passed even tho
 to fail"*, that is the tripwire firing: the underlying defect was fixed. Delete the `.failing`
 marker and the comment above it. That is the only correct response.
 
+## Full-system findings (demo provider loop)
+
+Standing the demo provider loop up (Phase 0) surfaced that `dmi-engine-demo-provider-integration` on
+`main` is no longer compatible with the current dmi-api — over the MQTT transport it does not answer
+dmi-api's engine RPCs, so the order → result → report loop cannot close. The vendor sim, dmi-api's
+inbound handlers and all of this harness's plumbing are sound; the gap is entirely in the integration.
+**None are fixed here** — the integration repo is read-only, and the detailed defect writeup is
+**tracked privately** (routed upstream), not in this public repo. The full-stack scenario ships gated
+on it: its completion assertions are `describe.skip`ped and an active test *confirms* the block
+(`POST /orders` times out at the engine and the order lands in `ERROR`).
+
 ## Known gaps
 
-- **No engine, no demo lab.** The full order → report loop needs the demo provider stack; deferred.
-  Reports are inserted via `sql.ts` rather than arriving over MQTT, and orders never leave
-  `accepted`.
+- **The demo loop is blocked upstream.** `HARNESS_FULL_STACK=1` stands the whole topology up, but the
+  order → report loop cannot close until the demo integration is fixed (tracked privately). The fast
+  suite still inserts reports via `sql.ts` and its orders never leave `accepted`.
 - **No wire-format snapshots** yet (a follow-up).
 - **`maxWorkers: 1`.** One database, one event stream, one `seq` counter. Scenarios must not race.

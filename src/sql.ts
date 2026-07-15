@@ -80,6 +80,19 @@ export async function insertUser (email: string): Promise<string> {
   return id
 }
 
+/* Read an order's status straight from MySQL by its requisitionId. Full-stack mode uses this to
+ * observe the order dmi-api committed even when POST /orders returns a 5xx (the engine RPC failing
+ * still leaves a persisted `order` row, set to ERROR in orders.service's catch). requisitionId is
+ * unique per harness order (see seed.orderPayload), so one row comes back. Returns undefined if the
+ * order was never written. */
+export async function getOrderStatusByRequisitionId (requisitionId: string): Promise<string | undefined> {
+  const rows = await query<{ status: string }>(
+    'SELECT `status` FROM `order` WHERE `requisitionId` = ? ORDER BY `createdAt` DESC LIMIT 1',
+    [requisitionId],
+  )
+  return rows[0]?.status
+}
+
 export async function countOrdersForOrganization (organizationId: string): Promise<number> {
   const rows = await query<{ count: number }>(
     'SELECT COUNT(*) AS count FROM `order` o' +

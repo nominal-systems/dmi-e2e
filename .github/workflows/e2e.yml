@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      run_full_stack:
+        description: 'Attempt the full-stack harness job (blocked upstream; see full-stack job)'
+        type: boolean
+        default: false
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -89,3 +94,28 @@ jobs:
         if: failure()
         working-directory: dmi-e2e
         run: docker compose logs --no-color --tail=200
+
+  # Full-system suite (HARNESS_FULL_STACK=1): dmi-api + redis + demo-provider-api + demo integration.
+  # Intentionally DISABLED. Phase 0's demo scenario is blocked upstream (the demo integration on
+  # `main` is not compatible with the current dmi-api, so the order->result->report loop cannot
+  # close). There is nothing for this job to run green yet, so it does not check out or build the demo
+  # repos, and the `dmi-ci` app is not provisioned on them. It runs only on a manual dispatch with
+  # run_full_stack=true, and only prints the checklist to enable it.
+  full-stack:
+    name: Full-stack harness (disabled — blocked upstream)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_full_stack }}
+    steps:
+      - name: Explain why this job is disabled, and how to enable it
+        run: |
+          echo "Full-stack CI is disabled: the Phase 0 demo scenario is blocked upstream."
+          echo "The demo integration must first be made compatible with the current dmi-api."
+          echo "Enabling this job is a follow-up bundled with that upstream fix:"
+          echo "  1) Install the dmi-ci GitHub App on nominal-systems/dmi-demo-provider-api and"
+          echo "     nominal-systems/dmi-engine-demo-provider-integration, with Packages: read."
+          echo "  2) Add both repos to the create-github-app-token 'repositories:' list."
+          echo "  3) Check out both repos, then 'docker compose --profile full-stack build' with"
+          echo "     GHP_TOKEN from the app token (GitHub Packages read), as the fast job does for dmi-api."
+          echo "  4) Run 'npm run test:harness' with HARNESS_FULL_STACK=1 and DMI_API_DIR set."
+          echo "  5) Un-skip the completion suite in scenarios/full-stack-smoke.e2e.ts and delete the"
+          echo "     CONFIRMED test."

@@ -8,6 +8,12 @@
 #
 # Host ports are shifted off the defaults so a developer's dmi-api dev stack can keep running
 # alongside the harness. Override with HARNESS_*_PORT.
+#
+# The base services (mysql, mongo, activemq) are what dmi-api alone needs and always start. The
+# full-system suite (HARNESS_FULL_STACK=1) additionally starts everything under the `full-stack`
+# profile: redis (Bull queues), the demo vendor API + its own MySQL, and the demo provider
+# integration. Those two app images build from sibling checkouts' (Node-14-era) Dockerfiles and
+# need a GHP_TOKEN build-arg to resolve @nominal-systems/* from GitHub Packages.
 
 name: dmi-e2e
 
@@ -34,6 +40,111 @@ services:
     ports:
       - '${HARNESS_ACTIVEMQ_PORT:-1884}:1883'
 
+  # ---- full-stack profile: the demo provider loop (order -> engine -> vendor -> report) ----
+
+  # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
+  redis:
+    image: redis:7-alpine
+    profiles: ['full-stack']
+    ports:
+      - '${HARNESS_REDIS_PORT:-6380}:6379'
+
+  # The demo vendor's own database. DATABASE_SYNCHRONIZE=true lets the vendor auto-create its schema
+  # on boot, so there is no migration step for it.
+  demo-provider-mysql:
+    image: mysql:8
+    profiles: ['full-stack']
+    environment:
+      MYSQL_ROOT_PASSWORD: ${HARNESS_DEMO_MYSQL_PASSWORD:-demo}
+      MYSQL_DATABASE: ${HARNESS_DEMO_MYSQL_DATABASE:-demo_provider}
+    ports:
+      - '${HARNESS_DEMO_MYSQL_PORT:-3308}:3306'
+    volumes:
+      - demo-provider-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Simulated vendor (NestJS + MySQL). X-Api-Key auth minted via GET /demo/keys; orders auto-complete
+  # ~6s after creation. Built from its own Node-14 Dockerfile (production stage).
+  dmi-demo-provider-api:
+    profiles: ['full-stack']
+    build:
+      context: ${DMI_DEMO_PROVIDER_DIR:-../dmi-demo-provider-api}
+      target: production
+      args:
+        GHP_TOKEN: ${GHP_TOKEN:-}
+    environment:
+      PORT: '3000'
+      DATABASE_TYPE: mysql
+      DATABASE_HOST: demo-provider-mysql
+      DATABASE_PORT: '3306'
+      DATABASE_USERNAME: root
+      DATABASE_PASSWORD: ${HARNESS_DEMO_MYSQL_PASSWORD:-demo}
+      DATABASE_DATABASE: ${HARNESS_DEMO_MYSQL_DATABASE:-demo_provider}
+      DATABASE_SYNCHRONIZE: 'true'
+    ports:
+      - '${HARNESS_DEMO_PROVIDER_PORT:-3011}:3000'
+    depends_on:
+      demo-provider-mysql:
+        condition: service_healthy
+
+  # Demo provider integration (standalone NestJS microservice, one container per provider, matching
+  # production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the vendor over HTTP
+  # using the base URL carried inside each MQTT message (the provider configuration's `url`).
+  dmi-engine-demo-provider-integration:
+    profiles: ['full-stack']
+    build:
+      context: ${DMI_DEMO_INTEGRATION_DIR:-../dmi-engine-demo-provider-integration}
+      target: production
+      args:
+        GHP_TOKEN: ${GHP_TOKEN:-}
+      # Builds the demo integration from its own (Node-14-era) sources. Its in-repo Dockerfile needs a
+      # small adjustment to build under current tooling, so we mirror it here (the repo itself stays
+      # untouched / read-only) rather than reference its Dockerfile. The image is included so the full
+      # topology stands up and the gate can be exercised; the end-to-end loop is gated pending an
+      # upstream fix to the demo integration (see README "Full-system mode"). Unused stages and the
+      # runtime `wait-for` download are trimmed — the production CMD does not use them.
+      dockerfile_inline: |
+        FROM node:14-alpine AS base
+        WORKDIR /app
+        ARG GHP_TOKEN
+        COPY package*.json .npmrc ./
+        RUN apk add --no-cache --virtual build-base &&\
+            npm install -g node-gyp &&\
+            npm install &&\
+            apk del build-base &&\
+            npm un -g node-gyp &&\
+            rm -rf /var/cache/apk/*
+        COPY . .
+        RUN chmod +x ./scripts/wait-for-all.sh && rm .npmrc
+        FROM base AS build
+        ENV NODE_ENV=production
+        RUN npm run build && npm prune --production
+        FROM node:14-alpine AS production
+        WORKDIR /app
+        ENV NODE_ENV=production
+        COPY --from=build /app/scripts scripts
+        COPY --from=build /app/dist dist
+        COPY --from=build /app/node_modules node_modules
+        COPY --from=build /app/package.json .
+        EXPOSE 3000
+        CMD ["npm", "run", "start:prod"]
+    environment:
+      PORT: '3000'
+      MQTT_PROTOCOL: mqtt
+      MQTT_HOST: activemq
+      MQTT_PORT: '1883'
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    depends_on:
+      - activemq
+      - redis
+      - dmi-demo-provider-api
+
 volumes:
   mysql-data:
   mongo-data:
+  demo-provider-mysql-data:
