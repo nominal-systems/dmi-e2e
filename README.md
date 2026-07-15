@@ -69,29 +69,77 @@ HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:
 ### Full-system mode
 
 The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1` selects a second
-jest project — `scenarios/full-stack-*.e2e.ts` — that runs dmi-api under a **normal `NODE_ENV`**
-(so `createOrder` actually RPCs the engine over MQTT) against the real demo provider loop: ActiveMQ,
-Redis, the demo vendor API (`dmi-demo-provider-api`, with its own MySQL) and the demo provider
-integration (`dmi-engine-demo-provider-integration`), all behind the `full-stack` compose profile.
+jest project that runs dmi-api under a **normal `NODE_ENV`** (so `createOrder` actually RPCs the
+engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS_STACK`:
+
+- **`idexx`** (default) — the Phase 0 loop. dmi-api + ActiveMQ + Redis + the **VetConnect Plus mock**
+  (`src/idexx-mock`, built from this repo) + the **real `dmi-engine-idexx-integration`** container,
+  behind the `idexx` compose profile. Runs `scenarios/idexx-full-stack.e2e.ts`.
+- **`demo`** — the pre-existing demo loop (ActiveMQ, Redis, `dmi-demo-provider-api` + its MySQL, and
+  `dmi-engine-demo-provider-integration`), behind the `full-stack` profile. Runs
+  `scenarios/full-stack-smoke.e2e.ts`. **Blocked upstream** (see below).
 
 ```bash
-# builds the two Node-14 integration/vendor images (needs a GitHub Packages read token) and boots
-# ~7 containers alongside dmi-api:
+# idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
+# Packages read token) and boots ~7 containers alongside dmi-api:
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 npm run test:harness
+
+# demo (the upstream-blocked loop):
+GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=demo npm run test:harness
 ```
 
-The two app images build from sibling checkouts (`../dmi-demo-provider-api`,
-`../dmi-engine-demo-provider-integration`; override with `DMI_DEMO_PROVIDER_DIR` /
-`DMI_DEMO_INTEGRATION_DIR`) and their `npm install` resolves `@nominal-systems/*` from GitHub
-Packages, so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the
-Docker build. The fast suite needs no token.
+The integration image builds from a sibling checkout (`../dmi-engine-idexx-integration`; override with
+`DMI_IDEXX_INTEGRATION_DIR`) and its `npm install` resolves `@nominal-systems/*` from GitHub Packages,
+so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the Docker
+build. The VetConnect Plus mock is a zero-dependency Node server built inline, so it needs no token.
+The fast suite needs no token.
 
-**Status: the full-stack demo scenario is blocked upstream.** The end-to-end order→report loop cannot
-close today because the demo integration on `main` is not compatible with the current dmi-api. The
-dmi-api handlers, the vendor sim and this harness's plumbing are all sound — the gap is entirely in
-the demo integration, and its fix is tracked privately (routed upstream), not in this repo. So
+**The idexx loop closes end to end.** An order placed over real HTTP round-trips through the real
+idexx integration and the mock vendor: `POST /orders?autoSubmitOrder=true` → the integration creates
+the order at the mock and runs IDEXX's confirmOrder browser handshake against it → the integration's
+results poll picks up a result the scenario seeds at the mock → dmi-api writes a `FINAL` report with
+test results and moves the order to `COMPLETED`, and `/events` shows the `order:*`/`report:*`
+sequence. The harness talks **only to the mock**, never to live `*.vetconnectplus.com`, so runs are
+deterministic, need no credentials, and place no real orders. See "The VetConnect Plus mock" below.
+
+**Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
+because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api
+handlers, the vendor sim and this harness's plumbing are all sound — the gap is entirely in the demo
+integration, and its fix is tracked privately (routed upstream), not in this repo. So
 `full-stack-smoke.e2e.ts` ships with its completion assertions `describe.skip`ped and an active test
-that *confirms* the break; the fast suite remains the default and is unaffected.
+that *confirms* the break; it is unaffected by, and independent of, the idexx loop.
+
+### The VetConnect Plus mock
+
+`src/idexx-mock/server.js` is a small, zero-dependency Node HTTP server that stands in for IDEXX's
+VetConnect Plus vendor. It speaks IDEXX's **public, documented dialect** (developer.vetconnectplus.com)
+closely enough for the real integration to drive it unmodified:
+
+- **Ordering** (`/api/v1/*`): `POST /order`, `GET/DELETE /order/:id`, the external-orders poll, auth
+  validate, and reference data.
+- **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
+  serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
+  integration issues to submit the order.
+- **Results** (`/api/v3/*`): the latest-results batch poll, its `confirm/:batchId` ack, and search.
+- **Control plane** (`/__control__/*`, host-facing): tests seed a (synthetic) result for an order,
+  list the orders the mock received, reset state, and inject error scenarios. This is how the
+  order→result→report loop is made deterministic — the mock holds no results until a test seeds one.
+
+All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
+captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
+Basic credentials and `X-Pims-*` headers are accepted as-is).
+
+### The MQTT broker
+
+The harness broker is **`eclipse-mosquitto:2`**, not ActiveMQ. dmi-api and the provider integrations
+talk to the engine over MQTT using dmi-engine-common's shared-subscription patterns, which subscribe
+to `$share/<group>/<topic>` — an **MQTT 5.0 shared subscription**. ActiveMQ 5.x "classic" (the broker
+the foundation started with) speaks only MQTT 3.1.1 and silently treats `$share/...` as a literal
+topic, so nothing is delivered: the engine RPCs and the inbound result/event streams never arrive and
+the loop can't close. Mosquitto routes shared subscriptions for both MQTT 3.1.1 and 5.0 clients. The
+compose service is still named `activemq` so all `ACTIVEMQ_*` / `MQTT_HOST` configuration is
+unchanged, and dmi-api's `activemq: up` health check (a generic MQTT ping) still passes, so the fast
+suite is unaffected.
 
 ### Ports
 
@@ -104,13 +152,14 @@ Shifted off dmi-api's defaults so a developer's dev stack can keep running along
 | Mongo    | 27018   | 27017           |
 | ActiveMQ | 1884    | 1883            |
 
-Full-stack-only services (behind the `full-stack` compose profile):
+Full-system services (behind a compose profile — only the selected loop's ports are published):
 
-| Service            | Harness | Notes |
-|--------------------|---------|-------|
-| demo-provider-api  | 3011    | the simulated vendor; harness mints keys here |
-| Redis              | 6380    | the integration's Bull queues |
-| demo-provider MySQL| 3308    | the vendor's own database |
+| Service            | Harness | Profile     | Notes |
+|--------------------|---------|-------------|-------|
+| VetConnect Plus mock | 3012  | `idexx`     | the simulated IDEXX vendor; tests drive its `/__control__` plane |
+| Redis              | 6380    | both        | the integration's Bull queues |
+| demo-provider-api  | 3011    | `full-stack`| the simulated demo vendor; harness mints keys here |
+| demo-provider MySQL| 3308    | `full-stack`| the demo vendor's own database |
 
 ## Environment
 
@@ -120,7 +169,8 @@ Every variable has a working default; the table exists so CI and debugging are n
 |---|---|---|
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
-| `HARNESS_FULL_STACK` | `0` | `1` selects the full-system suite (the demo provider loop) instead of the default fast suite. See "Full-system mode". |
+| `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock) or `demo` (upstream-blocked demo loop). |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -130,11 +180,16 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_MONGO_URI` | `mongodb://127.0.0.1:27018/dmi_harness` | |
 | `HARNESS_MONGO_PORT` | `27018` | Host port published by the Mongo container. |
 | `HARNESS_ACTIVEMQ_HOST` / `_PORT` | `127.0.0.1` / `1884` | |
-| `HARNESS_DEMO_PROVIDER_PORT` | `3011` | full-stack only. Host port for the demo vendor API (where the harness mints an X-Api-Key). |
-| `HARNESS_DEMO_PROVIDER_URL` | `http://$HARNESS_HOST:3011/demo` | full-stack only. Host-facing demo vendor base URL (includes its `/demo` prefix). |
-| `HARNESS_DEMO_PROVIDER_INTERNAL_URL` | `http://dmi-demo-provider-api:3000/demo` | full-stack only. URL the integration container uses to reach the vendor; stored verbatim in the dmi-api provider configuration, so it must resolve inside the compose network. |
-| `HARNESS_REDIS_PORT` | `6380` | full-stack only. Host port for Redis (the integration's Bull queues). |
-| `HARNESS_DEMO_MYSQL_PORT` / `_PASSWORD` / `_DATABASE` | `3308` / `demo` / `demo_provider` | full-stack only. The demo vendor's own MySQL (auto-synchronised schema). |
+| `HARNESS_VCP_MOCK_PORT` | `3012` | idexx only. Host port for the VetConnect Plus mock (its `/__control__` plane and `/status`). |
+| `HARNESS_VCP_MOCK_URL` | `http://$HARNESS_HOST:3012` | idexx only. Host-facing mock base URL the scenario drives. |
+| `HARNESS_IDEXX_ORDERING_URL` / `_RESULT_URL` | `http://vetconnect-mock:3000` | idexx only. Compose-network base URLs stored in the provider config; the integration reaches the mock here. Never point at live `*.vetconnectplus.com`. |
+| `HARNESS_IDEXX_PIMS_ID` / `_PIMS_VERSION` / `_USERNAME` / `_PASSWORD` / `_LOCALE` | `dmi-e2e-harness` / `1.0.0` / `harness-user` / `harness-pass` / `en` | idexx only. Dummy provider-config PIMS headers and integration credentials; the mock never authenticates for real. |
+| `HARNESS_IDEXX_POLL_MS` | `3000` | idexx only. The integration's Bull results/orders polling interval (dialed down from its 30s default so the loop closes quickly). |
+| `HARNESS_DEMO_PROVIDER_PORT` | `3011` | demo only. Host port for the demo vendor API (where the harness mints an X-Api-Key). |
+| `HARNESS_DEMO_PROVIDER_URL` | `http://$HARNESS_HOST:3011/demo` | demo only. Host-facing demo vendor base URL (includes its `/demo` prefix). |
+| `HARNESS_DEMO_PROVIDER_INTERNAL_URL` | `http://dmi-demo-provider-api:3000/demo` | demo only. URL the integration container uses to reach the vendor; stored verbatim in the dmi-api provider configuration, so it must resolve inside the compose network. |
+| `HARNESS_REDIS_PORT` | `6380` | full-stack only (both loops). Host port for Redis (the integration's Bull queues). |
+| `HARNESS_DEMO_MYSQL_PORT` / `_PASSWORD` / `_DATABASE` | `3308` / `demo` / `demo_provider` | demo only. The demo vendor's own MySQL (auto-synchronised schema). |
 | `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. |
 | `HARNESS_MANAGE_APP` | `1` unless `HARNESS_BASE_URL` is set | `0` to bring your own dmi-api. |
 | `HARNESS_BUILD` | `1` | `0` to reuse an existing `dist/` in the checkout. |
@@ -161,21 +216,24 @@ directory is the only write the harness makes inside the dmi-api checkout.
 ## Layout
 
 ```
-docker-compose.yml            base MySQL + Mongo + ActiveMQ; + a `full-stack` profile adding redis,
-                              the demo vendor API (+ its MySQL) and the demo integration
+docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profile (redis + the
+                              VetConnect Plus mock + the idexx integration) and a `full-stack`
+                              profile (redis + the demo vendor + its MySQL + the demo integration)
 src/
-  env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK
+  env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
-  seed.ts                     the quickstart flow; two independent orgs; demo-key minting
+  seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
+  idexx-mock/server.js        the VetConnect Plus mock vendor (zero-dependency Node HTTP server)
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite
-  full-stack-smoke.e2e.ts     the demo provider loop (HARNESS_FULL_STACK=1); gate blocked upstream
+  idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
+  full-stack-smoke.e2e.ts     the demo loop (HARNESS_FULL_STACK=1 HARNESS_STACK=demo); blocked upstream
 ```
 
 ## Findings
@@ -224,21 +282,47 @@ If a test in `tenant-isolation.e2e.ts` fails with *"Failing test passed even tho
 to fail"*, that is the tripwire firing: the underlying defect was fixed. Delete the `.failing`
 marker and the comment above it. That is the only correct response.
 
-## Full-system findings (demo provider loop)
+## Full-system findings
 
-Standing the demo provider loop up (Phase 0) surfaced that `dmi-engine-demo-provider-integration` on
-`main` is no longer compatible with the current dmi-api — over the MQTT transport it does not answer
-dmi-api's engine RPCs, so the order → result → report loop cannot close. The vendor sim, dmi-api's
-inbound handlers and all of this harness's plumbing are sound; the gap is entirely in the integration.
-**None are fixed here** — the integration repo is read-only, and the detailed defect writeup is
-**tracked privately** (routed upstream), not in this public repo. The full-stack scenario ships gated
-on it: its completion assertions are `describe.skip`ped and an active test *confirms* the block
-(`POST /orders` times out at the engine and the order lands in `ERROR`).
+**The idexx loop closes.** Standing up the idexx loop (Phase 0) confirmed that
+`dmi-engine-idexx-integration` interoperates with the current dmi-api over the real MQTT transport:
+`POST /orders` RPCs the integration, which creates the order at the mock (and runs the confirmOrder
+browser handshake), and the integration's results poll pushes a seeded result back so dmi-api writes a
+`FINAL` report and moves the order to `COMPLETED`. Two dmi-api mechanics are worth recording for the
+next integration:
+
+- **Creating an integration does not start its polling.** `POST /integrations` leaves it `NEW`;
+  polling begins only after `POST /admin/integrations/:id/start` (which emits the engine's
+  `integration/create` event and moves the integration to `RUNNING`). The harness gets an admin JWT
+  from `POST /auth/admin/login`.
+- **Results correlate to an order by its `externalId`** (the vendor order id the create RPC returned),
+  and dmi-api completes the order only when the result's PIMS patient id matches the order's — so the
+  order carries a `pims:patient:id` and the mock echoes it back in the result.
+- **The broker must speak MQTT 5.0 shared subscriptions.** The engine transport uses
+  `$share/<group>/<topic>` subscriptions; ActiveMQ 5.x "classic" (the old harness broker) silently
+  drops them, so the harness broker is `eclipse-mosquitto:2` (see "The MQTT broker" below).
+
+**The demo loop is blocked upstream.** `dmi-engine-demo-provider-integration` on `main` is no longer
+compatible with the current dmi-api — over the MQTT transport it does not answer dmi-api's engine
+RPCs, so its order → result → report loop cannot close. The vendor sim, dmi-api's inbound handlers and
+all of this harness's plumbing are sound; the gap is entirely in that integration. **Not fixed here** —
+the integration repo is read-only, and the detailed defect writeup is **tracked privately** (routed
+upstream), not in this public repo. The demo scenario ships gated on it: its completion assertions are
+`describe.skip`ped and an active test *confirms* the block (`POST /orders` times out at the engine and
+the order lands in `ERROR`).
 
 ## Known gaps
 
-- **The demo loop is blocked upstream.** `HARNESS_FULL_STACK=1` stands the whole topology up, but the
-  order → report loop cannot close until the demo integration is fixed (tracked privately). The fast
-  suite still inserts reports via `sql.ts` and its orders never leave `accepted`.
+- **CI runs the idexx full-stack job on manual dispatch only.** It needs the `dmi-ci` GitHub App
+  installed on `dmi-engine-idexx-integration` (contents + Packages read) and that repo added to the
+  token's `repositories:` — an org-admin action. Until then the job runs only via `workflow_dispatch`
+  (`run_idexx_full_stack=true`) and never on PR/push, so it cannot break the required fast `harness`
+  check. See `.github/workflows/e2e.yml`.
+- **The demo loop is blocked upstream** (tracked privately). Run it with `HARNESS_STACK=demo`.
+- **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
+  kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
+  results. The idexx scenario avoids this by stopping its integration in `afterAll` (removing its
+  jobs); if a run is interrupted before that, `docker compose --profile idexx down -v` clears Redis. A
+  normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
 - **No wire-format snapshots** yet (a follow-up).
 - **`maxWorkers: 1`.** One database, one event stream, one `seq` counter. Scenarios must not race.

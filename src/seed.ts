@@ -53,12 +53,34 @@ export async function mintDemoKey (): Promise<string> {
   return created.key
 }
 
+/* Mint an admin JWT via POST /auth/admin/login (admin/admin by default). dmi-api's AdminGuard uses
+ * the `admin-jwt` strategy, which only verifies the signature against JWT_SECRET_KEY and does no
+ * role check, so this token authorizes the admin routes. The full-stack idexx scenario needs it to
+ * POST /admin/integrations/:id/start — creating an integration leaves it status NEW and does not
+ * schedule polling; the admin start is what emits `<provider>/integration/create` to the engine. */
+export async function adminLogin (root: ApiClient = ApiClient.create()): Promise<ApiClient> {
+  const { token } = expectOk<{ token: string }>(
+    await root.post('/auth/admin/login', {
+      username: env.admin.username,
+      password: env.admin.password,
+    }),
+    'admin login',
+  )
+  return root.withBearer(token)
+}
+
 export interface SeedOrgOptions {
-  /* provider-configuration `url`. Default is an unreachable .invalid host — fast mode never contacts
-   * the vendor. Full-stack mode passes the demo vendor's compose-network URL. */
+  /* Provider id in the POST /providers/:id/configurations path. Default 'demo'. */
+  providerId?: string
+  /* The `configuration` body posted to POST /providers/:id/configurations. Defaults to the demo
+   * provider's `{ url }` shape (see providerUrl); idexx passes
+   * `{ orderingBaseUrl, resultBaseUrl, 'X-Pims-Id', 'X-Pims-Version' }`. */
+  configuration?: Record<string, unknown>
+  /* Convenience for the default demo `{ url }` configuration. Ignored when `configuration` is given.
+   * Default is an unreachable .invalid host — fast mode never contacts the vendor. */
   providerUrl?: string
   /* integrationOptions merged into the create-integration body. Default is a dummy apiKey; full-stack
-   * mode passes a real key minted from the demo vendor (see mintDemoKey). */
+   * modes pass real credentials (a demo vendor key, or idexx username/password/locale). */
   integrationOptions?: Record<string, unknown>
 }
 
@@ -69,7 +91,9 @@ export async function seedOrganization (
 ): Promise<SeededOrg> {
   const suffix = unique(label)
   const email = `harness-${suffix}@example.test`
+  const providerId = options.providerId ?? 'demo'
   const providerUrl = options.providerUrl ?? DEMO_LAB_URL
+  const configuration = options.configuration ?? { url: providerUrl }
   const integrationOptions = options.integrationOptions ?? { apiKey: `demo-key-${suffix}` }
 
   /* F6: dmi-api's POST /users is broken (see sql.insertUser). Insert the user row directly; the
@@ -94,8 +118,8 @@ export async function seedOrganization (
   const api = root.withApiKey(keys.prodKey)
 
   const providerConfiguration = expectOk<{ id: string }>(
-    await api.post('/providers/demo/configurations', { configuration: { url: providerUrl } }),
-    'configure the demo provider',
+    await api.post(`/providers/${providerId}/configurations`, { configuration }),
+    `configure the ${providerId} provider`,
   )
 
   const practice = expectOk<{ id: string }>(
@@ -147,6 +171,12 @@ export function orderPayload (
       sex: 'MALE',
       species: 'DOG',
       breed: 'LABRADOR',
+      /* A caller-supplied PIMS patient id. It flows to the provider in the create RPC and back in the
+       * result, and dmi-api reconciles a result into its order only when the patient id matches
+       * (ProviderResultUtils.isMatchingOrder). Without one, dmi-api backfills the patient's internal
+       * UUID *after* the provider RPC is built, so the provider never sees it, the result can't echo
+       * it, and the result lands as a duplicate orphan order instead of completing the real one. */
+      identifier: [{ system: 'pims:patient:id', value: unique('pat') }],
     },
     client: { firstName: 'Jane', lastName: 'Doe' },
     veterinarian: { firstName: 'Ann', lastName: 'Vet' },
