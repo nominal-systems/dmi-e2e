@@ -316,11 +316,12 @@ the order lands in `ERROR`).
 
 ## Known gaps
 
-- **CI runs the idexx full-stack job on manual dispatch only.** It needs the `dmi-ci` GitHub App
-  installed on `dmi-engine-idexx-integration` (contents + Packages read) and that repo added to the
-  token's `repositories:` — an org-admin action. Until then the job runs only via `workflow_dispatch`
-  (`run_idexx_full_stack=true`) and never on PR/push, so it cannot break the required fast `harness`
-  check. See `.github/workflows/e2e.yml`.
+- **The idexx full-stack CI job is scoped, not universal.** It lives in its own workflow
+  (`.github/workflows/e2e-idexx.yml`) because it needs a `paths:` filter and those are per-workflow.
+  It runs: on **push to `main`** always; on a **pull request** only when the harness, mock, compose or
+  the idexx scenario changes (a docs or tenant-isolation edit shouldn't pay ~4.5min for ~7
+  containers); and on demand via `workflow_dispatch`. It skips on **fork** PRs, which cannot read the
+  org secrets it needs. The fast `harness` job in `e2e.yml` still runs on every PR.
 - **The demo loop is blocked upstream** (tracked privately). Run it with `HARNESS_STACK=demo`.
 - **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
