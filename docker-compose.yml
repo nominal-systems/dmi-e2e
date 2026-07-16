@@ -10,10 +10,14 @@
 # alongside the harness. Override with HARNESS_*_PORT.
 #
 # The base services (mysql, mongo, activemq) are what dmi-api alone needs and always start. The
-# full-system suite (HARNESS_FULL_STACK=1) additionally starts everything under the `full-stack`
-# profile: redis (Bull queues), the demo vendor API + its own MySQL, and the demo provider
-# integration. Those two app images build from sibling checkouts' (Node-14-era) Dockerfiles and
-# need a GHP_TOKEN build-arg to resolve @nominal-systems/* from GitHub Packages.
+# full-system suite (HARNESS_FULL_STACK=1) additionally starts one provider loop, selected by
+# HARNESS_STACK and mapped to a compose profile:
+#   - `idexx` (default): redis (Bull queues), the VetConnect Plus mock (built from this repo's
+#     src/idexx-mock, zero deps), and the REAL dmi-engine-idexx-integration container.
+#   - `full-stack`: redis, the demo vendor API + its own MySQL, and the demo provider integration
+#     (the pre-existing, upstream-blocked loop).
+# The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
+# @nominal-systems/* from GitHub Packages; the mock needs no token.
 
 name: dmi-e2e
 
@@ -35,17 +39,29 @@ services:
     volumes:
       - mongo-data:/data/db
 
+  # MQTT broker. eclipse-mosquitto 2.x (MQTT 5.0) rather than ActiveMQ 5.x "classic": the DMI
+  # shared-subscription mechanism (dmi-engine-common's SharedMessagePattern/SharedEventPattern ->
+  # `$share/<group>/<topic>`) needs MQTT 5.0 shared subscriptions to route the engine RPCs and the
+  # inbound result/event streams, and ActiveMQ classic (which speaks only MQTT 3.1.1) silently drops
+  # them — a `$share/...` subscriber never receives messages published to the base topic. The service
+  # name stays `activemq` so dmi-api's ACTIVEMQ_* env and the integrations' MQTT_HOST resolve
+  # unchanged. Anonymous, all interfaces — a throwaway broker on a private compose network.
   activemq:
-    image: rmohr/activemq
+    build:
+      context: ./src/mqtt
+      dockerfile_inline: |
+        FROM eclipse-mosquitto:2
+        COPY mosquitto.conf /mosquitto/config/
     ports:
       - '${HARNESS_ACTIVEMQ_PORT:-1884}:1883'
 
   # ---- full-stack profile: the demo provider loop (order -> engine -> vendor -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
+  # Shared by both full-system loops (demo and idexx).
   redis:
     image: redis:7-alpine
-    profiles: ['full-stack']
+    profiles: ['full-stack', 'idexx']
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
 
@@ -143,6 +159,56 @@ services:
       - activemq
       - redis
       - dmi-demo-provider-api
+
+  # ---- idexx profile: the VetConnect Plus loop (order -> engine -> mock vendor -> report) ----
+
+  # VetConnect Plus (IDEXX) mock vendor, built from this repo's zero-dependency Node server. Serves
+  # both the ordering (/api/v1) and results (/api/v3) dialects plus the confirmOrder browser
+  # handshake, and a /__control__ plane the scenario drives to seed results deterministically. Built
+  # inline (a one-line COPY) rather than bind-mounted so the image is self-contained on any host, and
+  # it needs no GHP_TOKEN. `orderingBaseUrl`/`resultBaseUrl` in the dmi-api provider config point at
+  # this service's compose-network name, never at live *.vetconnectplus.com.
+  vetconnect-mock:
+    profiles: ['idexx']
+    build:
+      context: ./src/idexx-mock
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY server.js ./
+        EXPOSE 3000
+        CMD ["node", "server.js"]
+    environment:
+      PORT: '3000'
+    ports:
+      - '${HARNESS_VCP_MOCK_PORT:-3012}:3000'
+
+  # The REAL idexx provider integration (standalone NestJS microservice, one container per provider,
+  # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
+  # vendor over HTTP using the orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the
+  # provider configuration). Built from its own (Node-20) Dockerfile's `production` stage — unlike
+  # the demo repo it needs no inline workaround. The polling intervals are dialed down from the
+  # 30s default so the results loop closes quickly in the harness.
+  dmi-engine-idexx-integration:
+    profiles: ['idexx']
+    build:
+      context: ${DMI_IDEXX_INTEGRATION_DIR:-../dmi-engine-idexx-integration}
+      target: production
+      args:
+        GHP_TOKEN: ${GHP_TOKEN:-}
+    environment:
+      PORT: '3000'
+      MQTT_PROTOCOL: mqtt
+      MQTT_HOST: activemq
+      MQTT_PORT: '1883'
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+      IDEXX_RESULTS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
+      IDEXX_ORDERS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
+    depends_on:
+      - activemq
+      - redis
+      - vetconnect-mock
 
 volumes:
   mysql-data:

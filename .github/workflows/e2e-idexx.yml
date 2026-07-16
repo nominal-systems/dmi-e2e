@@ -1,0 +1,135 @@
+name: e2e-idexx
+
+# Full-system idexx suite (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx): dmi-api + mosquitto + redis +
+# the VetConnect Plus mock (built from this repo) + the REAL dmi-engine-idexx-integration container.
+# It boots ~7 containers and builds the integration image (~4-5 min), so it is scoped deliberately:
+#
+#   - push to main   ALWAYS. Cheap insurance that main never silently breaks, and push events carry
+#                    secrets so there is no fork problem.
+#   - pull_request   Only when the harness, the mock, compose or the idexx scenario actually changes
+#                    — a docs tweak or a tenant-isolation edit shouldn't pay ~4.5min for it. This
+#                    matters more as the antech/zoetis loops land and the fan-out multiplies.
+#   - dispatch       On demand.
+#
+# It lives in its own workflow rather than in e2e.yml because `paths:` filters are per-workflow, not
+# per-job: filtering inside e2e.yml would also gate the fast `harness` job, which must run on every
+# PR. No credentials or real IDEXX endpoints are involved — the harness runs entirely against the mock.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      # The harness plumbing, the VetConnect Plus mock and the broker config all live under src/.
+      - 'src/**'
+      - 'scenarios/idexx-full-stack.e2e.ts'
+      - 'docker-compose.yml'
+      - 'jest.config.js'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/e2e-idexx.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-idexx-${{ github.ref }}
+  cancel-in-progress: true
+
+# packages:read lets the workflow's GITHUB_TOKEN pull @nominal-systems/dmi-engine-common (that
+# package grants this repo Actions read).
+permissions:
+  contents: read
+  packages: read
+
+env:
+  NODE_VERSION: '20.x'
+  DMI_API_REF: main
+
+jobs:
+  idexx-full-stack:
+    name: Idexx full-stack harness
+    runs-on: ubuntu-latest
+    # A PR from a fork cannot read the org secrets this job needs (the dmi-ci app private key), so skip
+    # it cleanly instead of showing a confusing red X — dmi-e2e is public. Note the `event_name` clause:
+    # `github.event.pull_request` is null on push/dispatch, so a bare same-repo comparison would skip
+    # those runs too.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Checkout dmi-e2e
+        uses: actions/checkout@v5
+        with:
+          path: dmi-e2e
+
+      # The default GITHUB_TOKEN is scoped to this repo only and cannot read the private dmi-api /
+      # integration repos. The org's `dmi-ci` GitHub App (contents:read on those repos) mints a
+      # short-lived token per run.
+      - name: Mint checkout token (dmi-api + idexx integration)
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DMI_CI_APP_ID }}
+          private-key: ${{ secrets.DMI_CI_APP_PRIVATE_KEY }}
+          owner: nominal-systems
+          repositories: |
+            dmi-api
+            dmi-engine-idexx-integration
+
+      - name: Checkout dmi-api
+        uses: actions/checkout@v5
+        with:
+          repository: nominal-systems/dmi-api
+          ref: ${{ env.DMI_API_REF }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: dmi-api
+
+      - name: Checkout dmi-engine-idexx-integration
+        uses: actions/checkout@v5
+        with:
+          repository: nominal-systems/dmi-engine-idexx-integration
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: dmi-engine-idexx-integration
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            dmi-e2e/package-lock.json
+            dmi-api/package-lock.json
+
+      - name: Install harness dependencies
+        working-directory: dmi-e2e
+        run: npm install --no-audit --no-fund
+
+      - name: Install dmi-api dependencies
+        working-directory: dmi-api
+        run: npm install --no-audit --no-fund
+        env:
+          GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Typecheck harness
+        working-directory: dmi-e2e
+        run: npm run typecheck
+
+      # The idexx integration image resolves @nominal-systems/dmi-engine-common from GitHub Packages at
+      # build time. GHP_TOKEN is the workflow's own GITHUB_TOKEN, not the app token: that package grants
+      # this repo Actions read (which is how the fast job installs it), whereas an app token can only
+      # read packages of repos inside its installation — and dmi-engine-common is not one of them. The
+      # app token is only needed for the private *checkouts* above. The mock image needs no token.
+      - name: Run the idexx full-stack harness
+        working-directory: dmi-e2e
+        run: npm run test:harness
+        env:
+          HARNESS_FULL_STACK: '1'
+          HARNESS_STACK: idexx
+          DMI_API_DIR: ${{ github.workspace }}/dmi-api
+          DMI_IDEXX_INTEGRATION_DIR: ${{ github.workspace }}/dmi-engine-idexx-integration
+          GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dump container logs on failure
+        if: failure()
+        working-directory: dmi-e2e
+        run: docker compose --profile idexx logs --no-color --tail=200

@@ -2,17 +2,21 @@
  * normal) and so cannot share one app process:
  *
  *   - fast (default):      smoke + tenant-isolation, dmi-api alone under NODE_ENV=seed.
- *   - full-stack:          the demo provider loop, dmi-api under a normal NODE_ENV against the real
- *                          engine/vendor stack. Selected by HARNESS_FULL_STACK=1.
+ *   - full-stack:          a real provider loop, dmi-api under a normal NODE_ENV against the real
+ *                          engine/vendor stack. Selected by HARNESS_FULL_STACK=1; HARNESS_STACK then
+ *                          picks WHICH loop — 'idexx' (default: idexx integration + VetConnect Plus
+ *                          mock) runs scenarios/idexx-full-stack.e2e.ts; 'demo' (upstream-blocked)
+ *                          runs scenarios/full-stack-smoke.e2e.ts.
  *
- * Only the selected project is included, so globalSetup/globalTeardown (which read env.fullStack to
- * bring up the right containers and app env) run exactly once per run. Global options (globalSetup,
- * globalTeardown, maxWorkers, testTimeout, verbose) live at the root — jest ignores them inside a
- * project config; only test-selection options are per-project. Scoped to scenarios/ so the helpers
- * in src/ are never picked up as test files. */
+ * Only the selected project is included, so globalSetup/globalTeardown (which read env.fullStack /
+ * env.stack to bring up the right containers and app env) run exactly once per run. Global options
+ * (globalSetup, globalTeardown, maxWorkers, testTimeout, verbose) live at the root — jest ignores
+ * them inside a project config; only test-selection options are per-project. Scoped to scenarios/ so
+ * the helpers in src/ are never picked up as test files. */
 const fullStack =
   process.env.HARNESS_FULL_STACK === '1' ||
   (process.env.HARNESS_FULL_STACK ?? '').toLowerCase() === 'true'
+const stack = (process.env.HARNESS_STACK ?? 'idexx').toLowerCase() === 'demo' ? 'demo' : 'idexx'
 
 const projectCommon = {
   rootDir: __dirname,
@@ -32,8 +36,11 @@ const fastProject = {
 
 const fullStackProject = {
   ...projectCommon,
-  displayName: 'full-stack',
-  testMatch: ['<rootDir>/scenarios/full-stack-*.e2e.ts'],
+  displayName: `full-stack:${stack}`,
+  testMatch:
+    stack === 'demo'
+      ? ['<rootDir>/scenarios/full-stack-smoke.e2e.ts']
+      : ['<rootDir>/scenarios/idexx-full-stack.e2e.ts'],
 }
 
 module.exports = {

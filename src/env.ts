@@ -50,10 +50,14 @@ export interface HarnessEnv {
   mysql: MysqlEnv
   mongoUri: string
   activemq: { hostname: string, port: number }
-  /* HARNESS_FULL_STACK=1 selects the full-system suite: dmi-api under a normal NODE_ENV against the
-   * real demo provider stack (redis + demo-provider-api + demo integration), instead of the default
-   * fast suite (NODE_ENV=seed, dmi-api alone). */
+  /* HARNESS_FULL_STACK=1 selects a full-system suite: dmi-api under a normal NODE_ENV against a real
+   * provider loop (redis + a vendor + its integration), instead of the default fast suite
+   * (NODE_ENV=seed, dmi-api alone). */
   fullStack: boolean
+  /* Which full-system loop HARNESS_FULL_STACK=1 runs: 'idexx' (the real idexx integration + the
+   * VetConnect Plus mock, the Phase 0 default) or 'demo' (the pre-existing, upstream-blocked demo
+   * loop). Ignored unless fullStack is set. Each maps to its own compose profile and scenario file. */
+  stack: 'idexx' | 'demo'
   demoProvider: {
     /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
      * demo-provider-api's `/demo` global prefix. */
@@ -61,6 +65,24 @@ export interface HarnessEnv {
     /* Compose-network base URL the integration container uses to reach the vendor. Stored verbatim
      * in the dmi-api provider configuration, so it must resolve inside the compose network. */
     internalUrl: string
+  }
+  idexx: {
+    /* Host-facing base URL of the VetConnect Plus mock (published port). Tests drive the mock's
+     * control plane (/__control__/*) and readiness (/status) through this. */
+    mockBaseUrl: string
+    /* Compose-network base URLs the idexx integration container uses to reach the mock, stored
+     * verbatim in the dmi-api provider configuration so they must resolve inside the compose
+     * network. Ordering (/api/v1) and results (/api/v3) are served by the one mock, so both point at
+     * it. */
+    orderingBaseUrl: string
+    resultBaseUrl: string
+    /* Provider-configuration PIMS headers and integration credentials. All DUMMY — the mock never
+     * authenticates for real. Never point these (or the base URLs) at live *.vetconnectplus.com. */
+    pimsId: string
+    pimsVersion: string
+    username: string
+    password: string
+    locale: string
   }
   /* Orchestration. Set HARNESS_BASE_URL to point at a dmi-api you started yourself, in which case
    * the harness neither builds nor spawns one, and never touches DMI_API_DIR. */
@@ -75,7 +97,16 @@ const harnessRoot = path.resolve(__dirname, '..')
 const host = str('HARNESS_HOST', '127.0.0.1')
 const appPort = int('HARNESS_APP_PORT', 3010)
 const demoProviderPort = int('HARNESS_DEMO_PROVIDER_PORT', 3011)
+const vcpMockPort = int('HARNESS_VCP_MOCK_PORT', 3012)
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
+
+function stackChoice (): 'idexx' | 'demo' {
+  const value = str('HARNESS_STACK', 'idexx').toLowerCase()
+  if (value !== 'idexx' && value !== 'demo') {
+    throw new Error(`HARNESS_STACK must be 'idexx' or 'demo', got '${value}'`)
+  }
+  return value
+}
 
 export const env: HarnessEnv = {
   harnessRoot,
@@ -106,9 +137,20 @@ export const env: HarnessEnv = {
     port: int('HARNESS_ACTIVEMQ_PORT', 1884),
   },
   fullStack: flag('HARNESS_FULL_STACK', false),
+  stack: stackChoice(),
   demoProvider: {
     baseUrl: str('HARNESS_DEMO_PROVIDER_URL', `http://${host}:${demoProviderPort}/demo`),
     internalUrl: str('HARNESS_DEMO_PROVIDER_INTERNAL_URL', 'http://dmi-demo-provider-api:3000/demo'),
+  },
+  idexx: {
+    mockBaseUrl: str('HARNESS_VCP_MOCK_URL', `http://${host}:${vcpMockPort}`),
+    orderingBaseUrl: str('HARNESS_IDEXX_ORDERING_URL', 'http://vetconnect-mock:3000'),
+    resultBaseUrl: str('HARNESS_IDEXX_RESULT_URL', 'http://vetconnect-mock:3000'),
+    pimsId: str('HARNESS_IDEXX_PIMS_ID', 'dmi-e2e-harness'),
+    pimsVersion: str('HARNESS_IDEXX_PIMS_VERSION', '1.0.0'),
+    username: str('HARNESS_IDEXX_USERNAME', 'harness-user'),
+    password: str('HARNESS_IDEXX_PASSWORD', 'harness-pass'),
+    locale: str('HARNESS_IDEXX_LOCALE', 'en'),
   },
   manageContainers: flag('HARNESS_MANAGE_CONTAINERS', true),
   manageApp: flag('HARNESS_MANAGE_APP', explicitBaseUrl == null),

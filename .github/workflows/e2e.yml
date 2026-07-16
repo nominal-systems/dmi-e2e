@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       run_full_stack:
-        description: 'Attempt the full-stack harness job (blocked upstream; see full-stack job)'
+        description: 'Attempt the demo full-stack harness job (blocked upstream; see full-stack job)'
         type: boolean
         default: false
 
@@ -116,6 +116,10 @@ jobs:
           echo "  2) Add both repos to the create-github-app-token 'repositories:' list."
           echo "  3) Check out both repos, then 'docker compose --profile full-stack build' with"
           echo "     GHP_TOKEN from the app token (GitHub Packages read), as the fast job does for dmi-api."
-          echo "  4) Run 'npm run test:harness' with HARNESS_FULL_STACK=1 and DMI_API_DIR set."
+          echo "  4) Run 'npm run test:harness' with HARNESS_FULL_STACK=1 HARNESS_STACK=demo and DMI_API_DIR set."
           echo "  5) Un-skip the completion suite in scenarios/full-stack-smoke.e2e.ts and delete the"
           echo "     CONFIRMED test."
+
+  # The idexx full-stack suite lives in its own workflow (.github/workflows/e2e-idexx.yml): it needs a
+  # `paths:` filter on pull_request, and those filters are per-workflow — applying one here would also
+  # gate the fast `harness` job above, which must run on every PR.
