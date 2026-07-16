@@ -126,13 +126,12 @@ jobs:
 
   # Idexx full-stack suite (HARNESS_FULL_STACK=1, default HARNESS_STACK=idexx): dmi-api + redis + the
   # VetConnect Plus mock (built from this repo) + the REAL dmi-engine-idexx-integration container.
-  # Unlike the demo loop this one CLOSES end to end (verified locally), so the only thing gating CI is
-  # provisioning: the `dmi-ci` GitHub App must be installed on nominal-systems/dmi-engine-idexx-integration
-  # (contents:read for checkout, Packages:read for the @nominal-systems/* image build) and that repo added
-  # to the create-github-app-token 'repositories:' list below. Until an org admin does that, this job runs
-  # only on a manual dispatch (run_idexx_full_stack=true) and never on PR/push, so it cannot break the
-  # required fast `harness` check. No credentials or real IDEXX endpoints are involved — the harness runs
-  # entirely against the mock.
+  # Unlike the demo loop this one CLOSES end to end. `dmi-ci` is provisioned on
+  # nominal-systems/dmi-engine-idexx-integration, so the checkout below works. It is still manual-dispatch
+  # only (run_idexx_full_stack=true) and never runs on PR/push: it boots ~7 containers and builds the
+  # integration image, so whether to promote it to a per-PR gate is a cost/runtime call for the team —
+  # until then it cannot slow or break the required fast `harness` check. No credentials or real IDEXX
+  # endpoints are involved — the harness runs entirely against the mock.
   idexx-full-stack:
     name: Idexx full-stack harness (manual dispatch)
     runs-on: ubuntu-latest
@@ -197,8 +196,11 @@ jobs:
         working-directory: dmi-e2e
         run: npm run typecheck
 
-      # The idexx integration image resolves @nominal-systems/* from GitHub Packages at build time, so the
-      # app token (Packages:read) is passed as GHP_TOKEN. The mock image needs no token.
+      # The idexx integration image resolves @nominal-systems/dmi-engine-common from GitHub Packages at
+      # build time. GHP_TOKEN is the workflow's own GITHUB_TOKEN, not the app token: that package grants
+      # this repo Actions read (which is how the fast job installs it), whereas an app token can only
+      # read packages of repos inside its installation — and dmi-engine-common is not one of them. The
+      # app token is only needed for the private *checkouts* above. The mock image needs no token.
       - name: Run the idexx full-stack harness
         working-directory: dmi-e2e
         run: npm run test:harness
@@ -207,7 +209,7 @@ jobs:
           HARNESS_STACK: idexx
           DMI_API_DIR: ${{ github.workspace }}/dmi-api
           DMI_IDEXX_INTEGRATION_DIR: ${{ github.workspace }}/dmi-engine-idexx-integration
-          GHP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Dump container logs on failure
         if: failure()
