@@ -171,11 +171,11 @@ export function orderPayload (
       sex: 'MALE',
       species: 'DOG',
       breed: 'LABRADOR',
-      /* A caller-supplied PIMS patient id. It flows to the provider in the create RPC and back in the
-       * result, and dmi-api reconciles a result into its order only when the patient id matches
-       * (ProviderResultUtils.isMatchingOrder). Without one, dmi-api backfills the patient's internal
-       * UUID *after* the provider RPC is built, so the provider never sees it, the result can't echo
-       * it, and the result lands as a duplicate orphan order instead of completing the real one. */
+      /* A caller-supplied PIMS patient id. dmi-api reconciles a provider result into its order only
+       * when their `pims:patient:id` matches (ProviderResultUtils.isMatchingOrder); without one, the
+       * result lands as a duplicate orphan order while the original stays SUBMITTED — a dmi-api
+       * reconciliation bug tracked as nominal-systems/dmi-api#334. Supplying one (the mock echoes it
+       * back in the result) is the workaround so the loop closes; it can be dropped once #334 lands. */
       identifier: [{ system: 'pims:patient:id', value: unique('pat') }],
     },
     client: { firstName: 'Jane', lastName: 'Doe' },

@@ -297,7 +297,10 @@ next integration:
   from `POST /auth/admin/login`.
 - **Results correlate to an order by its `externalId`** (the vendor order id the create RPC returned),
   and dmi-api completes the order only when the result's PIMS patient id matches the order's — so the
-  order carries a `pims:patient:id` and the mock echoes it back in the result.
+  order carries a `pims:patient:id` and the mock echoes it back in the result. Without one, the result
+  lands as a duplicate orphan order and the original stays `SUBMITTED` — a dmi-api reconciliation bug
+  tracked as [nominal-systems/dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334);
+  the `pims:patient:id` is the workaround until it lands.
 - **The broker must speak MQTT 5.0 shared subscriptions.** The engine transport uses
   `$share/<group>/<topic>` subscriptions; ActiveMQ 5.x "classic" (the old harness broker) silently
   drops them, so the harness broker is `eclipse-mosquitto:2` (see "The MQTT broker" below).
