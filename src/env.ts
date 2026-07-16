@@ -55,9 +55,10 @@ export interface HarnessEnv {
    * (NODE_ENV=seed, dmi-api alone). */
   fullStack: boolean
   /* Which full-system loop HARNESS_FULL_STACK=1 runs: 'idexx' (the real idexx integration + the
-   * VetConnect Plus mock, the Phase 0 default) or 'demo' (the pre-existing, upstream-blocked demo
-   * loop). Ignored unless fullStack is set. Each maps to its own compose profile and scenario file. */
-  stack: 'idexx' | 'demo'
+   * VetConnect Plus mock, the Phase 0 default), 'antech' (the real classic-antech integration + the
+   * Antech mock) or 'demo' (the pre-existing, upstream-blocked demo loop). Ignored unless fullStack
+   * is set. Each maps to its own compose profile and scenario file. */
+  stack: 'idexx' | 'antech' | 'demo'
   demoProvider: {
     /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
      * demo-provider-api's `/demo` global prefix. */
@@ -84,6 +85,28 @@ export interface HarnessEnv {
     password: string
     locale: string
   }
+  antech: {
+    /* Host-facing base URL of the Antech mock (published port). Tests drive the mock's control plane
+     * (/__control__/*) and readiness (/status) through this. */
+    mockBaseUrl: string
+    /* Compose-network base URL the antech integration container uses to reach the mock, stored
+     * verbatim in the dmi-api provider configuration so it must resolve inside the compose network.
+     * The integration appends /api/v1.1/<endpoint> to it. */
+    baseUrl: string
+    /* Antech's web host. The integration only string-builds submission/manifest URIs from it and
+     * never calls it over HTTP, but it is a required provider-configuration option — so it points at
+     * the mock too rather than at a live Antech host. */
+    uiBaseUrl: string
+    /* Provider-configuration PIMS identifier, and the integration credentials. All DUMMY — the mock
+     * never authenticates for real. Never point these (or the base URLs) at a live Antech host. */
+    pimsIdentifier: string
+    username: string
+    password: string
+    clinicId: string
+    /* dmi-api declares LabId as an `integer` provider option and validates it with is-my-json-valid,
+     * which rejects a string — so this stays a number all the way to POST /integrations. */
+    labId: number
+  }
   /* Orchestration. Set HARNESS_BASE_URL to point at a dmi-api you started yourself, in which case
    * the harness neither builds nor spawns one, and never touches DMI_API_DIR. */
   manageContainers: boolean
@@ -98,12 +121,13 @@ const host = str('HARNESS_HOST', '127.0.0.1')
 const appPort = int('HARNESS_APP_PORT', 3010)
 const demoProviderPort = int('HARNESS_DEMO_PROVIDER_PORT', 3011)
 const vcpMockPort = int('HARNESS_VCP_MOCK_PORT', 3012)
+const antechMockPort = int('HARNESS_ANTECH_MOCK_PORT', 3013)
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
 
-function stackChoice (): 'idexx' | 'demo' {
+function stackChoice (): 'idexx' | 'antech' | 'demo' {
   const value = str('HARNESS_STACK', 'idexx').toLowerCase()
-  if (value !== 'idexx' && value !== 'demo') {
-    throw new Error(`HARNESS_STACK must be 'idexx' or 'demo', got '${value}'`)
+  if (value !== 'idexx' && value !== 'antech' && value !== 'demo') {
+    throw new Error(`HARNESS_STACK must be 'idexx', 'antech' or 'demo', got '${value}'`)
   }
   return value
 }
@@ -151,6 +175,18 @@ export const env: HarnessEnv = {
     username: str('HARNESS_IDEXX_USERNAME', 'harness-user'),
     password: str('HARNESS_IDEXX_PASSWORD', 'harness-pass'),
     locale: str('HARNESS_IDEXX_LOCALE', 'en'),
+  },
+  antech: {
+    mockBaseUrl: str('HARNESS_ANTECH_MOCK_URL', `http://${host}:${antechMockPort}`),
+    baseUrl: str('HARNESS_ANTECH_BASE_URL', 'http://antech-mock:3000'),
+    uiBaseUrl: str('HARNESS_ANTECH_UI_BASE_URL', 'http://antech-mock:3000'),
+    /* Antech documents this as a 3-4 letter PIMS identifier; it only ever appears in a generated
+     * requisition id, and the harness supplies its own requisitionId anyway. */
+    pimsIdentifier: str('HARNESS_ANTECH_PIMS_IDENTIFIER', 'HRN'),
+    username: str('HARNESS_ANTECH_USERNAME', 'harness-user'),
+    password: str('HARNESS_ANTECH_PASSWORD', 'harness-pass'),
+    clinicId: str('HARNESS_ANTECH_CLINIC_ID', '900001'),
+    labId: int('HARNESS_ANTECH_LAB_ID', 1),
   },
   manageContainers: flag('HARNESS_MANAGE_CONTAINERS', true),
   manageApp: flag('HARNESS_MANAGE_APP', explicitBaseUrl == null),

@@ -14,6 +14,8 @@
 # HARNESS_STACK and mapped to a compose profile:
 #   - `idexx` (default): redis (Bull queues), the VetConnect Plus mock (built from this repo's
 #     src/idexx-mock, zero deps), and the REAL dmi-engine-idexx-integration container.
+#   - `antech`: redis, the Antech mock (built from this repo's src/antech-mock, zero deps), and the
+#     REAL dmi-engine-antech-integration container (the classic antech provider, id `antech`).
 #   - `full-stack`: redis, the demo vendor API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
@@ -58,10 +60,10 @@ services:
   # ---- full-stack profile: the demo provider loop (order -> engine -> vendor -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
-  # Shared by both full-system loops (demo and idexx).
+  # Shared by every full-system loop (demo, idexx and antech).
   redis:
     image: redis:7-alpine
-    profiles: ['full-stack', 'idexx']
+    profiles: ['full-stack', 'idexx', 'antech']
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
 
@@ -209,6 +211,57 @@ services:
       - activemq
       - redis
       - vetconnect-mock
+
+  # ---- antech profile: the classic Antech loop (order -> engine -> mock vendor -> report) ----
+
+  # Antech mock vendor, built from this repo's zero-dependency Node server. Serves Antech's
+  # /api/v1.1 dialect (token login, order placement, the JSON status poll / acknowledge pair, the
+  # results XML document and the PDF manifest) plus a /__control__ plane the scenario drives to seed
+  # results deterministically. Built inline (a one-line COPY) rather than bind-mounted so the image
+  # is self-contained on any host, and it needs no GHP_TOKEN. `baseUrl`/`uiBaseUrl` in the dmi-api
+  # provider config point at this service's compose-network name, never at a live Antech host.
+  antech-mock:
+    profiles: ['antech']
+    build:
+      context: ./src/antech-mock
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY server.js ./
+        EXPOSE 3000
+        CMD ["node", "server.js"]
+    environment:
+      PORT: '3000'
+    ports:
+      - '${HARNESS_ANTECH_MOCK_PORT:-3013}:3000'
+
+  # The REAL classic-antech provider integration (standalone NestJS microservice, one container per
+  # provider, matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches
+  # the mock vendor over HTTP using the baseUrl carried inside each MQTT message (the provider
+  # configuration). Built from its own (Node-20) Dockerfile's `production` stage — like idexx, and
+  # unlike the demo repo, it needs no inline workaround.
+  #
+  # Note there is no polling-interval env var to set here: the antech integration hardcodes both its
+  # results and orders Bull intervals to 30s (src/config/configuration.ts), where idexx exposes
+  # IDEXX_*_POLLING_INTERVAL_MS. That is why the antech scenario budgets a longer completion wait.
+  dmi-engine-antech-integration:
+    profiles: ['antech']
+    build:
+      context: ${DMI_ANTECH_INTEGRATION_DIR:-../dmi-engine-antech-integration}
+      target: production
+      args:
+        GHP_TOKEN: ${GHP_TOKEN:-}
+    environment:
+      PORT: '3000'
+      MQTT_PROTOCOL: mqtt
+      MQTT_HOST: activemq
+      MQTT_PORT: '1883'
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    depends_on:
+      - activemq
+      - redis
+      - antech-mock
 
 volumes:
   mysql-data:
