@@ -178,12 +178,23 @@ documented, so the contract mirrored here was read out of the integration's own 
   `LabTests[].DisplayName` matching `<UnitCode><Name>` byte-for-byte, so the mock generates both from
   one constant rather than writing the name out twice.
 - **Control plane** (`/__control__/*`, host-facing): seed a (synthetic) result for an order, list or
-  inspect the orders the mock received, reset state, and inject error scenarios — the same
-  determinism story as the idexx mock: no results exist until a test seeds one.
+  inspect the orders the mock received, read its service catalogue, reset state, and inject error
+  scenarios — the same determinism story as the idexx mock: no results exist until a test seeds one.
+
+**It validates rather than defaults, deliberately.** A mock that quietly substitutes its own value
+for a field the integration failed to send doesn't test the integration — it agrees with it, and the
+assertions downstream then pass against the mock's own invention. So order placement **rejects** a
+request missing the patient name, sex, species, breed, client/doctor surname or tests; login rejects
+missing credentials (their *values* are dummy and unchecked, but their *presence* is contract); and
+placement rejects any test code outside the mock's service catalogue, which is the same list its
+`External/ServiceList` advertises. Antech mnemonics are 4–7 characters (`SA804`, `S16100`, `T960`) —
+notably **not** the bare `SA` the IDEXX mock uses, which is how an IDEXX-shaped placeholder can drift
+into an Antech test and pass against a permissive mock.
 
 All of its canned data is **synthetic** — invented values shaped like Antech responses, never
-captured clinic/patient data — and it never authenticates for real (any credentials are accepted and
-the token is a fixed dummy).
+captured clinic/patient data. The service mnemonics are genuine Antech catalogue codes (vendor
+identifiers published to integrators, not clinic or patient data); the descriptions and prices
+attached to them are invented. It never authenticates for real: the token is a fixed dummy.
 
 ### The MQTT broker
 
@@ -293,6 +304,7 @@ src/
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   idexx-mock/server.js        the VetConnect Plus mock vendor (zero-dependency Node HTTP server)
   antech-mock/server.js       the Antech mock vendor (zero-dependency Node HTTP server)
+  poll.ts                     pollUntil, shared by the full-system scenarios
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 scenarios/
@@ -393,6 +405,14 @@ taught us, beyond the mechanics above:
   `ClinicAccessionID` — so a vendor whose placement response is anything other than the
   ClinicAccessionID would strand every result as an orphan. The mock echoes the requisition id back,
   which is the only self-consistent reading of the contract.
+- **A mock that defaults is a mock that agrees with you.** The first cut of the antech mock filled in
+  `PetName`/`ClientLastName`/test-code when an order omitted them — with exactly the values the
+  scenario then asserted. That made the order-forwarding test unfalsifiable, and because dmi-api
+  reconciles results on patient name + client last name, the fabricated values kept completion, the
+  report and `/events` green too: an integration that stopped forwarding the patient would have
+  shipped a permanently green gate. The mocks now validate required fields and reject unknown test
+  codes. Worth checking in any vendor mock: **for each field the scenario asserts, ask what happens if
+  the integration stops sending it.** If the answer isn't "the test fails", the assertion is decorative.
 - **A failing antech results poll is silent**, so shape errors in the mock are invisible from outside:
   a healthy poll and a fatally broken one look identical, with no log output either way. The mock's
   response shapes were therefore verified directly against the mapper's accessors (and `xmlbuilder2`'s

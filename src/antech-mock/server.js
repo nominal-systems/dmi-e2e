@@ -156,13 +156,32 @@ const ORDER_STATUS_COMPLETED = 7
  * the integration joins the status JSON to the results XML by matching LabTests[].DisplayName
  * against the XML's <UnitCode><Name> BYTE-FOR-BYTE (antech.service.ts getBatchResults), so both are
  * generated from this single constant rather than written out twice. `mnemonic` becomes the report's
- * testResultsSet[].code; it defaults to the code the order was actually placed with. */
+ * testResultsSet[].code, and is the code the order was actually placed with. */
 const PANEL = {
   codeId: 8001,
   codeType: 'U',
   unitCodeExtId: '8001',
   displayName: 'Small Animal Chemistry Panel',
 }
+
+/* The mnemonics this mock will accept on an order, i.e. its service catalogue. Antech mnemonics are
+ * 4-7 character codes (`SA804`, `S16100`, `T960`, …) — NOT the bare `SA` that the IDEXX mock uses,
+ * which Antech would reject outright. Ordering a code that is not in this list is a 400, so the
+ * catalogue below is a real constraint rather than decoration: a scenario that drifts onto an
+ * implausible code fails here instead of quietly passing against a mock that accepts anything.
+ *
+ * The codes are genuine Antech service mnemonics (vendor catalogue identifiers, published to
+ * integrators — not clinic or patient data); every description and price attached to them here is
+ * invented. */
+const SERVICES = [
+  { mnemonic: 'SA804', description: PANEL.displayName, price: 45.0, category: 'Chemistry' },
+  { mnemonic: 'SA010', description: 'Small Animal CBC', price: 32.5, category: 'Hematology' },
+  { mnemonic: 'S16100', description: 'Blood Type Panel', price: 78.0, category: 'Immunology' },
+]
+
+/* The code the harness orders by default. Exported through /__control__ so the scenario asserts
+ * against the same catalogue the mock enforces, rather than a literal duplicated on both sides. */
+const DEFAULT_SERVICE_CODE = 'SA804'
 
 /* Invented analytes chosen to exercise every branch of the result mapper the scenario asserts on:
  *   - Glucose:   numeric + units + a parseable range + Abnormal=H -> valueQuantity, referenceRange,
@@ -369,8 +388,21 @@ async function handleLogin (req, res) {
     return
   }
   /* The integration POSTs its integrationOptions verbatim ({ UserName, Password, ClinicID, LabId })
-   * and reads only `Token` off the response. Credentials are dummy and deliberately not checked. */
-  await readBody(req)
+   * and reads only `Token` off the response.
+   *
+   * The credential VALUES are deliberately not checked — they are dummy by design and checking them
+   * would test nothing. Their PRESENCE is checked, because that is a real contract: an integration
+   * that stopped forwarding its credentials would still authenticate against a mock that accepted
+   * `{}`, and every downstream call would keep working. Real Antech would reject it. */
+  const credentials = await readBody(req)
+  const missing = ['UserName', 'Password', 'ClinicID', 'LabId'].filter(
+    (key) => credentials[key] == null || String(credentials[key]) === '',
+  )
+  if (missing.length > 0) {
+    log(`rejected login — missing credential field(s): ${missing.join(', ')}`)
+    sendJson(res, 401, { Message: `missing credential field(s): ${missing.join(', ')}` })
+    return
+  }
   sendJson(res, 200, { Token: ACCESS_TOKEN })
 }
 
@@ -382,13 +414,46 @@ async function handleOrderPlacement (req, res) {
   }
 
   const payload = await readBody(req)
-  const clinicAccessionId = String(payload.ClinicAccessionID ?? '')
-  if (clinicAccessionId === '') {
-    sendJson(res, 400, { Message: 'ClinicAccessionID is required' })
+
+  /* Validate rather than default. This is the difference between a mock that tests the integration
+   * and one that flatters it: every field below is one the real vendor needs and the scenario later
+   * asserts on, so substituting a fallback here would make the mock AGREE with an integration that
+   * had stopped sending it — the order-forwarding assertions would then pass against the mock's own
+   * invented values and could never fail. A missing field must be a loud 400, not a silent default.
+   * (The same trap applies downstream: dmi-api reconciles results to orders on patient name + client
+   * last name, so fabricated names would keep the whole loop green too.) */
+  const required = [
+    'ClinicAccessionID',
+    'PetName',
+    'PetSex',
+    'SpeciesID',
+    'BreedID',
+    'ClientLastName',
+    'DoctorLastName',
+  ]
+  const missing = required.filter((key) => payload[key] == null || String(payload[key]) === '')
+  if (!Array.isArray(payload.Tests) || payload.Tests.length === 0) missing.push('Tests')
+  if (missing.length > 0) {
+    log(`rejected order placement — missing required field(s): ${missing.join(', ')}`)
+    sendJson(res, 400, { Message: `missing required field(s): ${missing.join(', ')}` })
     return
   }
 
-  const firstTest = Array.isArray(payload.Tests) && payload.Tests.length > 0 ? payload.Tests[0] : {}
+  const clinicAccessionId = String(payload.ClinicAccessionID)
+  const firstTest = payload.Tests[0]
+  const mnemonic = String(firstTest.Code ?? '')
+  /* The vendor only accepts codes from its own catalogue (see SERVICES). Rejecting an unknown code
+   * is what stops the harness from drifting onto a plausible-looking code the real Antech would
+   * refuse — which is precisely how the bare IDEXX-flavoured `SA` slipped in originally. */
+  if (!SERVICES.some((service) => service.mnemonic === mnemonic)) {
+    log(`rejected order placement — unknown test code '${mnemonic}'`)
+    sendJson(res, 400, {
+      Message: `unknown test code '${mnemonic}'`,
+      ModelState: { 'Request.Tests': [`'${mnemonic}' is not in this lab's service list`] },
+    })
+    return
+  }
+
   const order = {
     clinicAccessionId,
     /* Lab-side ids the vendor assigns. `labAccessionId` is the ack key and the XML join key. */
@@ -403,24 +468,27 @@ async function handleOrderPlacement (req, res) {
      * self-quieting, so a placed order doesn't replay on every 30s tick for the rest of the run. */
     orderAcked: false,
     /* The ordered test code doubles as the result panel's Mnemonic and the XML's OrderCode. */
-    mnemonic: String(firstTest.Code ?? 'SA'),
+    mnemonic,
     petId: payload.PetID != null ? String(payload.PetID) : null,
-    petName: String(payload.PetName ?? 'Rex'),
-    petSex: String(payload.PetSex ?? 'M'),
+    petName: String(payload.PetName),
+    petSex: String(payload.PetSex),
+    /* Age/weight are genuinely optional on an Antech order (the integration sends PetAge 0/'Y' when
+     * the patient has no birthdate, and omits weight entirely when there is none), so unlike the
+     * fields above these do carry a fallback. */
     petAge: payload.PetAge ?? 0,
     petAgeUnits: String(payload.PetAgeUnits ?? 'Y'),
     /* Species/Breed arrive as whatever dmi-api's antech ref mapping produced for the order's
      * species/breed (a numeric antech code when mapped, the raw code when not). Echoed back
      * unchanged; the names below are cosmetic labels for the XML. */
-    speciesId: payload.SpeciesID ?? 'C',
-    breedId: payload.BreedID ?? 'LAB',
+    speciesId: payload.SpeciesID,
+    breedId: payload.BreedID,
     speciesName: 'Canine',
     breedName: 'Labrador Retriever',
     clientId: payload.ClientID != null ? String(payload.ClientID) : null,
-    clientFirstName: String(payload.ClientFirstName ?? 'Jane'),
-    clientLastName: String(payload.ClientLastName ?? 'Doe'),
-    doctorFirstName: String(payload.DoctorFirstName ?? 'Ann'),
-    doctorLastName: String(payload.DoctorLastName ?? 'Vet'),
+    clientFirstName: String(payload.ClientFirstName ?? ''),
+    clientLastName: String(payload.ClientLastName),
+    doctorFirstName: String(payload.DoctorFirstName ?? ''),
+    doctorLastName: String(payload.DoctorLastName),
     /* Set by POST /__control__/orders/:id/results. Until then the order has no result and the
      * labResult poll stays empty, which is what makes the loop deterministic. */
     result: null,
@@ -507,20 +575,34 @@ async function handleAckStatus (req, res) {
   const body = await readBody(req)
   /* Note the shapes differ between the two channels (antech.service.ts): orders ack with
    * `ClinicAccessionIds`, results with `LabAccessionsIds` (plural "Accessions" — not a typo here).
-   * The response body is ignored by the integration. */
+   * The response body is ignored by the integration.
+   *
+   * Acknowledging an id the mock never issued is answered 200 rather than 4xx — deliberately. Ack is
+   * idempotent-by-nature at the vendor (a retried batch must not fail), and the integration's error
+   * path is fragile enough that a 4xx here would surface as a confusing unrelated failure. It IS
+   * logged, so an integration acking phantom ids is visible in the container logs rather than
+   * silently absorbed. */
+  const unknown = []
   if (body.ServiceType === 'labOrder') {
-    for (const id of body.ClinicAccessionIds ?? []) {
-      const order = state.orders.get(String(id))
+    const ids = (body.ClinicAccessionIds ?? []).map(String)
+    for (const id of ids) {
+      const order = state.orders.get(id)
       if (order != null) order.orderAcked = true
+      else unknown.push(id)
     }
-    log(`acknowledged orders: ${(body.ClinicAccessionIds ?? []).join(', ')}`)
+    log(`acknowledged orders: ${ids.join(', ')}`)
   } else if (body.ServiceType === 'labResult') {
     const ids = (body.LabAccessionsIds ?? []).map(String)
+    const known = new Set(
+      [...state.orders.values()].filter((order) => order.result != null).map((order) => order.labAccessionId),
+    )
     for (const order of state.orders.values()) {
       if (order.result != null && ids.includes(order.labAccessionId)) order.resultAcked = true
     }
+    unknown.push(...ids.filter((id) => !known.has(id)))
     log(`acknowledged results: ${ids.join(', ')}`)
   }
+  if (unknown.length > 0) log(`WARNING: acknowledged unknown accession id(s): ${unknown.join(', ')}`)
   sendJson(res, 200, {})
 }
 
@@ -627,23 +709,28 @@ const routes = [
   ['GET', new RegExp(`^${API}/LabOrders/PDFPIMS$`), handleManifest],
 
   /* Reference data. The harness never triggers a ref sync, but the integration exposes these and a
-   * mock that 404s on them would be a trap for the next scenario. Synthetic single entries. */
+   * mock that 404s on them would be a trap for the next scenario. The service list is the same
+   * SERVICES catalogue that order placement enforces, so what the vendor advertises and what it
+   * accepts cannot drift apart. */
   ['GET', new RegExp(`^${API}/External/ServiceList$`), (req, res) =>
-    sendJson(res, 200, [
-      {
-        CodeID: PANEL.codeId,
-        LabID: 1,
-        CodeType: PANEL.codeType,
-        Mnemonic: 'SA',
-        Description: PANEL.displayName,
-        Price: 45.0,
-        Category: 'Chemistry',
-      },
-    ])],
+    sendJson(res, 200, SERVICES.map((service, index) => ({
+      CodeID: PANEL.codeId + index,
+      LabID: 1,
+      CodeType: PANEL.codeType,
+      Mnemonic: service.mnemonic,
+      Description: service.description,
+      Price: service.price,
+      Category: service.category,
+    })))],
   ['GET', new RegExp(`^${API}/Pets/Breeds$`), (req, res) =>
     sendJson(res, 200, [{ ID: 124, Name: 'Labrador Retriever', SpeciesId: 41 }])],
   ['GET', new RegExp(`^${API}/Pets/Species$`), (req, res) =>
     sendJson(res, 200, [{ ID: 41, Name: 'Canine', Breed: { ID: 124, Name: 'Labrador Retriever' } }])],
+
+  /* The service catalogue, so a test orders a code the mock will actually accept instead of
+   * hard-coding a literal that can drift out of step with it. */
+  ['GET', /^\/__control__\/services$/, (req, res) =>
+    sendJson(res, 200, { defaultCode: DEFAULT_SERVICE_CODE, services: SERVICES })],
 
   ['POST', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)\/results$/, handleControlSeedResult],
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],

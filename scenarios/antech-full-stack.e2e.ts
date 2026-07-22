@@ -1,5 +1,6 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
+import { pollUntil } from '../src/poll'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
@@ -24,28 +25,19 @@ import { closePool } from '../src/sql'
  *   - Results are XML, not JSON. The mock synthesises a <LabReport> document that the integration's
  *     AntechResultMapper parses (see src/antech-mock/server.js for the shape constraints).
  *   - Auth is a token in a ?accessToken= query param, not Basic + X-Pims-* headers. The integration
- *     logs in again before every single request; the mock accepts any credentials.
+ *     logs in again before every single request. The mock accepts any credential VALUES (they are
+ *     dummy by design) but requires them to be PRESENT.
  *   - There is no confirmOrder browser handshake — placement is a single POST, so the order is
  *     SUBMITTED the moment it lands and there is no separate submit step to assert.
  *   - The poll interval is hardcoded to 30s in the integration and is NOT env-tunable (idexx exposes
  *     IDEXX_*_POLLING_INTERVAL_MS), so the completion wait below budgets whole intervals. A slow
- *     pass here is the poll cadence, not a hang. */
-
-/* Poll a request until `done` holds or the deadline passes; returns the last response either way. */
-async function pollUntil<T> (
-  fetchFn: () => Promise<T>,
-  done: (value: T) => boolean,
-  timeoutMs: number,
-  intervalMs: number,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  let last = await fetchFn()
-  while (!done(last) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
-    last = await fetchFn()
-  }
-  return last
-}
+ *     pass here is the poll cadence, not a hang.
+ *
+ * A note on the mock, because it is what makes these assertions worth anything: it VALIDATES the
+ * order it receives rather than defaulting the missing bits. A mock that substituted its own
+ * `PetName` when the integration sent none would make the forwarding assertions below pass against
+ * its own invention — and because dmi-api reconciles results on patient name + client last name, the
+ * whole loop would stay green with a broken integration. Missing fields are a 400 instead. */
 
 /* The integration's Bull jobs repeat every 30s (hardcoded). A result seeded just after a tick waits
  * a full interval, and the job is only scheduled once the integration has handled the start event —
@@ -55,6 +47,7 @@ const COMPLETION_WAIT_MS = 120_000
 /* The analyte ids the mock reports on. They are the mock's own invented codes (Antech's real analyte
  * ids are opaque numeric strings), surfaced here so the assertions read as more than magic numbers. */
 const GLUCOSE = '1001'
+const CREATININE = '1002'
 const HEMOLYSIS_INDEX = '1003'
 
 describe('antech full-stack (Antech mock)', () => {
@@ -64,6 +57,14 @@ describe('antech full-stack (Antech mock)', () => {
   let externalId: string
   let requisitionId: string
   let reportId: string
+  /* The test code the order is placed with, read from the mock's own service catalogue rather than
+   * hard-coded here. Antech mnemonics are 4-7 character codes (SA804, S16100, …); the mock rejects
+   * anything outside its catalogue, so sourcing it from there keeps the two from drifting apart —
+   * and stops an IDEXX-flavoured placeholder like a bare `SA` from creeping back in. */
+  let serviceCode: string
+  /* Highest event seq observed before the result is seeded, so the /events assertion can prove which
+   * events the RESULT loop produced rather than counting ones order creation already emitted. */
+  let seqBeforeSeed = 0
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.antech.mockBaseUrl)
 
@@ -71,6 +72,12 @@ describe('antech full-stack (Antech mock)', () => {
     /* A fresh container starts clean; reset is only load-bearing for warm reruns (HARNESS_KEEP_UP),
      * where it clears the previous run's orders/results. Harmless on a cold start. */
     await mock.post('/__control__/reset').catch(() => undefined)
+
+    const catalogue = expectOk<{ defaultCode: string, services: Array<{ mnemonic: string }> }>(
+      await mock.get('/__control__/services'),
+      'read the mock service catalogue',
+    )
+    serviceCode = catalogue.defaultCode
 
     const root = ApiClient.create()
     /* Quickstart bootstrap: org -> antech provider config whose baseUrl points at the mock's
@@ -163,6 +170,9 @@ describe('antech full-stack (Antech mock)', () => {
        * equivalent — placement is a single POST and the order is SUBMITTED once it lands. */
       const payload = orderPayload(org.integrationId, {
         patient: { name: 'Rex', sex: 'MALE', species: 'DOG', breed: 'LABRADOR' },
+        /* Override the shared default (`SA`, an IDEXX code): the mock enforces Antech's catalogue
+         * and rejects anything outside it. */
+        testCodes: [{ code: serviceCode }],
       })
       requisitionId = payload.requisitionId as string
 
@@ -199,7 +209,11 @@ describe('antech full-stack (Antech mock)', () => {
       expect(received.clinicAccessionId).toBe(requisitionId)
       /* 1 == SUBMITTED in Antech's numeric order-status vocabulary: placed, no results yet. */
       expect(received.orderStatus).toBe(1)
-      expect(received.mnemonic).toBe('SA')
+      /* These four are the substance of this test: they are what the integration actually forwarded.
+       * The mock REJECTS an order missing any of them rather than substituting a default, so a
+       * regression that dropped the patient name or the tests fails at placement — it cannot reach
+       * here and quietly match a mock-invented fallback. */
+      expect(received.mnemonic).toBe(serviceCode)
       /* The patient/client the mock echoes back on results is what dmi-api reconciles against. */
       expect(received.petName).toBe('Rex')
       expect(received.clientLastName).toBe('Doe')
@@ -208,6 +222,14 @@ describe('antech full-stack (Antech mock)', () => {
     })
 
     it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {
+      /* Watermark the event stream before seeding, so the /events test below can distinguish events
+       * the RESULT loop produced from the ones order creation already emitted. */
+      const before = expectOk<{ data: Array<{ seq: number }> }>(
+        await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+        'read the event stream before seeding',
+      )
+      seqBeforeSeed = before.data.reduce((max, event) => Math.max(max, event.seq ?? 0), 0)
+
       /* Deterministic completion: the mock holds no results until a test seeds one, so the labResult
        * poll stays empty until this point. Seed a synthetic final ('F') result for this order; the
        * integration's next results poll then pulls the XML, maps it and pushes it back to dmi-api.
@@ -251,38 +273,58 @@ describe('antech full-stack (Antech mock)', () => {
             name?: string
             valueQuantity?: { value: number, units?: string } | null
             valueString?: string
-            referenceRange?: unknown[]
-            interpretation?: unknown
+            referenceRange?: Array<{ low?: number, high?: number, text?: string }>
+            interpretation?: { code?: string, text?: string } | null
+            notes?: string
           }>
         }>
       }>(await org.api.get(`/orders/${orderId}/report`), 'read order report')
       reportId = report.id
 
-      expect(['FINAL', 'PARTIAL']).toContain(report.status)
+      /* The seeded result is final ('F'), so FINAL is deterministic — accepting PARTIAL too would
+       * let a regression that downgraded final results slip through. */
+      expect(report.status).toBe('FINAL')
       expect(Array.isArray(report.testResultsSet)).toBe(true)
       expect(report.testResultsSet.length).toBeGreaterThan(0)
 
       /* The panel's code is the Mnemonic from the status JSON, which the mock sets to the code the
        * order was placed with. */
-      expect(report.testResultsSet.map((testResult) => testResult.code)).toContain('SA')
+      expect(report.testResultsSet.map((testResult) => testResult.code)).toContain(serviceCode)
 
       /* Flatten the panel to its observations and assert the seeded analytes survived the whole
-       * mapping chain (mock XML -> integration AntechResultMapper -> dmi-api Observation). */
+       * mapping chain (mock XML -> integration AntechResultMapper -> dmi-api Observation).
+       *
+       * The exact set is asserted, not merely a non-empty one: the mock seeds three analytes, and a
+       * mapper regression that silently dropped one would otherwise pass. */
       const observations = report.testResultsSet.flatMap((testResult) => testResult.observations ?? [])
-      expect(observations.length).toBeGreaterThan(0)
+      expect(observations.map((observation) => observation.code).sort()).toEqual(
+        [GLUCOSE, CREATININE, HEMOLYSIS_INDEX].sort(),
+      )
 
       /* Glucose was seeded numeric, out-of-range-high, with units and a reference range: it must map
-       * to a quantitative value with units, a reference range, and a high interpretation. The units
-       * are the fussy part — they only survive because the mock emits <Units> as CDATA, which is the
-       * only form the mapper reads. */
+       * to a quantitative value with units, a bounded reference range, and specifically a HIGH
+       * interpretation. The bounds and the code are asserted exactly — the mapper emits a
+       * referenceRange entry for ANY <Range> text (carrying only `text` when its regex doesn't
+       * match), and an inverted flag would still be "defined", so a looser check here would pass on
+       * a lost range or a HIGH silently becoming LOW. The units are the fussy part: they survive
+       * only because the mock emits <Units> as CDATA, the one form the mapper reads. */
       const glucose = observations.find((observation) => observation.code === GLUCOSE)
       expect(glucose).toBeDefined()
       expect(glucose?.name).toBe('Glucose')
       expect(glucose?.valueQuantity?.value).toBe(150)
       expect(glucose?.valueQuantity?.units).toBe('mg/dL')
-      expect(Array.isArray(glucose?.referenceRange)).toBe(true)
-      expect((glucose?.referenceRange ?? []).length).toBeGreaterThan(0)
-      expect(glucose?.interpretation).toBeDefined()
+      expect(glucose?.referenceRange).toEqual([
+        expect.objectContaining({ low: 74, high: 143 }),
+      ])
+      /* 'H' is the wire value of dmi-engine-common's TestResultItemInterpretationCode.HIGH; LOW is
+       * 'L', so this distinguishes the two rather than merely asserting a flag exists. */
+      expect(glucose?.interpretation).toMatchObject({ code: 'H' })
+
+      /* Creatinine carries a comment, which must arrive as the observation's notes — the mapper only
+       * reads it from a CDATA <Comment>, so this is the assertion that keeps that branch honest. */
+      const creatinine = observations.find((observation) => observation.code === CREATININE)
+      expect(creatinine?.valueQuantity?.value).toBe(1.2)
+      expect(creatinine?.notes).toBe('Within normal limits.')
 
       /* A non-numeric analyte takes the other branch of the mapper and must land as a string value
        * rather than a quantity. dmi-api serialises the absent quantity as an explicit null (it is a
@@ -293,22 +335,36 @@ describe('antech full-stack (Antech mock)', () => {
       expect(hemolysis?.valueQuantity ?? null).toBeNull()
     })
 
-    it('Mongo events show the order and report lifecycle', async () => {
-      const events = expectOk<{ data: Array<{ type: string, data?: { orderId?: string, reportId?: string } }> }>(
+    it('Mongo events show the order and report lifecycle, including the result loop', async () => {
+      const events = expectOk<{
+        data: Array<{ seq: number, type: string, data?: { orderId?: string, reportId?: string } }>
+      }>(
         await org.api.get('/events', { start_seq: 0, limit: 1000 }),
         'list events',
       )
 
       /* Scope to this order/report (a cold run has just this one; F1 means /events isn't tenant-
        * scoped, so filter explicitly rather than assume). */
-      const types = new Set(
-        events.data
-          .filter((event) => event.data?.orderId === orderId || event.data?.reportId === reportId)
-          .map((event) => event.type),
+      const mine = events.data.filter(
+        (event) => event.data?.orderId === orderId || event.data?.reportId === reportId,
       )
 
-      expect(Array.from(types)).toEqual(
+      expect(Array.from(new Set(mine.map((event) => event.type)))).toEqual(
         expect.arrayContaining(['order:created', 'order:updated', 'report:created', 'report:updated']),
+      )
+
+      /* The set above is weaker than it looks: dmi-api emits order:created, order:updated AND
+       * report:created while the order is being placed, before any result exists. So assert
+       * separately on the events that appeared only AFTER the result was seeded (seq is monotonic) —
+       * that is the part the result loop is actually responsible for, and the part that would go
+       * missing if the poll or the reconciliation broke. */
+      const afterSeed = new Set(
+        mine.filter((event) => event.seq > seqBeforeSeed).map((event) => event.type),
+      )
+
+      expect(seqBeforeSeed).toBeGreaterThan(0)
+      expect(Array.from(afterSeed)).toEqual(
+        expect.arrayContaining(['order:updated', 'report:updated']),
       )
     })
   })
