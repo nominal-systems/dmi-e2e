@@ -1,5 +1,6 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
+import { pollUntil } from '../src/poll'
 import { mintDemoKey, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool, getOrderStatusByRequisitionId } from '../src/sql'
 
@@ -19,21 +20,11 @@ import { closePool, getOrderStatusByRequisitionId } from '../src/sql'
  *   2. A skipped completion suite — the intended end-to-end assertions, ready to un-skip once the
  *      demo integration is fixed. */
 
-/* Poll a request until `done` holds or the deadline passes; returns the last response either way. */
-async function pollUntil<T> (
-  fetchFn: () => Promise<T>,
-  done: (value: T) => boolean,
-  timeoutMs: number,
-  intervalMs: number,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  let last = await fetchFn()
-  while (!done(last) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
-    last = await fetchFn()
-  }
-  return last
-}
+/* `orderPayload` takes no default test code — every vendor rejects codes outside its own catalogue,
+ * so a shared default is wrong for all but one provider. The demo loop is blocked upstream (the
+ * create RPC is never answered), so nothing here reaches the demo vendor's catalogue; revisit this
+ * value when the completion suite below is un-skipped. */
+const DEMO_TEST_CODE = [{ code: 'HARNESS-DEMO' }]
 
 describe('full-stack smoke (demo provider)', () => {
   let org: SeededOrg
@@ -89,7 +80,7 @@ describe('full-stack smoke (demo provider)', () => {
    * un-skip the completion suite below. */
   describe('CONFIRMED: the demo integration does not answer the engine RPC', () => {
     it('POST /orders times out at the engine and the order lands in ERROR', async () => {
-      const payload = orderPayload(org.integrationId)
+      const payload = orderPayload(org.integrationId, { testCodes: DEMO_TEST_CODE })
 
       const response = await org.api.post('/orders', payload)
 
@@ -116,7 +107,7 @@ describe('full-stack smoke (demo provider)', () => {
 
     beforeAll(async () => {
       const created = expectOk<{ id: string, externalId?: string, status: string }>(
-        await org.api.post('/orders', orderPayload(org.integrationId)),
+        await org.api.post('/orders', orderPayload(org.integrationId, { testCodes: DEMO_TEST_CODE })),
         'place demo order',
       )
       orderId = created.id

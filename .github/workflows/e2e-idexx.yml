@@ -128,8 +128,21 @@ jobs:
           DMI_API_DIR: ${{ github.workspace }}/dmi-api
           DMI_IDEXX_INTEGRATION_DIR: ${{ github.workspace }}/dmi-engine-idexx-integration
           GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Without this the log dump below is guaranteed to print nothing: the harness's
+          # globalTeardown runs `docker compose down -v` on its way out whether the run passed or
+          # failed, so by the time an `if: failure()` step runs there are no containers left.
+          # KEEP_UP defers teardown to the explicit step below.
+          HARNESS_KEEP_UP: '1'
 
       - name: Dump container logs on failure
         if: failure()
         working-directory: dmi-e2e
         run: docker compose --profile idexx logs --no-color --tail=200
+
+      # Paired with HARNESS_KEEP_UP above: the harness no longer tears itself down, so do it here.
+      # `always()` so a failed run cleans up too (the runner is ephemeral, but leaving the volumes
+      # behind would poison a self-hosted one).
+      - name: Tear down the stack
+        if: always()
+        working-directory: dmi-e2e
+        run: docker compose --profile idexx down -v

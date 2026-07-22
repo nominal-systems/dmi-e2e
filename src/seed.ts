@@ -159,9 +159,17 @@ export async function seed (): Promise<SeededContext> {
   return { orgA, orgB, anonymous: root }
 }
 
+export interface OrderPayloadOverrides extends Record<string, unknown> {
+  /* Required, and deliberately not defaulted. There is no provider-agnostic test code: every vendor
+   * has its own catalogue and rejects anything outside it, so a shared default is a code that is
+   * wrong for every provider but the one it was written for. This used to default to `SA`, an
+   * invented code that no IDEXX catalogue contains — and each new provider loop inherited it. */
+  testCodes: Array<{ code: string }>
+}
+
 export function orderPayload (
   integrationId: string,
-  overrides: Record<string, unknown> = {},
+  overrides: OrderPayloadOverrides,
 ): Record<string, unknown> {
   return {
     integrationId,
@@ -180,7 +188,6 @@ export function orderPayload (
     },
     client: { firstName: 'Jane', lastName: 'Doe' },
     veterinarian: { firstName: 'Ann', lastName: 'Vet' },
-    testCodes: [{ code: 'SA' }],
     ...overrides,
   }
 }

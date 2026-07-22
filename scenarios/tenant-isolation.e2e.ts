@@ -13,6 +13,12 @@ import { closePool, insertReport } from '../src/sql'
  * with a tripwire attached. Each one names the defect. See README.md — do not "fix" a red build
  * here by relaxing an assertion. */
 
+/* `orderPayload` takes no default test code — every vendor rejects codes outside its own catalogue,
+ * so a shared default is wrong for all but one provider. This suite runs under NODE_ENV=seed, where
+ * dmi-api returns before any engine round-trip, so no vendor ever sees this code; it just has to be
+ * present and stable. */
+const ANY_TEST_CODE = [{ code: 'HARNESS-TENANT-ISOLATION' }]
+
 describe('tenant isolation', () => {
   let ctx: SeededContext
   let aOrderId: string
@@ -22,7 +28,7 @@ describe('tenant isolation', () => {
     ctx = await seed()
 
     const order = expectOk<{ id: string }>(
-      await ctx.orgA.api.post('/orders', orderPayload(ctx.orgA.integrationId)),
+      await ctx.orgA.api.post('/orders', orderPayload(ctx.orgA.integrationId, { testCodes: ANY_TEST_CODE })),
       "create org A's order",
     )
     aOrderId = order.id
@@ -194,7 +200,7 @@ describe('tenant isolation', () => {
      * orders.service.ts resolves `createOrderDto.integrationId` with no ownership check. ApiGuard
      * authenticates the caller but nothing authorizes the integration being referenced. */
     it.failing('POST /orders rejects org B targeting org A\'s integration', async () => {
-      const response = await ctx.orgB.api.post('/orders', orderPayload(ctx.orgA.integrationId))
+      const response = await ctx.orgB.api.post('/orders', orderPayload(ctx.orgA.integrationId, { testCodes: ANY_TEST_CODE }))
 
       expect([403, 404]).toContain(response.status)
     })

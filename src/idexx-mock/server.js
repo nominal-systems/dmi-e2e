@@ -7,10 +7,15 @@
  * + confirm/ack + search). A separate control plane (`/__control__/*`) lets tests seed results,
  * inspect received orders and inject error scenarios so the order->result->report loop is
  * deterministic and CI-safe. It NEVER talks to real IDEXX and never authenticates for real; the
- * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is. All canned data is
- * SYNTHETIC — invented values shaped like IDEXX responses, never captured clinic/patient data. The
- * contract mirrored here was read from the integration's own source (endpoints, header names, the
- * confirmOrder transform, and the poll/ack shapes), not assumed. */
+ * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is.
+ *
+ * Data: every patient, client, veterinarian and clinic identifier here is INVENTED — no captured
+ * clinic or patient data, ever. Vendor vocabulary (analyte numbers, analyzer and test codes,
+ * species-level reference ranges) is taken from IDEXX's own catalogue and specs so the payloads are
+ * shaped like the real thing; that is product/catalogue data, not anyone's record.
+ *
+ * The contract mirrored here was read from the integration's own source (endpoints, header names,
+ * the confirmOrder transform, and the poll/ack shapes), not assumed. */
 
 const http = require('http')
 const crypto = require('crypto')
@@ -219,12 +224,15 @@ function buildResult (order, overrides) {
     updatedDate: nowIso(),
     updatedAuditDate: nowIso(),
     veterinarian: order.veterinarian || '',
+    /* Echoed straight back from the placed order, never defaulted: dmi-api reconciles the result to
+     * its order on these fields, so inventing one here would let a broken integration reconcile
+     * against the mock's imagination. handleCreateOrder rejects an order that omits them. */
     patient: {
       patientId: patient.patientId || '',
-      name: patient.name || 'Rex',
+      name: patient.name,
       clientId: client.id || '',
-      clientFirstName: client.firstName || '',
-      clientLastName: client.lastName || '',
+      clientFirstName: client.firstName,
+      clientLastName: client.lastName,
       genderName: 'Male',
       speciesCode: patient.speciesCode || 'CANINE',
       speciesName: 'Canine',
@@ -254,6 +262,66 @@ function refList (items) {
   return { version: '1', list: items }
 }
 
+/* The orderable-test catalogue, and the ONLY definition of it: `/api/v1/ref/tests` advertises this
+ * list and order placement enforces it, the way live IDEXX does (an unknown code is rejected with
+ * INVALID_LAB_SERVICE_ID). A mock that advertises a catalogue but accepts anything cannot catch an
+ * integration that sends a malformed or stale code.
+ *
+ * `IHD_DHP` is a real IDEXX in-house code from the vendor's own reference-data catalogue. Shape
+ * matters: the placeholder here used to be `SA`, which is not an IDEXX code in any form. */
+const SERVICE_CATALOGUE = [
+  {
+    code: 'IHD_DHP',
+    name: 'IDEXX VetLab Station Diagnostic Health Profile',
+    listPrice: '45.00',
+    currencyCode: 'USD',
+    inHouse: true,
+  },
+]
+const SERVICE_CODES = new Set(SERVICE_CATALOGUE.map((service) => service.code))
+
+function isBlank (value) {
+  return value === undefined || value === null || String(value).trim() === ''
+}
+
+/* IDEXX's error envelope (`ErrorResponse` -> `{ errors: [...] }`). */
+function sendError (res, status, code, message) {
+  log(`rejected: ${code} — ${message}`)
+  sendJson(res, status, { errors: [{ code, message }] })
+}
+
+/* What a create-order payload must carry for the mock to accept it.
+ *
+ * This mock VALIDATES rather than defaults, on purpose. Silently filling in a missing field is the
+ * most dangerous thing a vendor mock can do: dmi-api reconciles a provider result back to its order
+ * on patient name (+ PIMS patient id, + client last name), so a mock that invents the patient it was
+ * not sent will also satisfy reconciliation — and an integration that stopped forwarding the patient
+ * would leave this gate permanently green. Age and weight are genuinely optional on an IDEXX order
+ * and keep their fallbacks. */
+function validateCreateOrder (payload) {
+  const patient = Array.isArray(payload.patients) ? payload.patients[0] : undefined
+  const missing = []
+  if (patient === undefined) {
+    missing.push('patients[0]')
+  } else {
+    if (isBlank(patient.name)) missing.push('patients[0].name')
+    if (isBlank(patient.speciesCode)) missing.push('patients[0].speciesCode')
+    if (isBlank(patient.client?.lastName)) missing.push('patients[0].client.lastName')
+  }
+  if (isBlank(payload.veterinarian)) missing.push('veterinarian')
+  if (!Array.isArray(payload.tests) || payload.tests.length === 0) missing.push('tests')
+  if (missing.length > 0) {
+    return { code: 'MISSING_REQUIRED_FIELD', message: `missing or empty: ${missing.join(', ')}` }
+  }
+
+  const unknown = payload.tests.filter((code) => !SERVICE_CODES.has(String(code)))
+  if (unknown.length > 0) {
+    return { code: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}` }
+  }
+
+  return null
+}
+
 /* ---- ordering handlers (/api/v1) ---- */
 
 async function handleAuthValidate (req, res) {
@@ -280,6 +348,13 @@ async function handleCreateOrder (req, res) {
   }
 
   const payload = await readBody(req)
+
+  const rejection = validateCreateOrder(payload)
+  if (rejection != null) {
+    sendError(res, 400, rejection.code, rejection.message)
+    return
+  }
+
   const idexxOrderId = String(nextOrderId++)
   const corporateRequisitionId =
     payload.corporateRequisitionId != null && payload.corporateRequisitionId !== ''
@@ -359,7 +434,9 @@ async function handleUiOrderGet (req, res, params) {
     petOwnerBilling: false,
     requestModality: 'REFLAB',
     notes: { collectionDate: '' },
-    tests: tests.length > 0 ? tests : [{ code: 'SA', sd: 'ALL' }],
+    /* The order's own tests, never a stand-in: a fabricated entry here would hide an integration
+     * that dropped the test list between placement and confirmation. */
+    tests,
     ivls: [],
   })
 }
@@ -520,8 +597,7 @@ const routes = [
     sendJson(res, 200, refList([{ code: 'MALE', name: 'Male' }, { code: 'FEMALE', name: 'Female' }]))],
   ['GET', /^\/api\/v1\/ref\/species$/, (req, res) =>
     sendJson(res, 200, refList([{ code: 'CANINE', name: 'Canine' }, { code: 'FELINE', name: 'Feline' }]))],
-  ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) =>
-    sendJson(res, 200, refList([{ code: 'SA', name: 'Small Animal Panel', listPrice: '45.00', currencyCode: 'USD', inHouse: false }]))],
+  ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
   ['GET', /^\/api\/v1\/ivls\/devices$/, (req, res) => sendJson(res, 200, { ivlsDeviceList: [] })],
 
   ['GET', /^\/ui$/, handleUiPage],
