@@ -284,10 +284,14 @@ function isBlank (value) {
   return value === undefined || value === null || String(value).trim() === ''
 }
 
-/* IDEXX's error envelope (`ErrorResponse` -> `{ errors: [...] }`). */
-function sendError (res, status, code, message) {
-  log(`rejected: ${code} — ${message}`)
-  sendJson(res, status, { errors: [{ code, message }] })
+/* IDEXX's error envelope (`ErrorResponse` -> `{ errors: [{ errorCode, message, index? }] }`). The
+ * field is `errorCode`, not `code`: the integration's own providerErrorMapper reads
+ * `providerError.errorCode` (and its IDEXX-captured fixtures carry that name), so emitting `code`
+ * here renders every rejection as "undefined error in idexx: ..." — legible enough to debug by
+ * accident, but it leaves the mapper's real branch unexercised by the gate. */
+function sendError (res, status, errorCode, message) {
+  log(`rejected: ${errorCode} — ${message}`)
+  sendJson(res, status, { errors: [{ errorCode, message }] })
 }
 
 /* What a create-order payload must carry for the mock to accept it.
