@@ -170,8 +170,9 @@ describe('antech full-stack (Antech mock)', () => {
        * equivalent — placement is a single POST and the order is SUBMITTED once it lands. */
       const payload = orderPayload(org.integrationId, {
         patient: { name: 'Rex', sex: 'MALE', species: 'DOG', breed: 'LABRADOR' },
-        /* Override the shared default (`SA`, an IDEXX code): the mock enforces Antech's catalogue
-         * and rejects anything outside it. */
+        /* testCodes is required (orderPayload no longer defaults it — a shared default is wrong for
+         * every provider but the one it was written for). Pass a real Antech mnemonic read from the
+         * mock's catalogue; the mock enforces that catalogue and rejects anything outside it. */
         testCodes: [{ code: serviceCode }],
       })
       requisitionId = payload.requisitionId as string
@@ -367,5 +368,33 @@ describe('antech full-stack (Antech mock)', () => {
         expect.arrayContaining(['order:updated', 'report:updated']),
       )
     })
+
+    it('a rejected order surfaces the vendor field error, not a generic fallback', async () => {
+      /* Exercises the integration's error path, which the happy path never touches — the antech
+       * mirror of the idexx review's finding (a mock error envelope the mapper can't read leaves
+       * rejections red but the mapper's real branch unexercised). The mock rejects a code outside its
+       * catalogue with a 400 whose ModelState is keyed `order.Tests` (the shape real Antech uses); the
+       * integration's providerErrorMapper splits that key and surfaces the field name, and dmi-api
+       * re-throws the engine error out of createOrder, so POST /orders answers non-2xx with the field
+       * name in the body. A separate order (unique requisitionId) that never reaches COMPLETED — it
+       * lands ERROR in dmi-api — so it does not perturb the loop asserted above. */
+      const payload = orderPayload(org.integrationId, {
+        patient: { name: 'Rex', sex: 'MALE', species: 'DOG', breed: 'LABRADOR' },
+        testCodes: [{ code: 'NOT-A-REAL-ANTECH-CODE' }],
+      })
+
+      const response = await org.api.post('/orders', payload)
+      console.log(
+        `[antech-scenario] rejected-order response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+
+      expect(response.ok).toBe(false)
+      /* The field branch names the field: providerErrorMapper emits "<Field> is required by antech: …"
+       * (surfaced in dmi-api's `errors[]`) ONLY when it can read the mock's `order.<Field>` ModelState.
+       * Its generic fallback — "… failed with <status> status code" — is what appears when the envelope
+       * is unreadable, so asserting that did NOT fire is what proves the mock reaches the real branch. */
+      expect(response.text).toMatch(/Tests is required by antech/)
+      expect(response.text).not.toMatch(/failed with \d+ status code/)
+    }, 30_000)
   })
 })

@@ -435,7 +435,17 @@ async function handleOrderPlacement (req, res) {
   if (!Array.isArray(payload.Tests) || payload.Tests.length === 0) missing.push('Tests')
   if (missing.length > 0) {
     log(`rejected order placement — missing required field(s): ${missing.join(', ')}`)
-    sendJson(res, 400, { Message: `missing required field(s): ${missing.join(', ')}` })
+    /* Real Antech reports field-level validation errors in a `ModelState` map keyed `order.<Field>`
+     * (shape confirmed against the antech integration's captured error fixtures — e.g. `order.BreedID`,
+     * `order.PetSex`), each value an array of message strings. The integration's providerErrorMapper
+     * splits that key on `.` and surfaces the field name. Emitting only `Message` (as this branch
+     * used to) left the mapper's field branch unexercised — the same gap the idexx review found, where
+     * rejections stayed red but the mapper's real path never ran. Key shape is borrowed; the messages
+     * are invented. */
+    sendJson(res, 400, {
+      Message: `missing required field(s): ${missing.join(', ')}`,
+      ModelState: Object.fromEntries(missing.map((field) => [`order.${field}`, [`${field} is required.`]])),
+    })
     return
   }
 
@@ -447,9 +457,12 @@ async function handleOrderPlacement (req, res) {
    * refuse — which is precisely how the bare IDEXX-flavoured `SA` slipped in originally. */
   if (!SERVICES.some((service) => service.mnemonic === mnemonic)) {
     log(`rejected order placement — unknown test code '${mnemonic}'`)
+    /* `order.Tests`, not `Request.Tests`: the mapper's field branch fires on either (it just reads
+     * `key.split('.')[1]`), but `order.<Field>` is the prefix real Antech actually emits (see the
+     * missing-fields branch above), so the mock stays faithful rather than inventing a shape. */
     sendJson(res, 400, {
       Message: `unknown test code '${mnemonic}'`,
-      ModelState: { 'Request.Tests': [`'${mnemonic}' is not in this lab's service list`] },
+      ModelState: { 'order.Tests': [`'${mnemonic}' is not in this lab's service list`] },
     })
     return
   }
