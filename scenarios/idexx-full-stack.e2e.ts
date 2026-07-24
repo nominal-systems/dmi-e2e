@@ -1,5 +1,6 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
+import { pollUntil } from '../src/poll'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
@@ -18,22 +19,6 @@ import { closePool } from '../src/sql'
  * test seeds a result there, the integration maps it and emits `external_results` (-> report) and
  * `external_order_results` (-> order COMPLETED) back to dmi-api, then acks the batch. */
 
-/* Poll a request until `done` holds or the deadline passes; returns the last response either way. */
-async function pollUntil<T> (
-  fetchFn: () => Promise<T>,
-  done: (value: T) => boolean,
-  timeoutMs: number,
-  intervalMs: number,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  let last = await fetchFn()
-  while (!done(last) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
-    last = await fetchFn()
-  }
-  return last
-}
-
 describe('idexx full-stack (VetConnect Plus mock)', () => {
   let org: SeededOrg
   let admin: ApiClient
@@ -41,6 +26,9 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
   let externalId: string
   let requisitionId: string
   let reportId: string
+  /* Read from the mock's own /api/v1/ref/tests rather than hard-coded, so the code the harness
+   * orders is by construction one the vendor advertises — and the mock now rejects anything else. */
+  let serviceCode: string
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.idexx.mockBaseUrl)
 
@@ -48,6 +36,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     /* A fresh container starts clean; reset is only load-bearing for warm reruns (HARNESS_KEEP_UP),
      * where it clears the previous run's seeded orders/results. Harmless on a cold start. */
     await mock.post('/__control__/reset').catch(() => undefined)
+
+    const catalogue = expectOk<{ list: Array<{ code: string }> }>(
+      await mock.get('/api/v1/ref/tests'),
+      'read the mock orderable-test catalogue',
+    )
+    serviceCode = catalogue.list[0].code
 
     const root = ApiClient.create()
     /* Quickstart bootstrap: org -> idexx provider config whose orderingBaseUrl/resultBaseUrl point at
@@ -122,7 +116,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
     it('POST /orders creates the order via the real idexx integration (externalId assigned)', async () => {
-      const payload = orderPayload(org.integrationId)
+      const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
       requisitionId = payload.requisitionId as string
 
       /* autoSubmitOrder=true drives the integration's confirmOrder browser handshake against the
@@ -145,13 +139,16 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * the mock's uiURL -> harvest the cookie -> XHR PUT. The mock flips the order to SUBMITTED only
        * on that PUT. (If confirmOrder ever regressed, the integration swallows the error and the order
        * would still be created — so this is asserted separately from loop closure below.) */
-      const received = expectOk<{ status: string, corporateRequisitionId: string }>(
+      const received = expectOk<{ status: string, corporateRequisitionId: string, tests: string[] }>(
         await mock.get(`/__control__/orders/${requisitionId}`),
         'read order from mock control plane',
       )
 
       expect(received.corporateRequisitionId).toBe(requisitionId)
       expect(received.status).toBe('SUBMITTED')
+      /* The ordered test survived the mapping into IDEXX's dialect. The mock rejects an order whose
+       * codes are outside its catalogue, so this also pins that the integration forwards them. */
+      expect(received.tests).toEqual([serviceCode])
     })
 
     it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {
@@ -189,7 +186,9 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       }>(await org.api.get(`/orders/${orderId}/report`), 'read order report')
       reportId = report.id
 
-      expect(['FINAL', 'PARTIAL']).toContain(report.status)
+      /* Exactly FINAL: the single seeded result is COMPLETE, so this is deterministic, and
+       * accepting PARTIAL as well would hide a downgrade. */
+      expect(report.status).toBe('FINAL')
       expect(Array.isArray(report.testResultsSet)).toBe(true)
       expect(report.testResultsSet.length).toBeGreaterThan(0)
 
@@ -198,15 +197,31 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       const observations = report.testResultsSet.flatMap((testResult) => testResult.observations ?? [])
       expect(observations.length).toBeGreaterThan(0)
 
-      /* Glucose was seeded NUMERIC, out-of-range-high, with a reference range: it must map to a
-       * quantitative value with units, a reference range, and a high interpretation. */
+      /* The WHOLE seeded analyte set, so a dropped observation fails rather than being ignored. */
+      expect(observations.map((observation) => observation.code).sort()).toEqual(['CREA', 'GLU'])
+
+      /* Glucose was seeded NUMERIC, out-of-range-high, with a reference range. */
       const glucose = observations.find((observation) => observation.code === 'GLU')
       expect(glucose).toBeDefined()
       expect(glucose?.valueQuantity?.value).toBe(150)
       expect(glucose?.valueQuantity?.units).toBe('mg/dL')
-      expect(Array.isArray(glucose?.referenceRange)).toBe(true)
-      expect((glucose?.referenceRange ?? []).length).toBeGreaterThan(0)
-      expect(glucose?.interpretation).toBeDefined()
+      /* Bounds, not merely presence: the mapper emits a range entry for any low/high pair, so the
+       * numbers can drift silently while `length > 0` stays true. */
+      expect(glucose?.referenceRange).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'NORMAL', low: 74, high: 143 }),
+        ]),
+      )
+      /* The interpretation CODE, not merely its presence: `toBeDefined()` was as true of LOW as of
+       * HIGH. dmi-api persists the wire value, so this is 'H' (not 'HIGH'). */
+      expect(glucose?.interpretation).toMatchObject({ code: 'H' })
+
+      /* Creatinine was seeded in range: it must carry its value and NO interpretation. */
+      const creatinine = observations.find((observation) => observation.code === 'CREA')
+      expect(creatinine?.valueQuantity?.value).toBe(1.2)
+      expect(creatinine?.valueQuantity?.units).toBe('mg/dL')
+      /* dmi-api deletes the interpretation when the item is in range; it serialises as null. */
+      expect(creatinine?.interpretation ?? null).toBeNull()
     })
 
     it('Mongo events show the order and report lifecycle', async () => {
