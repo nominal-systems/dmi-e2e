@@ -75,6 +75,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
 - **`idexx`** (default) — the Phase 0 loop. dmi-api + ActiveMQ + Redis + the **VetConnect Plus mock**
   (`src/idexx-mock`, built from this repo) + the **real `dmi-engine-idexx-integration`** container,
   behind the `idexx` compose profile. Runs `scenarios/idexx-full-stack.e2e.ts`.
+- **`antech`** — the Phase 1 loop for **classic Antech** (provider id `antech`). dmi-api + ActiveMQ +
+  Redis + the **Antech mock** (`src/antech-mock`, built from this repo) + the **real
+  `dmi-engine-antech-integration`** container, behind the `antech` compose profile. Runs
+  `scenarios/antech-full-stack.e2e.ts`.
 - **`demo`** — the pre-existing demo loop (ActiveMQ, Redis, `dmi-demo-provider-api` + its MySQL, and
   `dmi-engine-demo-provider-integration`), behind the `full-stack` profile. Runs
   `scenarios/full-stack-smoke.e2e.ts`. **Blocked upstream** (see below).
@@ -84,15 +88,19 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
 # Packages read token) and boots ~7 containers alongside dmi-api:
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 npm run test:harness
 
+# antech (classic): the Antech mock + the real antech integration.
+GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=antech npm run test:harness
+
 # demo (the upstream-blocked loop):
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=demo npm run test:harness
 ```
 
-The integration image builds from a sibling checkout (`../dmi-engine-idexx-integration`; override with
-`DMI_IDEXX_INTEGRATION_DIR`) and its `npm install` resolves `@nominal-systems/*` from GitHub Packages,
-so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the Docker
-build. The VetConnect Plus mock is a zero-dependency Node server built inline, so it needs no token.
-The fast suite needs no token.
+Each integration image builds from a sibling checkout (`../dmi-engine-idexx-integration` /
+`../dmi-engine-antech-integration`; override with `DMI_IDEXX_INTEGRATION_DIR` /
+`DMI_ANTECH_INTEGRATION_DIR`) and its `npm install` resolves `@nominal-systems/*` from GitHub
+Packages, so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the
+Docker build. Both mocks are zero-dependency Node servers built inline, so they need no token. The
+fast suite needs no token.
 
 **The idexx loop closes end to end.** An order placed over real HTTP round-trips through the real
 idexx integration and the mock vendor: `POST /orders?autoSubmitOrder=true` → the integration creates
@@ -101,6 +109,20 @@ results poll picks up a result the scenario seeds at the mock → dmi-api writes
 test results and moves the order to `COMPLETED`, and `/events` shows the `order:*`/`report:*`
 sequence. The harness talks **only to the mock**, never to live `*.vetconnectplus.com`, so runs are
 deterministic, need no credentials, and place no real orders. See "The VetConnect Plus mock" below.
+
+**The antech loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
+the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
+poll picks up a result the scenario seeds at the mock, pulls the `LabResults/XML` document and maps
+it → dmi-api writes a report with test results, moves the order to `COMPLETED`, and `/events` shows
+the same sequence. It never touches a live Antech host. Two things differ from idexx and are worth
+knowing before you run it:
+
+- **It is slower.** The antech integration hardcodes both its Bull poll intervals to 30s
+  (`src/config/configuration.ts`) and exposes no env knob, where idexx's are dialed down to ~3s via
+  `IDEXX_*_POLLING_INTERVAL_MS`. A result can therefore sit for a full interval before the engine
+  picks it up; the scenario budgets whole intervals, so a slow pass is the poll cadence, not a hang.
+- **Its results are XML**, not JSON, and the mock synthesises a `<LabReport>` document that the real
+  `AntechResultMapper` parses. See "The Antech mock" below.
 
 **Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
 because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api
@@ -128,6 +150,51 @@ closely enough for the real integration to drive it unmodified:
 All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
 captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
 Basic credentials and `X-Pims-*` headers are accepted as-is).
+
+### The Antech mock
+
+`src/antech-mock/server.js` is the same idea for **classic Antech**: a small, zero-dependency Node
+HTTP server that stands in for the Antech vendor API, speaking its `/api/v1.1` dialect closely enough
+for the real integration to drive it unmodified. Unlike IDEXX's, Antech's dialect is not publicly
+documented, so the contract mirrored here was read out of the integration's own source
+(`antech.service.ts`, `mapper/antech-result.mapper.ts`, `interceptors/antech-api.interceptor.ts`):
+
+- **Auth**: `POST Users/login` mints a `Token`, which the integration replays as an `?accessToken=`
+  **query param** on every subsequent call — including POSTs. It logs in again before *every single
+  request* (there is no token cache upstream), so this endpoint is hit several times per poll.
+- **Ordering**: `POST External/OrderPlacement`. Its response **body is the externalId** — the
+  integration assigns the raw body with no field access — and results are later correlated by
+  `ClinicAccessionID`, so the mock echoes the requisition id back. `LabOrders/PDFPIMS` serves the PDF
+  manifest, fetched on every order creation.
+- **Polling**: `GET External/GetStatus?serviceType=labOrder|labResult` returns items pending
+  acknowledgement (`overrideAck=true` bypasses that), and `POST External/AckStatus` acknowledges a
+  batch. The mock models the acknowledge state, so a placed order does not replay on every tick.
+- **Results**: `GET LabResults/XML` returns a `<LabReport>` document. This is the fussy part — the
+  integration parses it with `xmlbuilder2`'s object format, so element shape is load-bearing:
+  `<Species>`/`<Breed>` must carry an attribute (the mapper reads their `'#'` text node),
+  `<Units>`/`<Comment>` must be **CDATA** (it reads their `'$'` node, and plain text silently drops
+  the units), and `<Accession-ID>` must repeat with both `Type="Lab-AccID"` and
+  `Type="Requisition-ID"`. The status JSON and the XML are joined on `LabAccessionID` **and** on
+  `LabTests[].DisplayName` matching `<UnitCode><Name>` byte-for-byte, so the mock generates both from
+  one constant rather than writing the name out twice.
+- **Control plane** (`/__control__/*`, host-facing): seed a (synthetic) result for an order, list or
+  inspect the orders the mock received, read its service catalogue, reset state, and inject error
+  scenarios — the same determinism story as the idexx mock: no results exist until a test seeds one.
+
+**It validates rather than defaults, deliberately.** A mock that quietly substitutes its own value
+for a field the integration failed to send doesn't test the integration — it agrees with it, and the
+assertions downstream then pass against the mock's own invention. So order placement **rejects** a
+request missing the patient name, sex, species, breed, client/doctor surname or tests; login rejects
+missing credentials (their *values* are dummy and unchecked, but their *presence* is contract); and
+placement rejects any test code outside the mock's service catalogue, which is the same list its
+`External/ServiceList` advertises. Antech mnemonics are 4–7 characters (`SA804`, `S16100`, `T960`) —
+notably **not** the bare `SA` the IDEXX mock uses, which is how an IDEXX-shaped placeholder can drift
+into an Antech test and pass against a permissive mock.
+
+All of its canned data is **synthetic** — invented values shaped like Antech responses, never
+captured clinic/patient data. The service mnemonics are genuine Antech catalogue codes (vendor
+identifiers published to integrators, not clinic or patient data); the descriptions and prices
+attached to them are invented. It never authenticates for real: the token is a fixed dummy.
 
 ### The MQTT broker
 
@@ -157,7 +224,8 @@ Full-system services (behind a compose profile — only the selected loop's port
 | Service            | Harness | Profile     | Notes |
 |--------------------|---------|-------------|-------|
 | VetConnect Plus mock | 3012  | `idexx`     | the simulated IDEXX vendor; tests drive its `/__control__` plane |
-| Redis              | 6380    | both        | the integration's Bull queues |
+| Antech mock        | 3013    | `antech`    | the simulated Antech vendor; tests drive its `/__control__` plane |
+| Redis              | 6380    | all         | the integration's Bull queues |
 | demo-provider-api  | 3011    | `full-stack`| the simulated demo vendor; harness mints keys here |
 | demo-provider MySQL| 3308    | `full-stack`| the demo vendor's own database |
 
@@ -170,7 +238,7 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
-| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock) or `demo` (upstream-blocked demo loop). |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock), `antech` (real classic-antech integration + Antech mock) or `demo` (upstream-blocked demo loop). |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -185,6 +253,13 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_IDEXX_ORDERING_URL` / `_RESULT_URL` | `http://vetconnect-mock:3000` | idexx only. Compose-network base URLs stored in the provider config; the integration reaches the mock here. Never point at live `*.vetconnectplus.com`. |
 | `HARNESS_IDEXX_PIMS_ID` / `_PIMS_VERSION` / `_USERNAME` / `_PASSWORD` / `_LOCALE` | `dmi-e2e-harness` / `1.0.0` / `harness-user` / `harness-pass` / `en` | idexx only. Dummy provider-config PIMS headers and integration credentials; the mock never authenticates for real. |
 | `HARNESS_IDEXX_POLL_MS` | `3000` | idexx only. The integration's Bull results/orders polling interval (dialed down from its 30s default so the loop closes quickly). |
+| `HARNESS_ANTECH_MOCK_PORT` | `3013` | antech only. Host port for the Antech mock (its `/__control__` plane and `/status`). |
+| `HARNESS_ANTECH_MOCK_URL` | `http://$HARNESS_HOST:3013` | antech only. Host-facing mock base URL the scenario drives. |
+| `HARNESS_ANTECH_BASE_URL` | `http://antech-mock:3000` | antech only. Compose-network base URL stored in the provider config; the integration appends `/api/v1.1/<endpoint>` to it. Never point at a live Antech host. |
+| `HARNESS_ANTECH_UI_BASE_URL` | `http://antech-mock:3000` | antech only. Antech's web host. A required provider-config option, but only ever string-built into submission/manifest URIs — never fetched. Points at the mock so nothing can leak to a live host. |
+| `HARNESS_ANTECH_PIMS_IDENTIFIER` | `HRN` | antech only. The 3-4 letter PIMS identifier; only appears in a generated requisition id (the harness supplies its own). |
+| `HARNESS_ANTECH_USERNAME` / `_PASSWORD` / `_CLINIC_ID` | `harness-user` / `harness-pass` / `900001` | antech only. Dummy integration credentials; the mock never authenticates for real. |
+| `HARNESS_ANTECH_LAB_ID` | `1` | antech only. dmi-api declares `LabId` as an **integer** provider option and rejects a string, so this stays a number. There is deliberately no antech poll-interval knob to pair with `HARNESS_IDEXX_POLL_MS`: that integration hardcodes its Bull intervals to 30s. |
 | `HARNESS_DEMO_PROVIDER_PORT` | `3011` | demo only. Host port for the demo vendor API (where the harness mints an X-Api-Key). |
 | `HARNESS_DEMO_PROVIDER_URL` | `http://$HARNESS_HOST:3011/demo` | demo only. Host-facing demo vendor base URL (includes its `/demo` prefix). |
 | `HARNESS_DEMO_PROVIDER_INTERNAL_URL` | `http://dmi-demo-provider-api:3000/demo` | demo only. URL the integration container uses to reach the vendor; stored verbatim in the dmi-api provider configuration, so it must resolve inside the compose network. |
@@ -217,7 +292,8 @@ directory is the only write the harness makes inside the dmi-api checkout.
 
 ```
 docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profile (redis + the
-                              VetConnect Plus mock + the idexx integration) and a `full-stack`
+                              VetConnect Plus mock + the idexx integration), an `antech` profile
+                              (redis + the Antech mock + the antech integration) and a `full-stack`
                               profile (redis + the demo vendor + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
@@ -227,12 +303,15 @@ src/
   sql.ts                      mysql2 pool for setup and assertions
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   idexx-mock/server.js        the VetConnect Plus mock vendor (zero-dependency Node HTTP server)
+  antech-mock/server.js       the Antech mock vendor (zero-dependency Node HTTP server)
+  poll.ts                     pollUntil, shared by the full-system scenarios
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
+  antech-full-stack.e2e.ts    the antech loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech); closes end to end
   full-stack-smoke.e2e.ts     the demo loop (HARNESS_FULL_STACK=1 HARNESS_STACK=demo); blocked upstream
 ```
 
@@ -305,6 +384,42 @@ next integration:
   `$share/<group>/<topic>` subscriptions; ActiveMQ 5.x "classic" (the old harness broker) silently
   drops them, so the harness broker is `eclipse-mosquitto:2` (see "The MQTT broker" below).
 
+**The antech loop closes too** (Phase 1), confirming `dmi-engine-antech-integration` (the classic
+`antech` provider) interoperates with the current dmi-api the same way. What the second provider
+taught us, beyond the mechanics above:
+
+- **The `pims:patient:id` workaround is provider-specific — and inverts for antech.** dmi-api's
+  reconciliation guard (`ProviderResultUtils.isMatchingOrder`) compares `pims:patient:id` across the
+  order it holds and the order the integration extracts from a result, and rejects the match when only
+  one side carries one. The antech result mapper tags the patient it extracts with its **own**
+  `antech:pet:id` system, never the PIMS one — so an antech order carrying a `pims:patient:id` can
+  *never* be reconciled by its own results (dmi-api logs `Skipping order update ... patient/client
+  mismatch` and the order sits at `SUBMITTED`). The antech scenario therefore deliberately places its
+  order **without** a patient identifier, which leaves both sides without one — a state the guard
+  treats as compatible — and falls back to matching on patient name + client last name. This is the
+  exact opposite of the idexx scenario, which must *supply* one. The generalisable lesson: whether a
+  provider needs the identifier depends on which identifier system *its* result mapper emits, so check
+  the mapper before copying either scenario.
+- **Two ids are in play and must agree.** The integration assigns the **raw body** of
+  `External/OrderPlacement` as the order's `externalId`, but results are correlated by
+  `ClinicAccessionID` — so a vendor whose placement response is anything other than the
+  ClinicAccessionID would strand every result as an orphan. The mock echoes the requisition id back,
+  which is the only self-consistent reading of the contract.
+- **A mock that defaults is a mock that agrees with you.** The first cut of the antech mock filled in
+  `PetName`/`ClientLastName`/test-code when an order omitted them — with exactly the values the
+  scenario then asserted. That made the order-forwarding test unfalsifiable, and because dmi-api
+  reconciles results on patient name + client last name, the fabricated values kept completion, the
+  report and `/events` green too: an integration that stopped forwarding the patient would have
+  shipped a permanently green gate. The mocks now validate required fields and reject unknown test
+  codes. Worth checking in any vendor mock: **for each field the scenario asserts, ask what happens if
+  the integration stops sending it.** If the answer isn't "the test fails", the assertion is decorative.
+- **A failing antech results poll is silent**, so shape errors in the mock are invisible from outside:
+  a healthy poll and a fatally broken one look identical, with no log output either way. The mock's
+  response shapes were therefore verified directly against the mapper's accessors (and `xmlbuilder2`'s
+  object format) rather than by iterating against the running stack, and the scenario asserts the
+  batch was **acknowledged** as explicit positive evidence that the poll ran to completion rather than
+  dying midway. Worth knowing before you debug this loop — and worth copying for the next provider.
+
 **The demo loop is blocked upstream.** `dmi-engine-demo-provider-integration` on `main` is no longer
 compatible with the current dmi-api — over the MQTT transport it does not answer dmi-api's engine
 RPCs, so its order → result → report loop cannot close. The vendor sim, dmi-api's inbound handlers and
@@ -316,17 +431,23 @@ the order lands in `ERROR`).
 
 ## Known gaps
 
-- **The idexx full-stack CI job is scoped, not universal.** It lives in its own workflow
-  (`.github/workflows/e2e-idexx.yml`) because it needs a `paths:` filter and those are per-workflow.
-  It runs: on **push to `main`** always; on a **pull request** only when the harness, mock, compose or
-  the idexx scenario changes (a docs or tenant-isolation edit shouldn't pay ~4.5min for ~7
-  containers); and on demand via `workflow_dispatch`. It skips on **fork** PRs, which cannot read the
-  org secrets it needs. The fast `harness` job in `e2e.yml` still runs on every PR.
+- **The full-stack CI jobs are scoped, not universal.** Each provider loop lives in its own workflow
+  (`.github/workflows/e2e-idexx.yml`, `e2e-antech.yml`) because each needs a `paths:` filter and those
+  are per-workflow, not per-job. They run: on **push to `main`** always; on a **pull request** only
+  when the harness, the mock, compose or that loop's scenario changes (a docs or tenant-isolation edit
+  shouldn't pay for ~7 containers per provider — this matters more as the fan-out grows); and on
+  demand via `workflow_dispatch`. They skip on **fork** PRs, which cannot read the org secrets they
+  need. The fast `harness` job in `e2e.yml` still runs on every PR.
 - **The demo loop is blocked upstream** (tracked privately). Run it with `HARNESS_STACK=demo`.
+- **The antech loop is slow by construction.** Its integration hardcodes both Bull poll intervals to
+  30s with no env knob (idexx exposes `IDEXX_*_POLLING_INTERVAL_MS`, which the harness dials down to
+  ~3s), so the antech scenario waits whole intervals for a result. Making that interval
+  env-configurable would be a small change in the antech integration repo and would cut this suite's
+  runtime substantially — a possible team follow-up, out of scope here (that repo is read-only).
 - **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
-  results. The idexx scenario avoids this by stopping its integration in `afterAll` (removing its
-  jobs); if a run is interrupted before that, `docker compose --profile idexx down -v` clears Redis. A
-  normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
+  results. Both mock-backed scenarios avoid this by stopping their integration in `afterAll` (removing
+  its jobs); if a run is interrupted before that, `docker compose --profile <loop> down -v` clears
+  Redis. A normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
 - **No wire-format snapshots** yet (a follow-up).
 - **`maxWorkers: 1`.** One database, one event stream, one `seq` counter. Scenarios must not race.
