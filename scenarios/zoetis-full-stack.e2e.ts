@@ -21,6 +21,12 @@ import { closePool } from '../src/sql'
  * COMPLETED) before acking the batch; the orders poll reads /orders, fetches each order's status and
  * results, emits `external_orders`, and acks each order individually.
  *
+ * Note that BOTH channels can move the order to COMPLETED, and that matters when reading the
+ * assertions below. Seeding a result flips the mock's own order status, which the orders poll then
+ * reports through `external_orders` independently of the results poll — so a COMPLETED order is not
+ * by itself evidence that a result reconciled. Only the report reaching FINAL is. See the completion
+ * test for the full argument.
+ *
  * How this differs from the other two loops, all verified against the integration's source:
  *   - Everything is XML, in both directions, and the integration parses it with xmlbuilder2's object
  *     format — so element MULTIPLICITY is load-bearing in several places. See the header of
@@ -319,7 +325,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(received.clientId).toBe(env.zoetis.clientId)
     })
 
-    it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {
+    it('seeding a result at the mock closes the loop: the report reaches FINAL, the order COMPLETED', async () => {
       /* Watermark the event stream before seeding, so the /events test below can distinguish events
        * the RESULT loop produced from the ones order creation already emitted. */
       const before = expectOk<{ data: Array<{ seq: number }> }>(
@@ -338,14 +344,37 @@ describe('zoetis full-stack (Zoetis mock)', () => {
         'seed a result at the mock',
       )
 
-      const response = await pollUntil(
-        async () => await org.api.get(`/orders/${orderId}`),
-        (r) => r.body?.status === 'COMPLETED',
+      /* Wait on the REPORT reaching FINAL, not on the order reaching COMPLETED — the obvious choice
+       * here is the wrong one, and it took an independent review to catch it.
+       *
+       * Seeding a result flips the MOCK's own order status to COMPLETED (faithfully: a real Zoetis
+       * order with final results reports exactly that). The ORDERS poll then carries that status to
+       * dmi-api through `external_orders` -> handleExternalOrders -> updateOrder, which is an
+       * entirely separate channel from the results poll. So `GET /orders/:id -> COMPLETED` is
+       * evidence that the ORDERS poll ran — it stays green with the results channel severed
+       * outright, with the results document carrying a mismatched PracticeRef, or with every
+       * ResultStatus downgraded. All three were reproduced; all three left a COMPLETED assertion
+       * green. It is not the reconciliation proof it reads as.
+       *
+       * A FINAL report is. dmi-api sets a report to FINAL in exactly one place
+       * (ReportsService, via resultStatusMapper on the `external_results` path); order creation
+       * leaves it REGISTERED, and no orders-poll path touches it. So FINAL is reachable only through
+       * the results channel, i.e. only if `PracticeRef == externalId` reconciliation actually
+       * happened — which is the claim this loop rests on.
+       *
+       * The order status is still asserted, after the wait: it is a real part of the loop closing,
+       * just not the part that proves reconciliation. */
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${orderId}/report`),
+        (r) => r.body?.status === 'FINAL',
         COMPLETION_WAIT_MS,
         2_000,
       )
 
-      expect(response.body.status).toBe('COMPLETED')
+      expect(report.body.status).toBe('FINAL')
+
+      const order = await org.api.get(`/orders/${orderId}`)
+      expect(order.body.status).toBe('COMPLETED')
     }, COMPLETION_WAIT_MS + 30_000)
 
     it('the integration acknowledged the result batch', async () => {

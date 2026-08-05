@@ -7,8 +7,7 @@
  * (`/__control__/*`) lets tests seed results, inspect received orders and inject error scenarios so
  * the order->result->report loop is deterministic and CI-safe.
  *
- * It NEVER talks to real Zoetis (`vetscanconnect.zoetis.com` or otherwise) and never authenticates
- * for real. All canned data is SYNTHETIC — invented values shaped like Zoetis responses, never
+ * It NEVER talks to a live Zoetis host and never authenticates for real. All canned data is SYNTHETIC — invented values shaped like Zoetis responses, never
  * captured clinic/patient data. The service and analyte codes are genuine Zoetis catalogue
  * identifiers (vendor codes published to integrators, not clinic or patient data); every name,
  * price, value and range attached to them here is invented.
@@ -260,8 +259,10 @@ function textAt (node, path) {
  * enforces, so the two cannot drift apart. Serving one list and accepting another is how a scenario
  * ends up ordering a code the real vendor would refuse.
  *
- * `CDP`, `HEM` and `T4` are genuine Zoetis catalogue codes (vendor test identifiers). The section
- * names, descriptions and `Includes` lists attached to them here are invented.
+ * `CDP`, `HEM` and `T4` are genuine Zoetis catalogue codes (vendor test identifiers), and the section
+ * names, the test names for those three, and the fixed `Replicate` / `ValidFrom` / `Currency` /
+ * `NonDiscountable` fields follow the vendor's own catalogue shape. The `Includes` lists, the
+ * `sampleType`s and the fourth entry (`TSH`) are invented. None of it is clinic or patient data.
  *
  * Three sections, not one: `mapTestArrays` calls `DirectoryOfService.Section.map(...)`, so a single
  * `<Section>` deserialises to an object and getServices throws. The `Test` child is safe either way
