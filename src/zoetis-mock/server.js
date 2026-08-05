@@ -29,22 +29,23 @@
  *     the order-status document's `acknowledged` link.
  *   - Auth is HTTP Basic with a domain-style username, `<partnerId>\<clientId>`.
  *
- * The arity traps — places where the integration indexes an array without normalising first, so a
- * single element crashes the poll (each verified against xmlbuilder2 2.4.1, the version the
- * integration resolves):
- *   - order-status `<link>`: `.link.find(...)` in acknowledgeOrders and `.link.filter(...)` in
- *     ZoetisMapper.getEditable. This mock always emits >= 2 links.
- *   - `<LabResultItem>`: `labResult.LabResultItems.LabResultItem.filter(...)` in
- *     ZoetisMapper.mapLabResult. This mock always seeds >= 2 analytes.
- *   - `<Section>` in the service catalogue: `DirectoryOfService.Section.map(...)`. >= 2 sections.
- *   - `<specie>` / `<gender>`: `species.specie.map(...)` / `genders.gender.map(...)`. >= 2 each.
- * `<LabReport>` and `<LabResult>` are safe — those two go through the mapper's `objectOrArray`.
+ * WHERE MULTIPLICITY IS LOAD-BEARING. xmlbuilder2's object format gives an object for a lone child
+ * and an array for repeated ones, and the integration consumes these as arrays — so this mock always
+ * emits at least two of each (verified against xmlbuilder2 2.4.1, the version the integration
+ * resolves):
+ *   - order-status `<link>`: read via `.link.find(...)` in acknowledgeOrders and `.link.filter(...)`
+ *     in ZoetisMapper.getEditable.
+ *   - `<LabResultItem>`: read via `LabResultItems.LabResultItem.filter(...)` in
+ *     ZoetisMapper.mapLabResult. Hence >= 2 seeded analytes.
+ *   - `<Section>` in the service catalogue: `DirectoryOfService.Section.map(...)`.
+ *   - `<specie>` / `<gender>` / `<Device>`: `.map(...)` in getSpecies / getSexes / getDevices.
+ * `<LabReport>` and `<LabResult>` need no such care — those two go through the mapper's
+ * `objectOrArray` and read the same either way.
  *
- * One more shape trap, on the other side of the same coin: an EMPTY `<LabResults/>` element is worse
- * than an absent one. ZoetisMapper.getTests does `!labResults ? [] : objectOrArray(labResults
- * .LabResult).map(r => r.LabResultHeader.TestCode)`, and `<LabResults/>` parses to `{}` — truthy —
- * so it maps over `[undefined]` and throws. An order with no results yet therefore omits the
- * element entirely rather than emitting it empty. */
+ * The mirror image of the same rule: an EMPTY `<LabResults/>` is NOT equivalent to an absent one.
+ * ZoetisMapper.getTests branches on `!labResults`, and `<LabResults/>` parses to `{}`, which is
+ * truthy — so it goes on to read `LabResult` off it. An order with no results yet therefore omits
+ * the element entirely rather than emitting it empty. */
 
 const http = require('http')
 

@@ -243,14 +243,13 @@ the integration's own source (`zoetis.service.ts`, `helpers/zoetis-order.helper.
 - **Control plane** (`/__control__/*`, host-facing): seed a result, list/inspect received orders, read
   the catalogue, reset, inject error scenarios — the same determinism story as the other two mocks.
 
-**Element multiplicity is the fussy part here**, and it is a different trap from Antech's CDATA and
-attribute sensitivity. The integration calls `.find` / `.filter` / `.map` on several parsed
-collections *without* normalising first, and `xmlbuilder2`'s object format collapses a lone child to
-an object rather than a one-element array — so a single element crashes the poll. The mock therefore
-always emits **≥ 2** of: order-status `<link>`, `<LabResultItem>`, `<Section>`, `<specie>`,
-`<gender>`, `<Device>`. The mirror-image trap: an **empty `<LabResults/>` is worse than an absent
-one**, because `getTests` treats `{}` as truthy and then maps over `[undefined]` — so an order with no
-result yet omits the element entirely.
+**Element multiplicity is the fussy part here**, where Antech's was CDATA and attribute sensitivity.
+`xmlbuilder2`'s object format gives an object for a lone child and an array for repeated ones, and
+the integration consumes several of these as arrays — so the mock always emits **≥ 2** of:
+order-status `<link>`, `<LabResultItem>`, `<Section>`, `<specie>`, `<gender>`, `<Device>`. The mirror
+image of the same rule: an **empty `<LabResults/>` is not equivalent to an absent one**, because
+`getTests` branches on falsiness and `{}` is truthy — so an order with no result yet omits the
+element entirely.
 
 **Errors go back as JSON while every success is XML**, deliberately. The integration's
 `providerErrorMapper` reads `error.response.data.error.context`, which axios only ever produces from a
@@ -532,10 +531,10 @@ confirmed to interoperate with the current dmi-api. What the third provider taug
   integration's `getBreeds` being a no-op, since Zoetis publishes no breed catalogue. So a breed that
   *does* resolve maps to null and is dropped from the order; only an unresolvable string survives.
   The scenario therefore sends a plain descriptive breed and asserts forwarding, not mapping.
-- **Multiplicity is this dialect's version of Antech's CDATA trap.** Every place the integration calls
-  `.find` / `.filter` / `.map` on a parsed XML collection without normalising first is a crash waiting
-  for a one-element response, because `xmlbuilder2`'s object format returns an object rather than a
-  one-element array. Worth grepping for in the next provider before writing its mock.
+- **Multiplicity is this dialect's version of Antech's CDATA sensitivity.** Wherever an integration
+  consumes a parsed XML collection as an array, a one-element response is a different shape — the
+  object formats return an object, not a one-element array. Worth grepping for in the next provider
+  before deciding how many of each element its mock should emit.
 - **Its failing polls are silent too**, exactly as antech's are, so the scenario asserts **both**
   acknowledge channels as positive evidence that each poll ran to completion rather than dying midway
   — including that the *orders* ack happened at `COMPLETED`, which can only be true if a full

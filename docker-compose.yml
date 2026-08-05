@@ -296,9 +296,8 @@ services:
   # Built from its own (Node-20) Dockerfile's `production` stage — like idexx and antech, and unlike
   # the demo repo, it needs no inline workaround.
   #
-  # `target: production` is not incidental: that Dockerfile also declares a `seed` stage whose
-  # `CMD ["npm", "run", "seed"]` names a script the package.json does not define, so an image built
-  # from it starts and immediately dies. Every loop here targets `production` for that reason.
+  # `target: production` is deliberate and matches the idexx/antech profiles: it is the stage that
+  # runs the built service. The Dockerfile offers other stages that are not the deployable one.
   #
   # PORT is set explicitly because the repo's own .env.example says 4100 while its code and Dockerfile
   # default to 3000; pinning it here removes the ambiguity. Nothing in the harness calls the
