@@ -16,6 +16,8 @@
 #     src/idexx-mock, zero deps), and the REAL dmi-engine-idexx-integration container.
 #   - `antech`: redis, the Antech mock (built from this repo's src/antech-mock, zero deps), and the
 #     REAL dmi-engine-antech-integration container (the classic antech provider, id `antech`).
+#   - `zoetis`: redis, the Zoetis mock (built from this repo's src/zoetis-mock, zero deps), and the
+#     REAL dmi-engine-zoetis-integration container (the classic zoetis provider, id `zoetis`).
 #   - `full-stack`: redis, the demo vendor API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
@@ -60,10 +62,10 @@ services:
   # ---- full-stack profile: the demo provider loop (order -> engine -> vendor -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
-  # Shared by every full-system loop (demo, idexx and antech).
+  # Shared by every full-system loop (demo, idexx, antech and zoetis).
   redis:
     image: redis:7-alpine
-    profiles: ['full-stack', 'idexx', 'antech']
+    profiles: ['full-stack', 'idexx', 'antech', 'zoetis']
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
 
@@ -262,6 +264,67 @@ services:
       - activemq
       - redis
       - antech-mock
+
+  # ---- zoetis profile: the Zoetis VetSync loop (order -> engine -> mock vendor -> report) ----
+
+  # Zoetis mock vendor, built from this repo's zero-dependency Node server. Serves Zoetis's
+  # /vetsync/v1 dialect (Basic auth, single-POST order placement, the orders/results polls and BOTH
+  # acknowledge channels, and the services/species/genders reference data) plus a /__control__ plane
+  # the scenario drives to seed results deterministically. Built inline (a one-line COPY) rather than
+  # bind-mounted so the image is self-contained on any host, and it needs no GHP_TOKEN. `baseUrl` in
+  # the dmi-api provider config points at this service's compose-network name, never at a live Zoetis
+  # host — and the mock builds its own order-status `link href`s from the request's Host header, so
+  # even the URLs the integration POSTs back to resolve here rather than anywhere real.
+  zoetis-mock:
+    profiles: ['zoetis']
+    build:
+      context: ./src/zoetis-mock
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY server.js ./
+        EXPOSE 3000
+        CMD ["node", "server.js"]
+    environment:
+      PORT: '3000'
+    ports:
+      - '${HARNESS_ZOETIS_MOCK_PORT:-3014}:3000'
+
+  # The REAL zoetis provider integration (standalone NestJS microservice, one container per provider,
+  # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
+  # vendor over HTTP using the baseUrl carried inside each MQTT message (the provider configuration).
+  # Built from its own (Node-20) Dockerfile's `production` stage — like idexx and antech, and unlike
+  # the demo repo, it needs no inline workaround.
+  #
+  # `target: production` is not incidental: that Dockerfile also declares a `seed` stage whose
+  # `CMD ["npm", "run", "seed"]` names a script the package.json does not define, so an image built
+  # from it starts and immediately dies. Every loop here targets `production` for that reason.
+  #
+  # PORT is set explicitly because the repo's own .env.example says 4100 while its code and Dockerfile
+  # default to 3000; pinning it here removes the ambiguity. Nothing in the harness calls the
+  # integration over HTTP anyway — it is driven entirely over MQTT.
+  #
+  # Note there is no polling-interval env var to set: like antech, the zoetis integration hardcodes
+  # both its results and orders Bull intervals to 30s (src/config/configuration.ts), where idexx
+  # exposes IDEXX_*_POLLING_INTERVAL_MS. That is why the zoetis scenario budgets a longer wait.
+  dmi-engine-zoetis-integration:
+    profiles: ['zoetis']
+    build:
+      context: ${DMI_ZOETIS_INTEGRATION_DIR:-../dmi-engine-zoetis-integration}
+      target: production
+      args:
+        GHP_TOKEN: ${GHP_TOKEN:-}
+    environment:
+      PORT: '3000'
+      MQTT_PROTOCOL: mqtt
+      MQTT_HOST: activemq
+      MQTT_PORT: '1883'
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    depends_on:
+      - activemq
+      - redis
+      - zoetis-mock
 
 volumes:
   mysql-data:

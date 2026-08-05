@@ -102,7 +102,8 @@ async function waitForTcp (
 /* Full-system services live behind compose profiles, so the default fast suite brings up only
  * MySQL/Mongo/ActiveMQ. Each full-system loop has its own profile: `idexx` (redis + the VetConnect
  * Plus mock + the real idexx integration), `antech` (redis + the Antech mock + the real classic
- * antech integration) and `full-stack` (redis + the demo vendor + its MySQL + the demo integration).
+ * antech integration), `zoetis` (redis + the Zoetis mock + the real zoetis integration) and
+ * `full-stack` (redis + the demo vendor + its MySQL + the demo integration).
  * `--profile` is a top-level flag and must precede the subcommand. */
 function composeProfile (): string {
   if (env.stack === 'demo') return 'full-stack'
@@ -174,6 +175,8 @@ export async function waitForDependencies (): Promise<void> {
       await waitForHttpOk(`${env.demoProvider.baseUrl}/status`, 'demo-provider-api', depsReadyMs)
     } else if (env.stack === 'antech') {
       await waitForHttpOk(`${env.antech.mockBaseUrl}/status`, 'antech-mock', depsReadyMs)
+    } else if (env.stack === 'zoetis') {
+      await waitForHttpOk(`${env.zoetis.mockBaseUrl}/status`, 'zoetis-mock', depsReadyMs)
     } else {
       await waitForHttpOk(`${env.idexx.mockBaseUrl}/status`, 'vetconnect-mock', depsReadyMs)
     }
