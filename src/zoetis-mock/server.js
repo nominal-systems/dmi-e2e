@@ -958,6 +958,28 @@ async function handleControlSeedResult (req, res, params) {
   const resultStatus = body.resultStatus ?? 'Done'
   const testCode = body.testCode ?? order.testCodes[0]
   const service = SERVICES.find((entry) => entry.code === testCode)
+  const analytes =
+    Array.isArray(body.analytes) && body.analytes.length > 0 ? body.analytes : defaultAnalytes()
+
+  /* Enforce the >= 2 rule the file header states, rather than trusting the caller to have read it.
+   * A single analyte emits one <LabResultItem>, which deserialises to an object, and the mapper
+   * calls `.filter` on it directly — inside the results poll, which swallows the throw. The next
+   * author to seed a one-analyte result would get a silent 120s timeout and nothing in the harness
+   * output to explain it. Refusing here turns that into an immediate, legible 400.
+   *
+   * This is the control plane, not the vendor dialect: a real Zoetis lab would happily return a
+   * one-analyte panel. The guard documents an integration constraint the harness cannot exercise,
+   * which is why it says so rather than pretending to be vendor validation. */
+  if (analytes.length < 2) {
+    sendJson(res, 400, {
+      message:
+        `seed at least 2 analytes (got ${analytes.length}): a lone <LabResultItem> deserialises to ` +
+        'an object and ZoetisMapper.mapLabResult calls .filter on it, which throws inside the ' +
+        'results poll and is swallowed there',
+    })
+    return
+  }
+
   order.result = {
     /* Echoed from the ORDER, not invented: the report's testResultsSet[].code is this value, so
      * sourcing it from what was ordered is what lets the scenario assert the two agree. */
@@ -967,7 +989,7 @@ async function handleControlSeedResult (req, res, params) {
     resultStatus,
     resultNotes: body.resultNotes ?? 'Synthetic harness result.',
     seededAt: new Date(),
-    analytes: Array.isArray(body.analytes) && body.analytes.length > 0 ? body.analytes : defaultAnalytes(),
+    analytes,
   }
   order.resultAcknowledged = false
   order.status = resultStatus === 'Done' ? STATUS_COMPLETED : STATUS_PARTIAL

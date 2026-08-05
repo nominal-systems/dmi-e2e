@@ -5,3 +5,8 @@ dist/
 .env
 .env.local
 .idea/
+
+# Session artifacts: review reports, scratch analyses. They routinely quote private-repo internals
+# and are not repo deliverables, so they must never be committed to this public repo — one stray
+# `git add -A` is all it takes, and this has happened.
+_review_report_*.md
