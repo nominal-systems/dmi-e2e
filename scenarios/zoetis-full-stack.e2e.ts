@@ -142,6 +142,34 @@ describe('zoetis full-stack (Zoetis mock)', () => {
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.zoetis.mockBaseUrl)
 
+  /* Place an order the same way the headline test does, for the "second time" scenarios below that
+   * each need their own. Every one of them gets a FRESH order rather than reusing the first: they
+   * assert on report content and acknowledge state, and sharing an order would make one test's
+   * amendment another's flake. `requisitionId` is unique per call (seed.orderPayload), which is what
+   * keeps them independent all the way down to the mock's own keying. */
+  async function placeOrder (): Promise<{ orderId: string, requisitionId: string }> {
+    const payload = orderPayload(org.integrationId, {
+      patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
+      testCodes: [{ code: serviceCode }],
+    })
+    const created = expectOk<{ id: string }>(
+      await org.api.post('/orders', payload),
+      'place zoetis order',
+    )
+    return { orderId: created.id, requisitionId: payload.requisitionId as string }
+  }
+
+  /* Read the observations of an order's report, flattened across its panels. Returns [] when the
+   * report has no test results yet, so a caller can poll on it. */
+  async function observationsFor (id: string): Promise<Array<{
+    code: string
+    valueQuantity?: { value: number, units?: string | null } | null
+  }>> {
+    const response = await org.api.get(`/orders/${id}/report`)
+    const panels = (response.body?.testResultsSet ?? []) as Array<{ observations?: any[] }>
+    return panels.flatMap((panel) => panel.observations ?? [])
+  }
+
   beforeAll(async () => {
     /* A fresh container starts clean; reset is only load-bearing for warm reruns (HARNESS_KEEP_UP),
      * where it clears the previous run's orders/results. Harmless on a cold start. */
@@ -568,5 +596,127 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(response.text).toMatch(/LabRequests\/LabRequest\/TestCode error in zoetis/)
       expect(response.text).not.toMatch(/failed with \d+ status code/)
     }, 30_000)
+  })
+
+  /* ---- "second time" coverage ----
+   *
+   * Everything above happens once per run: one order, one final result, one of each poll. The blocks
+   * below cover what happens the SECOND time — a result that arrives incomplete and is later amended,
+   * a delivery that is repeated because its acknowledgement failed, and a feed carrying two documents
+   * instead of one. Each takes its own fresh order so it cannot perturb the assertions above. */
+
+  describe('a Pending result is amended to Done, and the report updates in place', () => {
+    /* The clinical norm for in-clinic analyzers: a panel reports partial results, then completes.
+     * dmi-api merges the second delivery into the first report rather than accumulating a second
+     * copy, and this is what proves it. */
+    let progressiveOrderId: string
+    let progressiveRequisitionId: string
+    let observationCountAfterPending = 0
+
+    /* Two analytes (the mock's floor — a lone <LabResultItem> deserialises to an object and the
+     * mapper's .filter throws), seeded explicitly rather than using the mock's defaults so the
+     * amendment can change exactly one value and leave the other provably untouched. */
+    const pendingAnalytes = [
+      { code: GLUCOSE, name: 'Glucose', result: '150', units: 'mg/dL', lowRange: '74', highRange: '143', notes: 'H' },
+      { code: CREATININE, name: 'Creatinine', result: '1.2', units: 'mg/dL', lowRange: '0.5', highRange: '1.8' },
+    ]
+    const AMENDED_GLUCOSE = '210'
+
+    it('a Pending result gives a REGISTERED report that already carries observations', async () => {
+      const placed = await placeOrder()
+      progressiveOrderId = placed.orderId
+      progressiveRequisitionId = placed.requisitionId
+
+      expectOk(
+        await mock.post(`/__control__/orders/${progressiveRequisitionId}/results`, {
+          resultStatus: 'Pending',
+          analytes: pendingAnalytes,
+        }),
+        'seed a Pending result at the mock',
+      )
+
+      /* Traced rather than assumed: ZoetisMapper.getResultStatus only reports COMPLETED when EVERY
+       * LabResult carries ResultStatus `Done`, so a `Pending` panel maps to ResultStatus.PENDING;
+       * dmi-api's resultStatusMapper has no PENDING case and falls through to REGISTERED. The
+       * observations are mapped regardless of status, which is the point of this assertion — a
+       * partial result is readable, not withheld. */
+      const observations = await pollUntil(
+        async () => await observationsFor(progressiveOrderId),
+        (items) => items.length > 0,
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+
+      const report = expectOk<{ status: string }>(
+        await org.api.get(`/orders/${progressiveOrderId}/report`),
+        'read the progressive report',
+      )
+      expect(report.status).toBe('REGISTERED')
+
+      observationCountAfterPending = observations.length
+      expect(observations.map((observation) => observation.code).sort()).toEqual(
+        [GLUCOSE, CREATININE].sort(),
+      )
+      expect(observations.find((o) => o.code === GLUCOSE)?.valueQuantity?.value).toBe(150)
+      expect(observations.find((o) => o.code === CREATININE)?.valueQuantity?.value).toBe(1.2)
+    }, COMPLETION_WAIT_MS + 30_000)
+
+    it('the order reaches PARTIAL — and only the orders channel can have done that', async () => {
+      /* Worth stating because it is the completion-channels trap from the file header, in its other
+       * direction. A PENDING result cannot move the order at all: dmi-api's
+       * ProviderResultUtils.setOrderStatusFromResult only acts on COMPLETED and PARTIAL result
+       * statuses, and this result is PENDING. So PARTIAL here is unambiguously the ORDERS poll
+       * carrying the mock's `PARTIAL-RESULTS` vendor status through ZoetisMapper.getOrderStatus —
+       * the one assertion in this file that is specifically about that channel's status mapping. */
+      const response = await pollUntil(
+        async () => await org.api.get(`/orders/${progressiveOrderId}`),
+        (r) => r.body?.status === 'PARTIAL',
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+
+      expect(response.body.status).toBe('PARTIAL')
+    }, ORDER_ACK_WAIT_MS + 30_000)
+
+    it('re-seeding Done amends the existing observation in place: FINAL, no duplicate, no loss', async () => {
+      expectOk(
+        await mock.post(`/__control__/orders/${progressiveRequisitionId}/results`, {
+          resultStatus: 'Done',
+          analytes: [
+            { ...pendingAnalytes[0], result: AMENDED_GLUCOSE },
+            pendingAnalytes[1],
+          ],
+        }),
+        'amend the result to Done at the mock',
+      )
+
+      /* FINAL is the results-channel signal (see the headline completion test): the orders poll can
+       * move the ORDER to COMPLETED on its own, but only `external_results` can move the REPORT. */
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${progressiveOrderId}/report`),
+        (r) => r.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(report.body.status).toBe('FINAL')
+
+      const observations = await observationsFor(progressiveOrderId)
+
+      /* The substance of this test. dmi-api merges a re-delivered result into the existing report by
+       * observation CODE (ReportsService.updateTestResultObservations builds a map keyed on it and
+       * updates matches in place), so an amendment must overwrite rather than accumulate. Asserting
+       * the count is unchanged AND that exactly one glucose observation exists is what would catch a
+       * regression that started appending — which would otherwise look like a perfectly healthy
+       * report with a stale duplicate hiding in it. */
+      expect(observations.length).toBe(observationCountAfterPending)
+      expect(observations.filter((observation) => observation.code === GLUCOSE)).toHaveLength(1)
+      expect(observations.find((o) => o.code === GLUCOSE)?.valueQuantity?.value).toBe(
+        Number(AMENDED_GLUCOSE),
+      )
+      /* The analyte the amendment did NOT touch must still carry its first-delivery value — a merge
+       * that dropped unmentioned observations, or reset them, fails here rather than silently
+       * shrinking the report. */
+      expect(observations.find((o) => o.code === CREATININE)?.valueQuantity?.value).toBe(1.2)
+    }, COMPLETION_WAIT_MS + 30_000)
   })
 })
