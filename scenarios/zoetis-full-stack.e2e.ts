@@ -780,4 +780,114 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(observations.find((o) => o.code === GLUCOSE)?.valueQuantity?.value).toBe(150)
     }, COMPLETION_WAIT_MS * 2 + 30_000)
   })
+
+  describe('two orders in flight: the feeds carry two documents, and both close', () => {
+    /* Until here every run has held exactly one order, so the orders feed and the results batch have
+     * only ever carried ONE document — and the array-shaped parse paths (`objectOrArray` over
+     * `LabReports.LabReport` and `orders.order`) have never run against the real integration. A
+     * dialect this multiplicity-sensitive should not ship with the plural case untested. */
+    let firstOrder: { orderId: string, requisitionId: string }
+    let secondOrder: { orderId: string, requisitionId: string }
+
+    it('both reports reach FINAL, and a single batch really did carry both results', async () => {
+      firstOrder = await placeOrder()
+      secondOrder = await placeOrder()
+      expect(firstOrder.requisitionId).not.toBe(secondOrder.requisitionId)
+
+      /* Making simultaneity DETERMINISTIC rather than hoping for it. Two seeds landing either side of
+       * a poll tick would be served as two one-document batches and prove nothing new. So: arm a
+       * one-shot failure on the results poll BEFORE seeding either result. The next tick consumes the
+       * injection and fails; by the tick after, both results are pending and are served together in
+       * one batch. */
+      expectOk(
+        await mock.post('/__control__/scenarios', { key: 'batchResults', status: 500, once: true }),
+        'arm a one-shot results-poll failure to force both results into one batch',
+      )
+
+      expectOk(
+        await mock.post(`/__control__/orders/${firstOrder.requisitionId}/results`, {}),
+        'seed a result for the first order',
+      )
+      expectOk(
+        await mock.post(`/__control__/orders/${secondOrder.requisitionId}/results`, {}),
+        'seed a result for the second order',
+      )
+
+      /* Each wait is scoped to its own order — a shared assertion would let one order's success mask
+       * the other's failure, which is the whole risk this test exists to cover. The assertion carries
+       * the requisitionId so a failure NAMES which of the two broke; `expect(status).toBe('FINAL')`
+       * inside a loop would report "Expected FINAL, received REGISTERED" without saying whose. */
+      for (const order of [firstOrder, secondOrder]) {
+        /* One COMPLETION_WAIT_MS per order, not two: both waits plus slack have to fit inside this
+         * test's own timeout, or a broken second order exhausts the budget during its poll and jest
+         * reports a bare "Exceeded timeout" instead of the assertion below — losing exactly the
+         * naming this test is built to provide. (Learned from the prove-red run, which did that.) */
+        const report = await pollUntil(
+          async () => await org.api.get(`/orders/${order.orderId}/report`),
+          (r) => r.body?.status === 'FINAL',
+          COMPLETION_WAIT_MS,
+          2_000,
+        )
+        expect({ requisitionId: order.requisitionId, reportStatus: report.body?.status }).toEqual({
+          requisitionId: order.requisitionId,
+          reportStatus: 'FINAL',
+        })
+      }
+
+      /* Asserted, not assumed: both orders completing is equally true of two separate one-document
+       * batches, which would leave the array path just as untested as before. The high-water mark is
+       * the only thing that distinguishes the two. */
+      const feeds = expectOk<{ maxLabReportsInOneBatch: number, maxDistinctOrdersInOneAck: number }>(
+        await mock.get('/__control__/feeds'),
+        'read the mock feed high-water marks',
+      )
+      expect(feeds.maxLabReportsInOneBatch).toBeGreaterThanOrEqual(2)
+
+      /* The serving count alone is not enough, and this took a surviving mutation to notice.
+       * Cross-wiring both documents in the batch onto ONE order's PracticeRef still serves two
+       * documents and still ends with both reports FINAL — because this mock self-heals: the order
+       * whose result was misattributed stays pending and is served ALONE, correctly, on the next
+       * tick. Both the count above and the per-order FINAL waits stayed green through exactly that.
+       *
+       * Acknowledging is where the difference survives. The integration acks the ids it parsed OUT
+       * of the batch, so correctly-attributed documents produce two DISTINCT ids in one POST, and
+       * cross-wired ones produce the same id twice. That is the assertion that the two documents
+       * were not merely delivered together but read as two different orders. */
+      expect(feeds.maxDistinctOrdersInOneAck).toBeGreaterThanOrEqual(2)
+    }, COMPLETION_WAIT_MS * 2 + 90_000)
+
+    it('both results were batch-acknowledged and both orders link-acknowledged at COMPLETED', async () => {
+      /* The two acknowledge channels again, now with two orders in flight: the batch ack must cover
+       * both client_order_ids in one POST, and each order must still be acked individually through
+       * its own status document's `acknowledged` link. */
+      for (const order of [firstOrder, secondOrder]) {
+        const received = await pollUntil(
+          async () => await mock.get(`/__control__/orders/${order.requisitionId}`),
+          (r) => r.body?.resultAcknowledged === true && r.body?.acknowledgedStatus === 'COMPLETED',
+          ORDER_ACK_WAIT_MS,
+          2_000,
+        )
+
+        /* Self-identifying for the same reason as above. */
+        expect({
+          requisitionId: order.requisitionId,
+          resultAcknowledged: received.body?.resultAcknowledged,
+          acknowledgedStatus: received.body?.acknowledgedStatus,
+        }).toEqual({
+          requisitionId: order.requisitionId,
+          resultAcknowledged: true,
+          acknowledgedStatus: 'COMPLETED',
+        })
+      }
+
+      /* The orders feed is the other array-shaped parse path. Both orders are placed within one tick
+       * of each other, so it should have carried both at once — but assert it rather than assume it,
+       * for the same reason as the batch above. */
+      const feeds = expectOk<{ maxOrdersInOneFeed: number }>(
+        await mock.get('/__control__/feeds'),
+        'read the mock feed high-water marks',
+      )
+      expect(feeds.maxOrdersInOneFeed).toBeGreaterThanOrEqual(2)
+    }, ORDER_ACK_WAIT_MS * 2 + 30_000)
+  })
 })

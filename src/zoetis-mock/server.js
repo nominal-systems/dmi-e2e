@@ -87,6 +87,23 @@ function freshState () {
     /* Error/edge injection: { [key]: { status, body, once } }. Keys are logical operation names:
      * 'createOrder', 'batchOrders', 'batchResults', 'orderStatus', 'batchAcknowledge'. */
     scenarios: {},
+    /* High-water marks: the most documents this mock has ever served in ONE feed response.
+     *
+     * They exist so a test can assert that a MULTI-document batch actually happened, rather than
+     * inferring it from two orders both having completed — which two separate one-document batches
+     * would satisfy just as well. The array-shaped parse paths (`objectOrArray` on `LabReport` and
+     * on `orders.order`) only run when a response carries more than one, so without this the
+     * difference is invisible from outside. Read-only, exposed through /__control__/feeds. */
+    maxLabReportsInOneBatch: 0,
+    maxOrdersInOneFeed: 0,
+    /* Most DISTINCT client_order_ids ever acknowledged in one batch-acknowledge POST. Distinct, not
+     * total, and that is the whole point: it is what separates a multi-document batch whose documents
+     * were correctly attributed from one whose documents were cross-wired onto a single order. The
+     * latter still produces a two-entry ack — just two copies of the same id. Serving counts alone
+     * cannot tell those apart, and this mock self-heals a mis-served batch on the following tick
+     * (the leftover order is then the only one pending, so it is served alone and correctly), which
+     * would otherwise hide the failure entirely. */
+    maxDistinctOrdersInOneAck: 0,
   }
 }
 
@@ -830,6 +847,7 @@ function handleBatchOrders (req, res) {
   }
 
   const pending = [...state.orders.values()].filter((order) => order.acknowledgedStatus !== order.status)
+  state.maxOrdersInOneFeed = Math.max(state.maxOrdersInOneFeed, pending.length)
   sendXml(res, 200, buildOrdersXml(req, pending))
 }
 
@@ -881,6 +899,7 @@ function handleBatchResults (req, res) {
   const pending = [...state.orders.values()].filter(
     (order) => order.result != null && !order.resultAcknowledged,
   )
+  state.maxLabReportsInOneBatch = Math.max(state.maxLabReportsInOneBatch, pending.length)
   sendXml(res, 200, buildLabReportsXml(pending))
 }
 
@@ -912,6 +931,8 @@ async function handleBatchAcknowledge (req, res) {
   const ids = childrenNamed(document, 'order')
     .map((node) => node.attrs.client_order_id)
     .filter((id) => id != null && id !== '')
+
+  state.maxDistinctOrdersInOneAck = Math.max(state.maxDistinctOrdersInOneAck, new Set(ids).size)
 
   const unknown = []
   for (const id of ids) {
@@ -1160,6 +1181,20 @@ const routes = [
         species: SPECIES,
         genders: GENDERS,
         genderCodes: [...GENDER_CODES],
+      }),
+  ],
+
+  /* Feed high-water marks, so a test can assert a multi-document batch really was served rather
+   * than inferring it from two orders both completing (which two single-document batches satisfy
+   * equally well). Read-only. */
+  [
+    'GET',
+    /^\/__control__\/feeds$/,
+    (req, res) =>
+      sendJson(res, 200, {
+        maxLabReportsInOneBatch: state.maxLabReportsInOneBatch,
+        maxOrdersInOneFeed: state.maxOrdersInOneFeed,
+        maxDistinctOrdersInOneAck: state.maxDistinctOrdersInOneAck,
       }),
   ],
 
