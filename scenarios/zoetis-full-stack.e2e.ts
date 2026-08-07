@@ -719,4 +719,65 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(observations.find((o) => o.code === CREATININE)?.valueQuantity?.value).toBe(1.2)
     }, COMPLETION_WAIT_MS + 30_000)
   })
+
+  describe('a failed batch acknowledgement is retried, and the redelivery does not duplicate', () => {
+    /* The vendor's acknowledge model is at-least-once, and this is the case it exists for. The
+     * integration emits results to dmi-api and THEN acks them (ZoetisResultsProcessor), so an ack
+     * that fails leaves the batch unacked at the vendor: it is re-served on the next tick and dmi-api
+     * sees the same result a second time. Nothing in the loop above ever exercises that, because the
+     * ack has never failed. */
+    let retryOrderId: string
+    let retryRequisitionId: string
+
+    it('the result survives one lost acknowledgement: FINAL, observations once, ack eventually true', async () => {
+      const placed = await placeOrder()
+      retryOrderId = placed.orderId
+      retryRequisitionId = placed.requisitionId
+
+      /* One-shot: the first batch acknowledge 500s and the injection is consumed, so the retry on the
+       * following tick succeeds. That models a transient vendor failure rather than an outage, which
+       * is what makes "eventually acknowledged" the right assertion. */
+      expectOk(
+        await mock.post('/__control__/scenarios', {
+          key: 'batchAcknowledge',
+          status: 500,
+          once: true,
+        }),
+        'arm a one-shot batch-acknowledge failure',
+      )
+
+      expectOk(
+        await mock.post(`/__control__/orders/${retryRequisitionId}/results`, {}),
+        'seed a result whose first acknowledgement will fail',
+      )
+
+      /* Two ticks minimum: the first delivers and fails its ack, the second redelivers and acks. */
+      const acknowledged = await pollUntil(
+        async () => await mock.get(`/__control__/orders/${retryRequisitionId}`),
+        (r) => r.body?.resultAcknowledged === true,
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(acknowledged.body.resultAcknowledged).toBe(true)
+
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${retryOrderId}/report`),
+        (r) => r.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(report.body.status).toBe('FINAL')
+
+      /* The substance: the result was delivered TWICE and the report must still hold one copy of
+       * each observation. Content, not event cardinality — how many `report:updated` events fired is
+       * an implementation detail of the retry and pinning it would make this test fragile for no
+       * gain. The mock's default seed is six analytes, two of which the mapper filters out. */
+      const observations = await observationsFor(retryOrderId)
+      expect(observations.map((observation) => observation.code).sort()).toEqual(
+        [GLUCOSE, CREATININE, ALT, ALBUMIN].sort(),
+      )
+      expect(observations).toHaveLength(4)
+      expect(observations.find((o) => o.code === GLUCOSE)?.valueQuantity?.value).toBe(150)
+    }, COMPLETION_WAIT_MS * 2 + 30_000)
+  })
 })

@@ -84,8 +84,8 @@ function freshState () {
      * integration assigns as BOTH the requisitionId and the externalId, and it is what the result
      * document carries as its `Identification/PracticeRef`. */
     orders: new Map(),
-    /* Error/edge injection: { [key]: { status, body, once } }. Keys are logical operation names,
-     * e.g. 'createOrder', 'batchResults', 'batchOrders', 'orderStatus'. */
+    /* Error/edge injection: { [key]: { status, body, once } }. Keys are logical operation names:
+     * 'createOrder', 'batchOrders', 'batchResults', 'orderStatus', 'batchAcknowledge'. */
     scenarios: {},
   }
 }
@@ -891,6 +891,22 @@ function handleBatchResults (req, res) {
  * rather than silently absorbed. */
 async function handleBatchAcknowledge (req, res) {
   if (requireBasicAuth(req, res) == null) return
+
+  /* Injectable, and this is the one endpoint where that matters most: a FAILING acknowledge is the
+   * entire reason the vendor's at-least-once model exists. The integration emits results to dmi-api
+   * BEFORE acking them (ZoetisResultsProcessor), so an ack that fails leaves the batch unacked at
+   * the vendor and it is re-served on the next tick — dmi-api therefore receives the same result
+   * twice, and must merge rather than duplicate. Without a way to stage the failure that path is
+   * unreachable from the harness. Honours `once: true`, so a test can stage exactly one miss. */
+  const scenario = takeScenario('batchAcknowledge')
+  if (scenario != null) {
+    sendJson(
+      res,
+      scenario.status,
+      scenario.body ?? { error: { context: 'orders', message: 'batch acknowledge failed' } },
+    )
+    return
+  }
 
   const document = parseXml(await readRaw(req))
   const ids = childrenNamed(document, 'order')
