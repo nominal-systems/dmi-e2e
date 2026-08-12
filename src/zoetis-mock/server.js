@@ -424,6 +424,35 @@ function defaultAnalytes () {
 
 /* ---- response builders ---- */
 
+/* Which link rels an order-status document carries, BY STATE. Verified against the live Zoetis
+ * sandbox for the two states the loop always visits:
+ *
+ *   WAITING-FOR-SAMPLE -> self, poll, acknowledged, cancel     (no `results` link yet)
+ *   COMPLETED          -> self, poll, acknowledged, results    (no `cancel`)
+ *
+ * `results` appears only once results exist, and `cancel` only while the order is still editable —
+ * so ZoetisMapper.getEditable (cancel present <-> editable) now tracks the vendor's actual state
+ * machine rather than a constant. The other two states were NOT captured live; their sets are
+ * assumptions, stated as such:
+ *
+ *   PARTIAL-RESULTS    -> self, poll, acknowledged, results    (assumed: results exist, and a
+ *                         partially-resulted order is presumed no longer editable)
+ *   CANCELLED          -> self, poll, acknowledged             (assumed: no results, not editable)
+ *
+ * The integration builds its results URLs itself and only ever FOLLOWS the `acknowledged` href, so
+ * none of this changes its behaviour — it is fidelity, plus getEditable becoming state-true. Every
+ * state still carries >= 3 links, so the >=2 arity rule at the top of this file holds untouched.
+ *
+ * A single source of truth on purpose: buildOrderElement emits exactly these rels, and the control
+ * plane exposes them (publicOrder.linkRels), so a scenario asserting the set can never drift from
+ * what the vendor dialect actually serves. */
+function linkRelsFor (status) {
+  const rels = ['self', 'poll', 'acknowledged']
+  if (status === STATUS_COMPLETED || status === STATUS_PARTIAL) rels.push('results')
+  if (status === STATUS_WAITING_FOR_SAMPLE) rels.push('cancel')
+  return rels
+}
+
 /* The order-status document, returned by order placement and by GET /orders/:id/status, and the
  * `<order>` entries of the orders poll.
  *
@@ -436,22 +465,18 @@ function defaultAnalytes () {
  * The links are not decoration. `acknowledged` is POSTed to VERBATIM by acknowledgeOrders, and
  * `cancel` is what ZoetisMapper.getEditable looks for. There must be at least two of them or both
  * `.find` and `.filter` are called on a plain object and the orders poll dies (silently — the
- * processor swallows it). */
+ * processor swallows it). Which rels appear is linkRelsFor's business — see the state table there. */
 function buildOrderElement (req, order, indent) {
   const base = `${selfBaseUrl(req)}${API}/orders/${encodeURIComponent(order.practiceRef)}`
   const pad = ' '.repeat(indent)
-  const links = [
-    { href: `${base}/status`, method: 'GET', rel: 'self' },
-    { href: `${base}/results`, method: 'GET', rel: 'results' },
-    { href: `${selfBaseUrl(req)}${API}/orders`, method: 'GET', rel: 'poll' },
-    { href: `${base}/acknowledged/${encodeURIComponent(order.status)}`, method: 'POST', rel: 'acknowledged' },
-  ]
-  /* An order that can no longer be edited advertises no `cancel` link — that is what flips
-   * ZoetisMapper.getEditable to false, so it tracks the order's real state rather than being
-   * constant. */
-  if (order.status === STATUS_WAITING_FOR_SAMPLE) {
-    links.push({ href: base, method: 'DELETE', rel: 'cancel' })
+  const hrefFor = {
+    self: { href: `${base}/status`, method: 'GET' },
+    poll: { href: `${selfBaseUrl(req)}${API}/orders`, method: 'GET' },
+    acknowledged: { href: `${base}/acknowledged/${encodeURIComponent(order.status)}`, method: 'POST' },
+    results: { href: `${base}/results`, method: 'GET' },
+    cancel: { href: base, method: 'DELETE' },
   }
+  const links = linkRelsFor(order.status).map((rel) => ({ rel, ...hrefFor[rel] }))
 
   return (
     `${pad}<order id="${escapeXml(order.id)}" client_order_id="${escapeXml(order.practiceRef)}">\n` +
@@ -1064,6 +1089,9 @@ function publicOrder (order) {
     practiceRef: order.practiceRef,
     id: order.id,
     status: order.status,
+    /* The link rels the order-status document advertises in this state — the same linkRelsFor that
+     * builds the document, so an asserting scenario and the vendor dialect cannot drift apart. */
+    linkRels: linkRelsFor(order.status),
     acknowledgedStatus: order.acknowledgedStatus,
     resultAcknowledged: order.resultAcknowledged,
     hasResult: order.result != null,
