@@ -38,6 +38,9 @@
  *     ZoetisMapper.mapLabResult. Hence >= 2 seeded analytes.
  *   - `<Section>` in the service catalogue: `DirectoryOfService.Section.map(...)`.
  *   - `<specie>` / `<gender>` / `<Device>`: `.map(...)` in getSpecies / getSexes / getDevices.
+ *     (A device's `<Tests>` is the one deliberate exception to the >=2 rule — one of the served
+ *     devices carries a single `<Test>`, because single-assay instruments are real at this vendor;
+ *     see the DEVICES note.)
  * `<LabReport>` and `<LabResult>` need no such care — those two go through the mapper's
  * `objectOrArray` and read the same either way.
  *
@@ -382,10 +385,41 @@ const GENDER_CODES = new Set(GENDERS.map((gender) => gender.toUpperCase().replac
 
 /* Devices are not part of the order->result loop, but the integration exposes getDevices and it does
  * `Devices.Device.map(...)` — so if a ref sync ever reaches here, two entries keep it from throwing.
- * A mock that 404s (or serves one device) would be a trap for the next scenario. */
+ * A mock that 404s (or serves one device) would be a trap for the next scenario.
+ *
+ * The element shape is what the integration's own parser declares and reads
+ * (devices-response.interface.ts, ZoetisDeviceMapper): per device — Id, Type, SoftwareRevision,
+ * SerialNumber, CurrentStatus, DirectoryOfServiceSections, and Tests holding <Test> children (bare
+ * test-code strings). The mapper maps CurrentStatus 'Online' to an active device and anything else
+ * to inactive (ZoetisDeviceStatus has exactly Online/Offline), so one of each is served. All values
+ * synthetic; the test codes are the catalogue's own.
+ *
+ * The single-Test device is deliberate and real: the vendor's fleet includes single-assay
+ * instruments (verified against the live Zoetis sandbox). Note what that does to the XML dialect:
+ * ONE <Test> child deserialises to a bare string rather than a one-element array — the standard
+ * arity behaviour described in the file header — and ZoetisDeviceMapper.map's
+ * `device.Tests.Test.map(...)` does not normalise that. Nothing in this suite syncs devices today,
+ * so no scenario asserts either way; the shape is here so the mock tells the truth about the vendor
+ * rather than about the parser. */
 const DEVICES = [
-  { id: 'VS-CHEM-1', name: 'Harness Chemistry Analyzer', model: 'VETSCAN-SIM', serial: 'HRN-0001' },
-  { id: 'VS-HEM-1', name: 'Harness Hematology Analyzer', model: 'VETSCAN-SIM', serial: 'HRN-0002' },
+  {
+    id: 'VS-CHEM-1',
+    type: 'Harness Chemistry Analyzer',
+    softwareRevision: '2.1.0',
+    serial: 'HRN-0001',
+    currentStatus: 'Online',
+    section: 'Chemistry',
+    tests: ['CDP', 'TSH'],
+  },
+  {
+    id: 'VS-T4-1',
+    type: 'Harness T4 Analyzer',
+    softwareRevision: '1.4.2',
+    serial: 'HRN-0002',
+    currentStatus: 'Offline',
+    section: 'Hematology',
+    tests: ['T4'],
+  },
 ]
 
 /* Invented analyte values on genuine Zoetis analyte codes, chosen to exercise all three branches of
@@ -688,10 +722,17 @@ function buildDevicesXml () {
     DEVICES.map(
       (device) =>
         '    <Device>\n' +
-        `        <DeviceID>${escapeXml(device.id)}</DeviceID>\n` +
-        `        <DeviceName>${escapeXml(device.name)}</DeviceName>\n` +
-        `        <Model>${escapeXml(device.model)}</Model>\n` +
+        `        <Id>${escapeXml(device.id)}</Id>\n` +
+        `        <Type>${escapeXml(device.type)}</Type>\n` +
+        `        <SoftwareRevision>${escapeXml(device.softwareRevision)}</SoftwareRevision>\n` +
         `        <SerialNumber>${escapeXml(device.serial)}</SerialNumber>\n` +
+        `        <CurrentStatus>${escapeXml(device.currentStatus)}</CurrentStatus>\n` +
+        '        <DirectoryOfServiceSections>\n' +
+        `            <DirectoryOfServiceSection>${escapeXml(device.section)}</DirectoryOfServiceSection>\n` +
+        '        </DirectoryOfServiceSections>\n' +
+        '        <Tests>\n' +
+        device.tests.map((test) => `            <Test>${escapeXml(test)}</Test>`).join('\n') +
+        '\n        </Tests>\n' +
         '    </Device>',
     ).join('\n') +
     '\n</Devices>'
