@@ -32,7 +32,8 @@ import { closePool } from '../src/sql'
  *     format — so element MULTIPLICITY is load-bearing in several places. See the header of
  *     src/zoetis-mock/server.js for the full list; the mock is built to satisfy all of them.
  *   - Placement is a SINGLE POST. There is no login step (antech) and no confirmOrder browser
- *     handshake (idexx), so the order is SUBMITTED the moment it lands.
+ *     handshake (idexx). The vendor answers with a WAITING-FOR-SAMPLE status document — which the
+ *     create-response mapping reports as a dmi SUBMITTED order; see the two-readings pin below.
  *   - Auth is HTTP Basic with a domain-style username, `<partnerId>\<clientId>` — joining a provider
  *     CONFIGURATION field to an INTEGRATION option. The mock accepts any credential VALUES (they are
  *     dummy by design) but requires them PRESENT and requires that join to have happened.
@@ -305,6 +306,15 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * All three agreeing is the entire basis of zoetis reconciliation — it is what lets a polled
        * result find this order. */
       expect(externalId).toBe(requisitionId)
+
+      /* First half of the two-readings pin (the second half is the still-SUBMITTED test below). The
+       * vendor answers placement with a WAITING-FOR-SAMPLE status document, and the CREATE-RESPONSE
+       * mapping (zoetis-responses.helper.ts mapOrderStatus) has no case for that value — it falls to
+       * its default and reports the new order as dmi SUBMITTED. The ORDERS-POLL mapping
+       * (ZoetisMapper.getOrderStatus) reads the same vendor state as WAITING_FOR_INPUT. Today the two
+       * paths disagree about the same document; this pin records the create-response half, so a
+       * deliberate change to either mapping flips a named assertion instead of drifting silently. */
+      expect(created.status).toBe('SUBMITTED')
     }, 60_000)
 
     it('the mock received the order with the REF-MAPPED species and sex, not the raw dmi codes', async () => {
@@ -325,7 +335,9 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       )
 
       expect(received.practiceRef).toBe(requisitionId)
-      expect(received.status).toBe('SUBMITTED')
+      /* The vendor-side status of a freshly placed order. WAITING-FOR-SAMPLE, never SUBMITTED —
+       * SUBMITTED is dmi vocabulary the vendor does not speak. */
+      expect(received.status).toBe('WAITING-FOR-SAMPLE')
 
       /* THE POINT OF THIS TEST. species and sex are the only order fields dmi-api transforms on the
        * way to the vendor, and they must arrive in the ZOETIS vocabulary. Asserting the exact mapped
@@ -352,6 +364,36 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * provider configuration. */
       expect(received.clientId).toBe(env.zoetis.clientId)
     })
+
+    it('one poll tick in, before any result: the order is acked at WAITING-FOR-SAMPLE and dmi keeps it SUBMITTED', async () => {
+      /* Second half of the two-readings pin, and deliberately BEFORE any result is seeded — this
+       * test must hold with the results channel never having fired at all.
+       *
+       * Waiting on the mock's acknowledgedStatus is what makes the dmi-side assertion below mean
+       * something: an order is only acked after a full orders-poll cycle
+       * (poll -> fetch status+results -> emit external_orders -> ack), so once the ack reads
+       * WAITING-FOR-SAMPLE, the integration has provably run ZoetisMapper.getOrderStatus over this
+       * order and emitted its reading — WAITING_FOR_INPUT — to dmi-api. Without the ack gate,
+       * "still SUBMITTED" would be equally true of a poll that had not run yet. */
+      const received = await pollUntil(
+        async () => await mock.get(`/__control__/orders/${requisitionId}`),
+        (r) => r.body?.acknowledgedStatus === 'WAITING-FOR-SAMPLE',
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+      expect(received.body.acknowledgedStatus).toBe('WAITING-FOR-SAMPLE')
+
+      /* And yet the dmi order does NOT become WAITING_FOR_INPUT. dmi-api's isValidStatusChange
+       * (order-status.helper.ts) switches on the INCOMING external status and has no case for
+       * WAITING_FOR_INPUT, so its default refuses the change and the order keeps the SUBMITTED the
+       * create response gave it. Three behaviours are pinned across this test and the placement
+       * test above: the create-response mapping (default -> SUBMITTED), the poll mapping
+       * (WAITING-FOR-SAMPLE -> WAITING_FOR_INPUT, observable here only through dmi-api refusing
+       * exactly that value), and the refusal itself. If any of the three changes deliberately,
+       * this is the one-line edit that flips. */
+      const order = await org.api.get(`/orders/${orderId}`)
+      expect(order.body.status).toBe('SUBMITTED')
+    }, ORDER_ACK_WAIT_MS + 30_000)
 
     it('seeding a result at the mock closes the loop: the report reaches FINAL, the order COMPLETED', async () => {
       /* Watermark the event stream before seeding, so the /events test below can distinguish events

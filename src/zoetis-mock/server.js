@@ -66,11 +66,18 @@ function log (message) {
 
 /* ---- Zoetis order statuses ----
  *
- * The vocabulary the integration maps (zoetis-responses.helper.ts mapOrderStatus and
- * ZoetisMapper.getOrderStatus): WAITING-FOR-SAMPLE -> WAITING_FOR_INPUT, PARTIAL-RESULTS -> PARTIAL,
- * COMPLETED -> COMPLETED, CANCELLED -> CANCELLED, anything else -> SUBMITTED. An order is SUBMITTED
- * when placed and flips to COMPLETED once a final result is seeded. */
-const STATUS_SUBMITTED = 'SUBMITTED'
+ * Every order is born WAITING-FOR-SAMPLE — verified against the live Zoetis sandbox. The vendor
+ * never emits a SUBMITTED status; that word exists only on the dmi side of the fence. An order
+ * moves to COMPLETED when a final result exists and to PARTIAL-RESULTS when a pending one does
+ * (see handleControlSeedResult).
+ *
+ * How the integration maps this vocabulary, because it maps it TWICE and differently:
+ * ZoetisMapper.getOrderStatus (the orders poll) has an explicit case for every value here —
+ * WAITING-FOR-SAMPLE -> WAITING_FOR_INPUT, PARTIAL-RESULTS -> PARTIAL, COMPLETED -> COMPLETED,
+ * CANCELLED -> CANCELLED — while zoetis-responses.helper.ts mapOrderStatus (the create-order
+ * response) has no WAITING-FOR-SAMPLE case and reports it as dmi SUBMITTED via its default. The
+ * scenario pins both readings. */
+const STATUS_WAITING_FOR_SAMPLE = 'WAITING-FOR-SAMPLE'
 const STATUS_PARTIAL = 'PARTIAL-RESULTS'
 const STATUS_COMPLETED = 'COMPLETED'
 const STATUS_CANCELLED = 'CANCELLED'
@@ -442,7 +449,7 @@ function buildOrderElement (req, order, indent) {
   /* An order that can no longer be edited advertises no `cancel` link — that is what flips
    * ZoetisMapper.getEditable to false, so it tracks the order's real state rather than being
    * constant. */
-  if (order.status === STATUS_SUBMITTED) {
+  if (order.status === STATUS_WAITING_FOR_SAMPLE) {
     links.push({ href: base, method: 'DELETE', rel: 'cancel' })
   }
 
@@ -793,14 +800,17 @@ async function handleCreateOrder (req, res) {
   const order = {
     id: String(nextOrderId++),
     practiceRef,
-    status: STATUS_SUBMITTED,
+    /* Fresh orders are WAITING-FOR-SAMPLE, never anything else — verified against the live Zoetis
+     * sandbox. The practice has ordered; the lab has no sample yet. */
+    status: STATUS_WAITING_FOR_SAMPLE,
     placedAt: now,
     updatedAt: now,
     /* Zoetis's acknowledge model, for the ORDERS channel: the poll hands back orders whose current
      * status the practice has not acknowledged yet, and the integration acks each one by POSTing to
      * the `acknowledged` link href — which carries that status. Tracking the acknowledged status
      * (rather than a bare boolean) is what makes the feed self-quieting AND still report the later
-     * SUBMITTED -> COMPLETED transition, instead of replaying the same order every 30s forever. */
+     * WAITING-FOR-SAMPLE -> COMPLETED transition, instead of replaying the same order every 30s
+     * forever. */
     acknowledgedStatus: null,
     /* Echoed straight back from the request. Everything here was validated above, so none of it is
      * a mock-invented value the scenario could accidentally be asserting against itself. */
