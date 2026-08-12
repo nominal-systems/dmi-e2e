@@ -846,6 +846,10 @@ async function handleCreateOrder (req, res) {
     ['Identification/PracticeID', textAt(document, 'Identification/PracticeID')],
     ['Identification/ClientId', textAt(document, 'Identification/ClientId')],
     ['Identification/PracticeRef', textAt(document, 'Identification/PracticeRef')],
+    /* Required and NOT defaulted: the integration always sends it (getOrder hardcodes
+     * LaboratoryRef '1'), so a mock default of '1' could only ever paper over the integration
+     * silently dropping the element — the exact fallback the validate-don't-default rule forbids. */
+    ['Identification/LaboratoryRef', textAt(document, 'Identification/LaboratoryRef')],
     ['Identification/OwnerName', textAt(document, 'Identification/OwnerName')],
     ['Identification/VetName', textAt(document, 'Identification/VetName')],
     ['AnimalDetails/AnimalName', textAt(document, 'AnimalDetails/AnimalName')],
@@ -934,7 +938,7 @@ async function handleCreateOrder (req, res) {
     reportType: textAt(document, 'Identification/ReportType'),
     practiceId: textAt(document, 'Identification/PracticeID'),
     clientId: textAt(document, 'Identification/ClientId'),
-    laboratoryRef: textAt(document, 'Identification/LaboratoryRef') || '1',
+    laboratoryRef: textAt(document, 'Identification/LaboratoryRef'),
     ownerName: textAt(document, 'Identification/OwnerName'),
     ownerId: textAt(identification, 'OwnerID') || null,
     vetName: textAt(document, 'Identification/VetName'),

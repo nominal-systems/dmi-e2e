@@ -108,6 +108,11 @@ const EXPECTED_ZOETIS_GENDER = 'MALE_NEUTERED'
  * Deliberately not a dmi breed ref code: that would resolve to NULL and strip the breed entirely. */
 const BREED = 'Labrador Retriever'
 
+/* Like breed, birthdate is plain forwarding — no ref mapping, no transformation: getAnimalDetails
+ * copies patient.birthdate into <DateOfBirth> verbatim. It had simply never been sent by any test,
+ * so the element (and its pass-through) was uncovered. */
+const BIRTHDATE = '2020-01-15'
+
 interface RefItem { code: string, name: string }
 
 /* Resolve a canonical dmi ref code by its human-readable name. Throws loudly rather than returning
@@ -283,7 +288,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * autoSubmitOrder is not passed: it drives idexx's confirmOrder handshake, and zoetis placement
        * is a single POST with no equivalent. */
       const payload = orderPayload(org.integrationId, {
-        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED, birthdate: BIRTHDATE },
         /* testCodes is required (orderPayload does not default it — a shared default is wrong for
          * every provider but the one it was written for). Pass a real Zoetis code read from the
          * mock's catalogue; the mock enforces that catalogue and rejects anything outside it. */
@@ -325,10 +330,14 @@ describe('zoetis full-stack (Zoetis mock)', () => {
         species: string
         gender: string
         breed: string
+        dateOfBirth: string
         animalName: string
         ownerName: string
         vetName: string
         clientId: string
+        reportType: string
+        practiceId: string
+        laboratoryRef: string
         testCodes: string[]
       }>(
         await mock.get(`/__control__/orders/${requisitionId}`),
@@ -349,8 +358,19 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * proves the vendor refuses it, this one proves what was actually sent.) */
       expect(received.species).toBe(EXPECTED_ZOETIS_SPECIES)
       expect(received.gender).toBe(EXPECTED_ZOETIS_GENDER)
-      /* Breed is not ref-mapped for zoetis (see the BREED note above): it must arrive verbatim. */
+      /* Breed is not ref-mapped for zoetis (see the BREED note above): it must arrive verbatim.
+       * Same for birthdate — plain forwarding into <DateOfBirth>, never sent by any test before. */
       expect(received.breed).toBe(BREED)
+      expect(received.dateOfBirth).toBe(BIRTHDATE)
+
+      /* Hardcoded by the integration's getOrder helper (zoetis-order.helper.ts) rather than taken
+       * from the payload: ReportType 'Request', PracticeID 'Practice1', LaboratoryRef '1'. Pinned as
+       * exact values because a presence check is equally true of any regression that still emits
+       * SOMETHING — and the mock now requires LaboratoryRef and stores it verbatim (its old silent
+       * `|| '1'` default could only ever have papered over the element going missing). */
+      expect(received.reportType).toBe('Request')
+      expect(received.practiceId).toBe('Practice1')
+      expect(received.laboratoryRef).toBe('1')
 
       /* The rest of what the integration forwarded. The mock REJECTS an order missing any of these
        * rather than substituting a default, so a regression that dropped one fails at placement — it
