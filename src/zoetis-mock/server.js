@@ -751,11 +751,15 @@ async function handleCreateOrder (req, res) {
     return
   }
 
-  /* Validate rather than default. This is the difference between a mock that tests the integration
-   * and one that flatters it: every field below is one the real vendor needs and the scenario later
-   * asserts on, so substituting a fallback here would make the mock AGREE with an integration that
-   * had stopped sending it — the order-forwarding assertions would then pass against the mock's own
-   * invented values and could never fail.
+  /* Validate rather than default — but validate what the VENDOR requires, not everything the
+   * harness happens to send. Every field below is one the real vendor refuses an order without, and
+   * the scenario later asserts on, so substituting a fallback here would make the mock AGREE with an
+   * integration that had stopped sending it — the order-forwarding assertions would then pass
+   * against the mock's own invented values and could never fail. The converse discipline is why
+   * AnimalDetails/Breed is NOT in the list: an order without a Breed element is accepted (verified
+   * against the live Zoetis sandbox), so requiring it would gold-plate the contract and reject
+   * orders the real vendor takes. It is still echoed verbatim when present, and the scenario still
+   * pins that forwarding.
    *
    * The species/gender checks matter most of all, and for a reason specific to this loop: those two
    * are the only order fields that go through a real dmi-api ref-mapping transformation on the way
@@ -774,7 +778,6 @@ async function handleCreateOrder (req, res) {
     ['Identification/VetName', textAt(document, 'Identification/VetName')],
     ['AnimalDetails/AnimalName', textAt(document, 'AnimalDetails/AnimalName')],
     ['AnimalDetails/Species', textAt(document, 'AnimalDetails/Species')],
-    ['AnimalDetails/Breed', textAt(document, 'AnimalDetails/Breed')],
     ['AnimalDetails/Gender', textAt(document, 'AnimalDetails/Gender')],
   ]
   const missing = required.filter(([, value]) => value === '')
@@ -870,7 +873,9 @@ async function handleCreateOrder (req, res) {
      * values dmi-api's mapping produced. */
     species,
     gender,
-    breed: textAt(document, 'AnimalDetails/Breed'),
+    /* Optional at the vendor (see the required-list note): stored verbatim when present, null when
+     * the order carried no Breed element. */
+    breed: textAt(animal, 'Breed') || null,
     dateOfBirth: textAt(animal, 'DateOfBirth') || null,
     testCodes,
     /* Set by POST /__control__/orders/:practiceRef/results. Until then the order has no result and
