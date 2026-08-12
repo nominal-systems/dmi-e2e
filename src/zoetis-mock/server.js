@@ -139,6 +139,23 @@ function sendJson (res, status, body) {
   res.end(payload)
 }
 
+/* A status-only response with an EMPTY body — what the vendor's acknowledge endpoints answer
+ * (verified against the live Zoetis sandbox). The integration treats any 2xx as success and
+ * discards acknowledge response bodies (makePostRequest returns data both ack call sites ignore),
+ * so nothing downstream reads what is deliberately not there. */
+function sendEmpty (res, status) {
+  res.writeHead(status)
+  res.end()
+}
+
+/* The vendor's error dialect: an <error> root whose <message> carries the failure context as an
+ * ATTRIBUTE and the human-readable reason as element text, served as application/xml. Verified
+ * against the live Zoetis sandbox for a duplicate-acknowledge 409 and a 404. One builder for every
+ * error the mock serves, so no two handlers can drift onto different shapes. */
+function vendorErrorXml (context, message) {
+  return `<error><message context="${escapeXml(context)}">${escapeXml(message)}</message></error>`
+}
+
 /* Vendor ERRORS go back as JSON even though every success is XML, and that asymmetry is deliberate
  * rather than sloppy. The integration's providerErrorMapper reads `error.response.data.error
  * .context` and `.error.message` — an object, which axios only ever produces from a JSON body. An
@@ -978,7 +995,9 @@ async function handleBatchAcknowledge (req, res) {
   log(`acknowledged results: ${ids.join(', ') || '(none)'}`)
   if (unknown.length > 0) log(`WARNING: acknowledged unknown/result-less client_order_id(s): ${unknown.join(', ')}`)
 
-  sendXml(res, 200, '<?xml version="1.0" encoding="utf-8"?>\n<acknowledged/>')
+  /* HTTP 201 with an empty body — verified against the live Zoetis sandbox. The previous
+   * `200 + <acknowledged/>` was invented. */
+  sendEmpty(res, 201)
 }
 
 /* Per-order acknowledge, the ORDERS channel. This is the endpoint the order-status document's
@@ -992,9 +1011,27 @@ function handleOrderAcknowledge (req, res, params) {
     sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
+  /* Re-acknowledging a status that is already acknowledged is a 409 at the real vendor, in its XML
+   * error dialect — context and message shape observed live (an OrderAlreadyAcknowledgedException
+   * naming the client_order_id, context "POLL LIST"). The integration cannot reach this branch from
+   * the harness today: the orders feed only re-lists an order once its status has CHANGED since the
+   * last acknowledgement, so the normal flow never double-acks (and acknowledgeOrders carries a
+   * TODO for 409 support). The branch exists so the mock refuses a duplicate the way the vendor
+   * would, instead of silently absorbing one. */
+  if (order.acknowledgedStatus === params.status) {
+    log(`refused duplicate acknowledge of order ${order.practiceRef} at status ${params.status}`)
+    sendXml(
+      res,
+      409,
+      vendorErrorXml('POLL LIST', `OrderAlreadyAcknowledgedException - Order ${order.practiceRef} already acknowledged`),
+    )
+    return
+  }
   order.acknowledgedStatus = params.status
   log(`acknowledged order ${order.practiceRef} at status ${params.status}`)
-  sendXml(res, 200, '<?xml version="1.0" encoding="utf-8"?>\n<acknowledged/>')
+  /* HTTP 204 with an empty body — verified against the live Zoetis sandbox. The previous
+   * `200 + <acknowledged/>` was invented. */
+  sendEmpty(res, 204)
 }
 
 function handleCancelOrder (req, res, params) {
