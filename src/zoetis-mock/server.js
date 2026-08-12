@@ -427,6 +427,11 @@ const DEVICES = [
  *   - GLU: numeric `Result` + units + both range bounds + Notes 'H' -> valueQuantity, a bounded
  *          referenceRange, and specifically a HIGH interpretation.
  *   - CRE: numeric `Result`, in range, no flag -> valueQuantity + referenceRange, no interpretation.
+ *   - CA:  numeric `Result` BELOW a LowRange-only bound + Notes 'L' -> valueQuantity, the
+ *          single-bound reference range (getReferenceRange's `>${low}` text form, low set, no
+ *          high), and specifically a LOW interpretation. The only analyte covering
+ *          getInterpretation's LOW case and getReferenceRange's one-bound branch — GLU covers the
+ *          HIGH/two-bound mirror.
  *   - ALT: `resultText` and NO `Result`, text that is not numeric -> getValueX's valueString branch.
  *          It carries units because that branch APPENDS them ("<text> <units>"), which nothing else
  *          covers; it carries no range because getReferenceRange requires a numeric Result.
@@ -465,6 +470,15 @@ function defaultAnalytes () {
       units: 'mg/dL',
       lowRange: '0.5',
       highRange: '1.8',
+    },
+    {
+      code: 'CA',
+      name: 'Calcium',
+      result: '7.9',
+      units: 'mg/dL',
+      /* LowRange only, on purpose — the single-bound branch. 'L' is NormalizedFlag.LOW. */
+      lowRange: '8.6',
+      notes: 'L',
     },
     {
       code: 'ALT',

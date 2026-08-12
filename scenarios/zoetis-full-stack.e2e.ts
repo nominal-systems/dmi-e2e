@@ -68,12 +68,13 @@ const COMPLETION_WAIT_MS = 120_000
  * up to a full interval behind completion itself. */
 const ORDER_ACK_WAIT_MS = 90_000
 
-/* The analytes the mock reports on. Genuine Zoetis analyte codes; the values, units and ranges
- * attached to them are invented. The last two exist only to be FILTERED OUT — the mapper drops any
- * code ending `_IMG64` or `_HIST_DATA` — so the report must contain the first four and neither of
- * the last two. */
+/* The analytes the mock reports on. Genuine Zoetis analyte codes (CA is a CDP-panel mnemonic); the
+ * values, units and ranges attached to them are invented. The last two exist only to be FILTERED
+ * OUT — the mapper drops any code ending `_IMG64` or `_HIST_DATA` — so the report must contain the
+ * first five and neither of the last two. */
 const GLUCOSE = 'GLU'
 const CREATININE = 'CRE'
+const CALCIUM = 'CA'
 const ALT = 'ALT'
 const ALBUMIN = 'ALB'
 const HISTOGRAM_IMAGE = 'GLU_HIST_IMG64'
@@ -520,12 +521,12 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        *
        * The EXACT set is asserted, and that does double duty. It catches a mapper regression that
        * silently dropped an analyte, and it pins the mapper's image/histogram FILTER: the mock seeds
-       * six items, two of them with the `_IMG64` and `_HIST_DATA` suffixes the mapper discards, so a
+       * seven items, two of them with the `_IMG64` and `_HIST_DATA` suffixes the mapper discards, so a
        * filter that stopped working shows up here as two extra observations rather than as nothing at
        * all. */
       const observations = report.testResultsSet.flatMap((testResult) => testResult.observations ?? [])
       expect(observations.map((observation) => observation.code).sort()).toEqual(
-        [GLUCOSE, CREATININE, ALT, ALBUMIN].sort(),
+        [GLUCOSE, CREATININE, CALCIUM, ALT, ALBUMIN].sort(),
       )
       expect(observations.map((observation) => observation.code)).not.toContain(HISTOGRAM_IMAGE)
       expect(observations.map((observation) => observation.code)).not.toContain(HISTOGRAM_DATA)
@@ -556,6 +557,22 @@ describe('zoetis full-stack (Zoetis mock)', () => {
         expect.objectContaining({ low: 0.5, high: 1.8, text: '0.5-1.8' }),
       ])
       expect(creatinine?.interpretation ?? null).toBeNull()
+
+      /* Calcium was seeded numeric, BELOW a LowRange-only bound, flagged 'L': the two mapper
+       * branches nothing else runs. getInterpretation's LOW case must emit specifically 'L' (the
+       * wire value of TestResultItemInterpretationCode.LOW — 'H' is HIGH, so this pin distinguishes
+       * an inverted flag from a missing one). getReferenceRange's single-bound branch must emit the
+       * mapper's own `>8.6` text form with `low` set and NO `high` — normalised to null before
+       * asserting, since an absent bound may serialise either as null or as a missing key. */
+      const calcium = observations.find((observation) => observation.code === CALCIUM)
+      expect(calcium?.name).toBe('Calcium')
+      expect(calcium?.valueQuantity?.value).toBe(7.9)
+      expect(calcium?.valueQuantity?.units).toBe('mg/dL')
+      expect(calcium?.referenceRange).toEqual([
+        expect.objectContaining({ low: 8.6, text: '>8.6' }),
+      ])
+      expect(calcium?.referenceRange?.[0]?.high ?? null).toBeNull()
+      expect(calcium?.interpretation).toMatchObject({ code: 'L' })
 
       /* ALT was seeded as non-numeric TEXT, which takes getValueX's second branch: a valueString with
        * the units APPENDED to it, and no quantity. Asserting the concatenated form is the only thing
@@ -813,12 +830,12 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       /* The substance: the result was delivered TWICE and the report must still hold one copy of
        * each observation. Content, not event cardinality — how many `report:updated` events fired is
        * an implementation detail of the retry and pinning it would make this test fragile for no
-       * gain. The mock's default seed is six analytes, two of which the mapper filters out. */
+       * gain. The mock's default seed is seven analytes, two of which the mapper filters out. */
       const observations = await observationsFor(retryOrderId)
       expect(observations.map((observation) => observation.code).sort()).toEqual(
-        [GLUCOSE, CREATININE, ALT, ALBUMIN].sort(),
+        [GLUCOSE, CREATININE, CALCIUM, ALT, ALBUMIN].sort(),
       )
-      expect(observations).toHaveLength(4)
+      expect(observations).toHaveLength(5)
       expect(observations.find((o) => o.code === GLUCOSE)?.valueQuantity?.value).toBe(150)
     }, COMPLETION_WAIT_MS * 2 + 30_000)
   })
