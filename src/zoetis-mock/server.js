@@ -156,20 +156,37 @@ function vendorErrorXml (context, message) {
   return `<error><message context="${escapeXml(context)}">${escapeXml(message)}</message></error>`
 }
 
-/* Vendor ERRORS go back as JSON even though every success is XML, and that asymmetry is deliberate
- * rather than sloppy. The integration's providerErrorMapper reads `error.response.data.error
- * .context` and `.error.message` — an object, which axios only ever produces from a JSON body. An
- * XML error body would leave `data` a string, `data.error` undefined, and the mapper would fall
- * through to its generic "A request to <path> failed with <status> status code." branch — so a
- * rejection test would go red without ever exercising the mapper's real path. Matching the shape the
- * mapper actually reads is what makes the rejection assertions worth anything.
+/* Vendor ERRORS are XML like every success — the vendorErrorXml dialect above, served as
+ * application/xml. Verified against the live Zoetis sandbox for a duplicate-acknowledge 409 and a
+ * 404; a validation 400's exact body was not separately captured, so the mock's rejections
+ * extrapolate the same form.
  *
- * `context` is the offending field (surfaced by the mapper as "<context> error in zoetis: ..."),
- * `message` the human-readable reason. Field paths use the request document's own element path
- * (`AnimalDetails/Species`), which is the only naming the integration and this mock can agree on. */
+ * What this dialect means for the integration's error surface, mechanically: providerErrorMapper
+ * reads `error.response.data.error.context` / `.message`, properties that only exist when axios
+ * parsed a JSON body into an object. An XML error body keeps `error.response.data` a string, so the
+ * mapper's structured branch never runs and every vendor error surfaces through its generic
+ * "A request to <path> failed with <status> status code." branch — which the rejection scenario
+ * pins as the vendor-real surface. (An earlier revision of this mock answered errors in JSON
+ * precisely to reach the structured branch; that exercised more mapper code at the price of a wire
+ * shape the vendor never produces.)
+ *
+ * `context` names the offending field where one exists, using the request document's own element
+ * path (`AnimalDetails/Species`) — the only naming the integration and this mock can agree on. */
 function sendVendorError (res, status, context, message) {
   log(`rejected: ${context} — ${message}`)
-  sendJson(res, status, { error: { context, message } })
+  sendXml(res, status, vendorErrorXml(context, message))
+}
+
+/* Short-circuit an injected failure scenario. The default body is the vendor's XML error dialect —
+ * an injected 500 must look like a real vendor 500, or the retry paths it exists to exercise would
+ * be retrying against a fiction. A custom `body` is a control-plane escape hatch and goes out as
+ * JSON, exactly as given. */
+function sendScenario (res, scenario, context, message) {
+  if (scenario.body != null) {
+    sendJson(res, scenario.status, scenario.body)
+    return
+  }
+  sendVendorError(res, scenario.status, context, message)
 }
 
 function readRaw (req) {
@@ -740,7 +757,7 @@ async function handleCreateOrder (req, res) {
 
   const scenario = takeScenario('createOrder')
   if (scenario != null) {
-    sendJson(res, scenario.status, scenario.body ?? { error: { context: 'order', message: 'order placement failed' } })
+    sendScenario(res, scenario, 'order', 'order placement failed')
     return
   }
 
@@ -899,7 +916,7 @@ function handleBatchOrders (req, res) {
 
   const scenario = takeScenario('batchOrders')
   if (scenario != null) {
-    sendJson(res, scenario.status, scenario.body ?? { error: { context: 'orders', message: 'orders poll failed' } })
+    sendScenario(res, scenario, 'orders', 'orders poll failed')
     return
   }
 
@@ -913,7 +930,7 @@ function handleOrderStatus (req, res, params) {
 
   const scenario = takeScenario('orderStatus')
   if (scenario != null) {
-    sendJson(res, scenario.status, scenario.body ?? { error: { context: 'order', message: 'order status failed' } })
+    sendScenario(res, scenario, 'order', 'order status failed')
     return
   }
 
@@ -949,7 +966,7 @@ function handleBatchResults (req, res) {
 
   const scenario = takeScenario('batchResults')
   if (scenario != null) {
-    sendJson(res, scenario.status, scenario.body ?? { error: { context: 'results', message: 'results poll failed' } })
+    sendScenario(res, scenario, 'results', 'results poll failed')
     return
   }
 
@@ -976,11 +993,7 @@ async function handleBatchAcknowledge (req, res) {
    * unreachable from the harness. Honours `once: true`, so a test can stage exactly one miss. */
   const scenario = takeScenario('batchAcknowledge')
   if (scenario != null) {
-    sendJson(
-      res,
-      scenario.status,
-      scenario.body ?? { error: { context: 'orders', message: 'batch acknowledge failed' } },
-    )
+    sendScenario(res, scenario, 'orders', 'batch acknowledge failed')
     return
   }
 

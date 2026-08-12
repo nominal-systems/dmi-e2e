@@ -606,19 +606,22 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       )
     })
 
-    it('a rejected order surfaces the vendor field error, not a generic fallback', async () => {
+    it('a rejected order surfaces as an error — through the generic message, because vendor errors are XML', async () => {
       /* Exercises the integration's error path, which the happy path never touches. The mock rejects
-       * a code outside its catalogue with a 400 whose body is `{ error: { context, message } }` — the
-       * exact shape zoetis's providerErrorMapper reads — and dmi-api re-throws the engine error out
-       * of createOrder, so POST /orders answers non-2xx with the field name in the body. A separate
-       * order (unique requisitionId) that never reaches COMPLETED — it lands ERROR in dmi-api — so it
-       * does not perturb the loop asserted above.
+       * a code outside its catalogue with a 400 in the vendor's XML error dialect —
+       * `<error><message context="...">...</message></error>` — and dmi-api re-throws the engine
+       * error out of createOrder, so POST /orders answers non-2xx. A separate order (unique
+       * requisitionId) that never reaches COMPLETED — it lands ERROR in dmi-api — so it does not
+       * perturb the loop asserted above.
        *
-       * The mock answers errors as JSON while every success is XML, and that asymmetry is what makes
-       * this test prove something: providerErrorMapper reads `error.response.data.error.context`,
-       * which axios only ever produces from a JSON body. An XML error body would leave `data` a
-       * string and the mapper would fall through to its generic branch — the rejection would still be
-       * red, but the mapper's real path would never run. */
+       * What surfaces is the GENERIC mapper message, and pinning it exactly is deliberate:
+       * providerErrorMapper's structured branch reads `error.response.data.error.*`, properties
+       * axios only produces from a JSON body. With the vendor's real XML dialect `data` stays a
+       * string, the structured branch is unreachable, and the mapper falls through to
+       * "A request to <path> failed with <status> status code." — so the field-name assertion this
+       * test used to make is gone on purpose; the generic surface IS the vendor-real behaviour. If
+       * the integration ever learns to parse XML error envelopes, this pin goes red and gets
+       * deliberately re-pointed at the structured surface. */
       const payload = orderPayload(org.integrationId, {
         patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
         testCodes: [{ code: 'NOT-A-REAL-ZOETIS-CODE' }],
@@ -630,13 +633,10 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       )
 
       expect(response.ok).toBe(false)
-      /* The field branch names the field: providerErrorMapper emits "<context> error in zoetis: …"
-       * (surfaced in dmi-api's `errors[]`) ONLY when it can read the mock's `error.context`. Its
-       * generic fallback — "A request to … failed with <status> status code." — is what appears when
-       * the envelope is unreadable, so asserting that did NOT fire is what proves the mock reaches
-       * the real branch. */
-      expect(response.text).toMatch(/LabRequests\/LabRequest\/TestCode error in zoetis/)
-      expect(response.text).not.toMatch(/failed with \d+ status code/)
+      /* Exact, not fuzzy: the path proves WHICH request failed and the status proves HOW — a 409
+       * (duplicate PracticeRef) or a 500 surfacing here instead would be a different defect and must
+       * not satisfy this pin. */
+      expect(response.text).toContain('A request to /vetsync/v1/orders failed with 400 status code.')
     }, 30_000)
   })
 
