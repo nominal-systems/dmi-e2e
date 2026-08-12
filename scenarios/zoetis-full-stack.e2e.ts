@@ -1087,4 +1087,61 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(laterUpdates.length).toBeGreaterThanOrEqual(1)
     }, ORDER_ACK_WAIT_MS * 2 + 30_000)
   })
+
+  describe('placement edges: the VOY- fallback id and the duplicate-PracticeRef refusal', () => {
+    /* Two placement paths the headline flow never takes. Both orders here are placement-only — never
+     * seeded, never completed — so they stay out of every other block's assertions. */
+    let voyRequisitionId: string
+
+    it('an order placed WITHOUT a requisitionId gets the integration\'s VOY- fallback, end to end', async () => {
+      /* `requisitionId: undefined` — JSON.stringify drops undefined-valued keys, so the wire body
+       * truly omits it; asserted below rather than assumed, because a requisitionId that merely
+       * looked empty would exercise a different branch. dmi-api's CreateOrderDto declares the field
+       * optional and passes the payload through; the integration then mints its own practice
+       * reference — createRequisitionId() in zoetis.service.ts returns `VOY-${Date.now()}` — and
+       * getOrderFromZoetisOrderResponse hands it back as BOTH requisitionId and externalId, exactly
+       * as with a caller-supplied id. */
+      const payload = orderPayload(org.integrationId, {
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
+        testCodes: [{ code: serviceCode }],
+        requisitionId: undefined,
+      })
+      expect(JSON.parse(JSON.stringify(payload))).not.toHaveProperty('requisitionId')
+
+      const created = expectOk<{ id: string, externalId: string, requisitionId: string }>(
+        await org.api.post('/orders', payload),
+        'place a zoetis order without a requisitionId',
+      )
+
+      expect(created.externalId).toMatch(/^VOY-\d+$/)
+      expect(created.requisitionId).toBe(created.externalId)
+
+      /* And the mock is keyed by exactly that value — the fallback id really was the PracticeRef on
+       * the wire, not a dmi-side afterthought. */
+      const received = expectOk<{ practiceRef: string }>(
+        await mock.get(`/__control__/orders/${encodeURIComponent(created.externalId)}`),
+        'read the VOY order from the mock control plane',
+      )
+      expect(received.practiceRef).toBe(created.externalId)
+      voyRequisitionId = created.externalId
+    }, 60_000)
+
+    it('re-placing an order under an existing PracticeRef is refused end to end (vendor 409)', async () => {
+      /* The mock refuses a duplicate PracticeRef with a 409 rather than silently overwriting an
+       * order that may already have results — dmi-api itself has no unique constraint on
+       * requisitionId (the orders index is non-unique), so the refusal genuinely comes from the
+       * vendor side. The surface is the same generic mapper message as the rejection test above
+       * (XML error bodies never reach providerErrorMapper's structured branch); the 409 in the text
+       * is what distinguishes this refusal from a validation 400. */
+      const payload = orderPayload(org.integrationId, {
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
+        testCodes: [{ code: serviceCode }],
+        requisitionId: voyRequisitionId,
+      })
+
+      const response = await org.api.post('/orders', payload)
+      expect(response.ok).toBe(false)
+      expect(response.text).toContain('A request to /vetsync/v1/orders failed with 409 status code.')
+    }, 30_000)
+  })
 })
