@@ -932,4 +932,142 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(feeds.maxOrdersInOneFeed).toBeGreaterThanOrEqual(2)
     }, ORDER_ACK_WAIT_MS * 2 + 30_000)
   })
+
+  describe('cancel paths: one test off an order, then the order itself', () => {
+    /* Both DELETE routes dmi-api exposes, end to end — never driven by any test before this block.
+     * dmi-api's DELETE /orders/:id/tests/:testCode RPCs `tests.cancel`, and the integration's
+     * cancelOrderTest turns it into `DELETE {base}/vetsync/v1/orders/{id}/{code}` — the test code a
+     * bare second path segment, with NO /tests/ on the wire (that segment exists only on dmi-api's
+     * public route). DELETE /orders/:id RPCs `cancel` and lands as `DELETE .../orders/{id}`. A
+     * dedicated order, isolated from every other block's assertions: it is never seeded and never
+     * completes. */
+    let cancelOrderId: string
+    let cancelRequisitionId: string
+    /* Highest event seq at the moment the dmi-side cancel completed, so the propagation test below
+     * can prove the ORDERS channel produced a further order:updated AFTER it — see there. */
+    let seqAfterCancel = 0
+
+    /* CDP + T4: the first two-element <LabRequests> any run has produced. T4 is a genuine catalogue
+     * mnemonic the mock enforces; resolved from the mock's own catalogue so the two cannot drift. */
+    let secondCode: string
+
+    it('an order placed with TWO catalogue codes forwards both', async () => {
+      const catalogue = expectOk<{ services: Array<{ code: string }> }>(
+        await mock.get('/__control__/services'),
+        'read the mock service catalogue',
+      )
+      const t4 = catalogue.services.find((service) => service.code === 'T4')
+      expect(t4).toBeDefined()
+      secondCode = t4?.code as string
+
+      const payload = orderPayload(org.integrationId, {
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: BREED },
+        testCodes: [{ code: serviceCode }, { code: secondCode }],
+      })
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload),
+        'place a two-test zoetis order',
+      )
+      cancelOrderId = created.id
+      cancelRequisitionId = payload.requisitionId as string
+
+      /* Sorted: the mock stores document order, which follows the payload today, but WHICH tests
+       * arrived is the contract here — their ordering is not. */
+      const received = expectOk<{ testCodes: string[] }>(
+        await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        'read the two-test order from the mock control plane',
+      )
+      expect([...received.testCodes].sort()).toEqual([serviceCode, secondCode].sort())
+    }, 60_000)
+
+    it('cancelling one test removes exactly that code at the vendor and keeps the other', async () => {
+      const response = await org.api.delete(`/orders/${cancelOrderId}/tests/${secondCode}`)
+      expect(response.ok).toBe(true)
+
+      /* The exact remaining set, not a count: a cancel that removed the WRONG test would leave the
+       * same count behind. */
+      const received = expectOk<{ testCodes: string[] }>(
+        await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        'read the order from the mock control plane after test cancel',
+      )
+      expect(received.testCodes).toEqual([serviceCode])
+    }, 30_000)
+
+    /* DEFECT tripwire, on the tenant-isolation.e2e.ts pattern: this asserts the CORRECT expectation
+     * and is marked `failing` while dmi-api behaves otherwise — it passes CI as long as the defect
+     * exists and goes red the moment someone fixes it, forcing the marker off. Mechanically:
+     * dmi-api's cancelOrderTests (orders.service.ts) re-saves the order with
+     * `tests: [...order.tests, ...tests]` — the cancelled test is appended to the local list, never
+     * removed — so the list still carries the cancelled code even though the vendor-side
+     * cancellation (previous test) really happened. */
+    it.failing('the dmi order\'s local test list shrinks to the remaining code', async () => {
+      const order = await org.api.get(`/orders/${cancelOrderId}`)
+
+      expect(order.status).toBe(200)
+      expect((order.body.tests as Array<{ code: string }>).map((test) => test.code)).toEqual([serviceCode])
+    })
+
+    it('cancelling the order flips the vendor to CANCELLED and strips its cancel link', async () => {
+      const response = await org.api.delete(`/orders/${cancelOrderId}`)
+      expect(response.status).toBe(204)
+
+      /* Watermark AFTER the DELETE returned: cancelOrder emits its own order:updated synchronously
+       * before responding, so every event above this seq is someone else's doing — which is what
+       * lets the next test attribute a later event to the orders channel. (A poll tick could in
+       * principle fire in the gap between the DELETE and this read; the window is milliseconds
+       * against a 30s cadence.) */
+      const events = expectOk<{ data: Array<{ seq: number }> }>(
+        await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+        'read events after cancelling',
+      )
+      seqAfterCancel = events.data.reduce((max, event) => Math.max(max, event.seq ?? 0), 0)
+      expect(seqAfterCancel).toBeGreaterThan(0)
+
+      /* dmi-api's cancelOrder sets the local order CANCELLED synchronously after the engine RPC
+       * succeeds (orders.service.ts) — no poll tick involved yet. */
+      const order = await org.api.get(`/orders/${cancelOrderId}`)
+      expect(order.body.status).toBe('CANCELLED')
+
+      /* Vendor side: status flipped, and the state-dependent link set (see linkRelsFor in the mock)
+       * no longer advertises `cancel` — the editable flag's wire form tracks the state machine. */
+      const received = expectOk<{ status: string, linkRels: string[] }>(
+        await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        'read the cancelled order from the mock control plane',
+      )
+      expect(received.status).toBe('CANCELLED')
+      expect(received.linkRels).toContain('acknowledged')
+      expect(received.linkRels).not.toContain('cancel')
+    }, 30_000)
+
+    it('the orders channel reports the cancellation: acked at CANCELLED, and dmi-api accepts the update', async () => {
+      /* The CANCELLED branch of ZoetisMapper.getOrderStatus has never run before this test. The ack
+       * gate proves the poll served and processed the CANCELLED order (poll -> fetch -> emit -> ack,
+       * the same argument as the WAITING-FOR-SAMPLE test above)... */
+      const received = await pollUntil(
+        async () => await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        (r) => r.body?.acknowledgedStatus === 'CANCELLED',
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+      expect(received.body.acknowledgedStatus).toBe('CANCELLED')
+
+      /* ...and the event proves dmi-api ACCEPTED what was emitted, which the WAITING_FOR_INPUT case
+       * cannot show (its change is refused). isValidStatusChange returns true unconditionally for an
+       * incoming CANCELLED, so handleExternalOrders saves the order and emits order:updated — an
+       * event later than the post-DELETE watermark, for this order, that only the orders channel can
+       * have produced (the results channel never runs here: nothing was ever seeded). If the
+       * CANCELLED mapping broke, the emitted status would fall to SUBMITTED, the guard would refuse
+       * it, no save and no event would happen — and this wait would time out red. */
+      const events = await pollUntil(
+        async () => await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+        (r) => ((r.body?.data ?? []) as Array<{ seq: number, type: string, data?: { orderId?: string } }>)
+          .some((event) => event.type === 'order:updated' && event.data?.orderId === cancelOrderId && event.seq > seqAfterCancel),
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+      const laterUpdates = ((events.body?.data ?? []) as Array<{ seq: number, type: string, data?: { orderId?: string } }>)
+        .filter((event) => event.type === 'order:updated' && event.data?.orderId === cancelOrderId && event.seq > seqAfterCancel)
+      expect(laterUpdates.length).toBeGreaterThanOrEqual(1)
+    }, ORDER_ACK_WAIT_MS * 2 + 30_000)
+  })
 })

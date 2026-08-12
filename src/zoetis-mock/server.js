@@ -1063,7 +1063,43 @@ function handleCancelOrder (req, res, params) {
   order.status = STATUS_CANCELLED
   order.updatedAt = new Date()
   log(`cancelled order ${order.practiceRef}`)
-  sendXml(res, 200, buildOrderStatusXml(req, order))
+  /* The cancel RESPONSE shape was not captured live; a status-only 204 is the minimal
+   * extrapolation, and the integration discards cancel response bodies anyway (makeDeleteRequest
+   * returns nothing to its callers). What IS contract here is the state change: the order flips to
+   * CANCELLED, the orders feed re-lists it (status != acknowledgedStatus), and its link set loses
+   * `cancel` (see linkRelsFor). */
+  sendEmpty(res, 204)
+}
+
+/* Test-level cancel: DELETE /vetsync/v1/orders/:practiceRef/:testCode. NOTE the wire shape — the
+ * test code is a bare second path segment, with NO /tests/ between; that segment exists only on
+ * dmi-api's public route (DELETE /orders/:id/tests/:testCode). cancelOrderTest in zoetis.service.ts
+ * builds exactly `${baseUrl}/vetsync/v1/orders/${id}/${tests.pop().code}` — one test per call. */
+function handleCancelOrderTest (req, res, params) {
+  if (requireBasicAuth(req, res) == null) return
+
+  const order = state.orders.get(params.practiceRef)
+  if (order == null) {
+    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    return
+  }
+  /* Validate rather than absorb: cancelling a test the order never requested is an error at a real
+   * lab, not a no-op. (The status and body shape for this case were not captured live; the 404 and
+   * the field-path context extrapolate the vendor's error dialect.) */
+  if (!order.testCodes.includes(params.testCode)) {
+    sendVendorError(
+      res,
+      404,
+      'LabRequests/LabRequest/TestCode',
+      `order '${order.practiceRef}' has no test '${params.testCode}'`,
+    )
+    return
+  }
+  order.testCodes = order.testCodes.filter((code) => code !== params.testCode)
+  order.updatedAt = new Date()
+  log(`cancelled test ${params.testCode} on order ${order.practiceRef} (remaining: ${order.testCodes.join(',') || '(none)'})`)
+  /* Response shape extrapolated like the order-level cancel above; the integration discards it. */
+  sendEmpty(res, 204)
 }
 
 /* ---- control plane (/__control__) ---- */
@@ -1223,6 +1259,8 @@ const routes = [
   ['GET', new RegExp(`^${API}/orders/(?<practiceRef>[^/]+)/results$`), handleOrderResults],
   ['POST', new RegExp(`^${API}/orders/(?<practiceRef>[^/]+)/acknowledged/(?<status>[^/]+)$`), handleOrderAcknowledge],
   ['DELETE', new RegExp(`^${API}/orders/(?<practiceRef>[^/]+)$`), handleCancelOrder],
+  /* Test-level cancel — the test code is a bare second segment (no /tests/), see the handler. */
+  ['DELETE', new RegExp(`^${API}/orders/(?<practiceRef>[^/]+)/(?<testCode>[^/]+)$`), handleCancelOrderTest],
 
   /* Reference data. The harness never triggers a ref sync, but the integration exposes all of these
    * and a mock that 404s on them would be a trap for the next scenario. `services` is the same
