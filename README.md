@@ -79,6 +79,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   Redis + the **Antech mock** (`src/antech-mock`, built from this repo) + the **real
   `dmi-engine-antech-integration`** container, behind the `antech` compose profile. Runs
   `scenarios/antech-full-stack.e2e.ts`.
+- **`zoetis`** — the Phase 1 loop for **Zoetis VetSync v1** (provider id `zoetis`). dmi-api +
+  ActiveMQ + Redis + the **Zoetis mock** (`src/zoetis-mock`, built from this repo) + the **real
+  `dmi-engine-zoetis-integration`** container, behind the `zoetis` compose profile. Runs
+  `scenarios/zoetis-full-stack.e2e.ts`.
 - **`demo`** — the pre-existing demo loop (ActiveMQ, Redis, `dmi-demo-provider-api` + its MySQL, and
   `dmi-engine-demo-provider-integration`), behind the `full-stack` profile. Runs
   `scenarios/full-stack-smoke.e2e.ts`. **Blocked upstream** (see below).
@@ -91,16 +95,19 @@ GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 npm run test:harness
 # antech (classic): the Antech mock + the real antech integration.
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=antech npm run test:harness
 
+# zoetis (VetSync v1): the Zoetis mock + the real zoetis integration.
+GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis npm run test:harness
+
 # demo (the upstream-blocked loop):
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=demo npm run test:harness
 ```
 
 Each integration image builds from a sibling checkout (`../dmi-engine-idexx-integration` /
-`../dmi-engine-antech-integration`; override with `DMI_IDEXX_INTEGRATION_DIR` /
-`DMI_ANTECH_INTEGRATION_DIR`) and its `npm install` resolves `@nominal-systems/*` from GitHub
-Packages, so `GHP_TOKEN` (a `read:packages` token — a `gh auth token` works) must be exported for the
-Docker build. Both mocks are zero-dependency Node servers built inline, so they need no token. The
-fast suite needs no token.
+`../dmi-engine-antech-integration` / `../dmi-engine-zoetis-integration`; override with
+`DMI_IDEXX_INTEGRATION_DIR` / `DMI_ANTECH_INTEGRATION_DIR` / `DMI_ZOETIS_INTEGRATION_DIR`) and its
+`npm install` resolves `@nominal-systems/*` from GitHub Packages, so `GHP_TOKEN` (a `read:packages`
+token — a `gh auth token` works) must be exported for the Docker build. All three mocks are
+zero-dependency Node servers built inline, so they need no token. The fast suite needs no token.
 
 **The idexx loop closes end to end.** An order placed over real HTTP round-trips through the real
 idexx integration and the mock vendor: `POST /orders?autoSubmitOrder=true` → the integration creates
@@ -123,6 +130,21 @@ knowing before you run it:
   picks it up; the scenario budgets whole intervals, so a slow pass is the poll cadence, not a hang.
 - **Its results are XML**, not JSON, and the mock synthesises a `<LabReport>` document that the real
   `AntechResultMapper` parses. See "The Antech mock" below.
+
+**The zoetis loop closes end to end** as well: `POST /orders` → the integration builds a `<LabReport>`
+request document and places it with a single authenticated `POST /vetsync/v1/orders` → its results
+poll picks up a result the scenario seeds at the mock, maps it and pushes it back, so dmi-api writes a
+`FINAL` report, moves the order to `COMPLETED`, and `/events` shows the same sequence. It never
+touches a live Zoetis host. What differs from the other two:
+
+- **It is slow, like antech, and for the same reason**: the zoetis integration hardcodes both Bull
+  poll intervals to 30s (`src/config/configuration.ts`) with no env knob.
+- **Everything is XML in both directions**, and the integration parses it with `xmlbuilder2`'s object
+  format — so element *multiplicity* is load-bearing in several places. See "The Zoetis mock" below.
+- **It has two acknowledge channels**, and the scenario asserts both: results ack as a batch, orders
+  ack one at a time by POSTing to an `href` the order-status document itself advertises.
+- **Its species and sex really are ref-mapped**, which makes it the first loop where the scenario can
+  assert dmi-api's ref mapping end to end. See "Full-system findings".
 
 **Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
 because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api
@@ -196,6 +218,60 @@ captured clinic/patient data. The service mnemonics are genuine Antech catalogue
 identifiers published to integrators, not clinic or patient data); the descriptions and prices
 attached to them are invented. It never authenticates for real: the token is a fixed dummy.
 
+### The Zoetis mock
+
+`src/zoetis-mock/server.js` is the same idea for **Zoetis VetSync v1**: a zero-dependency Node HTTP
+server speaking the `/vetsync/v1` dialect closely enough for the real integration to drive it
+unmodified. As with Antech, the dialect is not publicly documented, so the contract was read out of
+the integration's own source (`zoetis.service.ts`, `helpers/zoetis-order.helper.ts`,
+`helpers/zoetis-responses.helper.ts`, `mappers/zoetis.mapper.ts`,
+`interceptors/zoetis-api.interceptor.ts`):
+
+- **Auth**: HTTP Basic, with a **domain-style username** the integration builds as
+  `` `${partnerId}\${clientId}` `` — joining a provider *configuration* field to an *integration*
+  option. Values are dummy and unchecked; presence, and the fact that the join happened, are enforced.
+- **Ordering**: a single `POST /vetsync/v1/orders` carrying a `<LabReport>` request document. The
+  response is the order-status document, whose `client_order_id` the integration assigns as **both**
+  the requisitionId and the externalId — which is the whole of Zoetis reconciliation.
+- **Polling and the two acks**: `GET /orders` lists orders whose status the practice has not
+  acknowledged, and each is acked individually by POSTing to the `href` of its `acknowledged` link;
+  `GET /orders/batch/results` serves unacked results, acked as a batch via
+  `POST /orders/batch/acknowledged`. The mock models both, so neither poll replays forever.
+- **Reference data**: `/services` (the enforced catalogue), `/species`, `/genders`, `/devices`. There
+  is deliberately **no `/breeds`** — the integration's `getBreeds` is a no-op that never calls the
+  vendor, so an endpoint would be fiction.
+- **Control plane** (`/__control__/*`, host-facing): seed a result, list/inspect received orders, read
+  the catalogue, reset, inject error scenarios — the same determinism story as the other two mocks.
+
+**Element multiplicity is the fussy part here**, where Antech's was CDATA and attribute sensitivity.
+`xmlbuilder2`'s object format gives an object for a lone child and an array for repeated ones, and
+the integration consumes several of these as arrays — so the mock always emits **≥ 2** of:
+order-status `<link>`, `<LabResultItem>`, `<Section>`, `<specie>`, `<gender>`, `<Device>`. The mirror
+image of the same rule: an **empty `<LabResults/>` is not equivalent to an absent one**, because
+`getTests` branches on falsiness and `{}` is truthy — so an order with no result yet omits the
+element entirely.
+
+**Errors go back as JSON while every success is XML**, deliberately. The integration's
+`providerErrorMapper` reads `error.response.data.error.context`, which axios only ever produces from a
+JSON body; an XML error body would leave `data` a string and send the mapper down its generic
+fallback, so a rejection test would go red without ever exercising the real branch. Same lesson as the
+Antech `ModelState` envelope.
+
+**It validates rather than defaults**, for the same reasons the Antech mock does — and one more that
+is specific to this loop. Order placement rejects a missing animal name, species, breed, gender,
+owner or vet name, client id, practice ref or tests; it rejects a duplicate practice ref; and it
+**enforces its own species, gender and service vocabularies**. That last one matters because species
+and sex are the only order fields dmi-api actually *transforms* on the way to the vendor: a ref
+mapping that silently stopped resolving would otherwise produce a well-formed order the mock accepted,
+keeping the gate green while the vendor received a code it had never heard of.
+
+All of its canned data is **synthetic**. The service codes (`CDP`, `HEM`, `T4`) and analyte codes
+(`GLU`, `CRE`, `ALT`, `ALB`) are genuine Zoetis catalogue identifiers — vendor codes published to
+integrators, not clinic or patient data — and every name, value, unit and range attached to them is
+invented. It never authenticates for real, and it builds the `link href`s it advertises from the
+request's own `Host` header, so even the URLs the integration POSTs back to resolve to the mock rather
+than anywhere real.
+
 ### The MQTT broker
 
 The harness broker is **`eclipse-mosquitto:2`**, not ActiveMQ. dmi-api and the provider integrations
@@ -225,6 +301,7 @@ Full-system services (behind a compose profile — only the selected loop's port
 |--------------------|---------|-------------|-------|
 | VetConnect Plus mock | 3012  | `idexx`     | the simulated IDEXX vendor; tests drive its `/__control__` plane |
 | Antech mock        | 3013    | `antech`    | the simulated Antech vendor; tests drive its `/__control__` plane |
+| Zoetis mock        | 3014    | `zoetis`    | the simulated Zoetis vendor; tests drive its `/__control__` plane |
 | Redis              | 6380    | all         | the integration's Bull queues |
 | demo-provider-api  | 3011    | `full-stack`| the simulated demo vendor; harness mints keys here |
 | demo-provider MySQL| 3308    | `full-stack`| the demo vendor's own database |
@@ -238,7 +315,7 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
-| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock), `antech` (real classic-antech integration + Antech mock) or `demo` (upstream-blocked demo loop). |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock), `antech` (real classic-antech integration + Antech mock), `zoetis` (real zoetis integration + Zoetis mock) or `demo` (upstream-blocked demo loop). |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -260,6 +337,11 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_ANTECH_PIMS_IDENTIFIER` | `HRN` | antech only. The 3-4 letter PIMS identifier; only appears in a generated requisition id (the harness supplies its own). |
 | `HARNESS_ANTECH_USERNAME` / `_PASSWORD` / `_CLINIC_ID` | `harness-user` / `harness-pass` / `900001` | antech only. Dummy integration credentials; the mock never authenticates for real. |
 | `HARNESS_ANTECH_LAB_ID` | `1` | antech only. dmi-api declares `LabId` as an **integer** provider option and rejects a string, so this stays a number. There is deliberately no antech poll-interval knob to pair with `HARNESS_IDEXX_POLL_MS`: that integration hardcodes its Bull intervals to 30s. |
+| `HARNESS_ZOETIS_MOCK_PORT` | `3014` | zoetis only. Host port for the Zoetis mock (its `/__control__` plane and `/status`). |
+| `HARNESS_ZOETIS_MOCK_URL` | `http://$HARNESS_HOST:3014` | zoetis only. Host-facing mock base URL the scenario drives. |
+| `HARNESS_ZOETIS_BASE_URL` | `http://zoetis-mock:3000` | zoetis only. Compose-network base URL stored in the provider config; the integration appends `/vetsync/v1/<endpoint>` to it. Never point at a live Zoetis host. |
+| `HARNESS_ZOETIS_PARTNER_ID` / `_PARTNER_PASSWORD` | `harness-partner` / `harness-pass` | zoetis only. Dummy provider-**configuration** credentials; the mock never authenticates for real. |
+| `HARNESS_ZOETIS_CLIENT_ID` | `harness-client` | zoetis only. The dummy "FUSE Client ID" **integration** option. The integration joins it to `partnerId` as the HTTP Basic username `partnerId\clientId`, which is why the two live in different places. All four zoetis provider options are declared `string` by dmi-api — unlike antech's `LabId`, none is an integer. There is deliberately no zoetis poll-interval knob, for the same reason as antech. |
 | `HARNESS_DEMO_PROVIDER_PORT` | `3011` | demo only. Host port for the demo vendor API (where the harness mints an X-Api-Key). |
 | `HARNESS_DEMO_PROVIDER_URL` | `http://$HARNESS_HOST:3011/demo` | demo only. Host-facing demo vendor base URL (includes its `/demo` prefix). |
 | `HARNESS_DEMO_PROVIDER_INTERNAL_URL` | `http://dmi-demo-provider-api:3000/demo` | demo only. URL the integration container uses to reach the vendor; stored verbatim in the dmi-api provider configuration, so it must resolve inside the compose network. |
@@ -293,7 +375,8 @@ directory is the only write the harness makes inside the dmi-api checkout.
 ```
 docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profile (redis + the
                               VetConnect Plus mock + the idexx integration), an `antech` profile
-                              (redis + the Antech mock + the antech integration) and a `full-stack`
+                              (redis + the Antech mock + the antech integration), a `zoetis` profile
+                              (redis + the Zoetis mock + the zoetis integration) and a `full-stack`
                               profile (redis + the demo vendor + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
@@ -304,6 +387,7 @@ src/
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   idexx-mock/server.js        the VetConnect Plus mock vendor (zero-dependency Node HTTP server)
   antech-mock/server.js       the Antech mock vendor (zero-dependency Node HTTP server)
+  zoetis-mock/server.js       the Zoetis mock vendor (zero-dependency Node HTTP server)
   poll.ts                     pollUntil, shared by the full-system scenarios
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
@@ -312,6 +396,7 @@ scenarios/
   tenant-isolation.e2e.ts     the point of this suite
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
   antech-full-stack.e2e.ts    the antech loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech); closes end to end
+  zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   full-stack-smoke.e2e.ts     the demo loop (HARNESS_FULL_STACK=1 HARNESS_STACK=demo); blocked upstream
 ```
 
@@ -420,6 +505,41 @@ taught us, beyond the mechanics above:
   batch was **acknowledged** as explicit positive evidence that the poll ran to completion rather than
   dying midway. Worth knowing before you debug this loop — and worth copying for the next provider.
 
+**The zoetis loop closes too** (Phase 1), making `dmi-engine-zoetis-integration` the third provider
+confirmed to interoperate with the current dmi-api. What the third provider taught us:
+
+- **Reconciliation has a third shape, not two.** idexx orders must *carry* a `pims:patient:id` and
+  antech orders must *omit* one — but both are workarounds for the same guard,
+  `ProviderResultUtils.isMatchingOrder`. Zoetis never reaches that guard at all: its result mapper
+  attaches no `.order` to a result, so results always take dmi-api's `externalId` path.
+  Reconciliation is purely `PracticeRef == client_order_id == externalId == requisitionId`, and the
+  patient identifier is a free choice. The generalisable lesson is stronger than "check the mapper's
+  identifier system": **check first whether the provider's results reach the guard at all.**
+- **Ref mapping was never actually exercised until this loop.** dmi-api maps an order's
+  species/sex/breed from its canonical refs to provider codes (`RefsService.mapPatientRefs`) before
+  handing the order to the engine, and nothing in the earlier scenarios asserted the result — they
+  place orders with `species: 'DOG'`, `sex: 'MALE'`, `breed: 'LABRADOR'`, **none of which is a dmi ref
+  code**, so the mapping silently no-ops and the raw strings are forwarded. A mapping that stopped
+  resolving would have changed nothing observable. The zoetis scenario closes that hole for its own
+  loop by placing the order with the canonical ref codes (looked up by name over `GET /refs/*`, since
+  dmi's codes are opaque UUIDs) and asserting the vendor received the *zoetis* vocabulary — `DOG` and
+  `MALE_NEUTERED` — with the mock enforcing both. Input and expected output are deliberately
+  different strings, so a no-op mapping fails loudly. Verified: pointing the order at a species with
+  no zoetis mapping makes the mock reject placement with `'<uuid>' is not a Zoetis species code`.
+- **Zoetis breeds cannot be ref-mapped at all.** dmi-api seeds 1307 zoetis breed `provider_ref` rows
+  and **every one has a NULL `code`** (the other three providers have none) — consistent with the
+  integration's `getBreeds` being a no-op, since Zoetis publishes no breed catalogue. So a breed that
+  *does* resolve maps to null and is dropped from the order; only an unresolvable string survives.
+  The scenario therefore sends a plain descriptive breed and asserts forwarding, not mapping.
+- **Multiplicity is this dialect's version of Antech's CDATA sensitivity.** Wherever an integration
+  consumes a parsed XML collection as an array, a one-element response is a different shape — the
+  object formats return an object, not a one-element array. Worth grepping for in the next provider
+  before deciding how many of each element its mock should emit.
+- **Its failing polls are silent too**, exactly as antech's are, so the scenario asserts **both**
+  acknowledge channels as positive evidence that each poll ran to completion rather than dying midway
+  — including that the *orders* ack happened at `COMPLETED`, which can only be true if a full
+  poll → fetch → emit → ack cycle ran after the result landed.
+
 **The demo loop is blocked upstream.** `dmi-engine-demo-provider-integration` on `main` is no longer
 compatible with the current dmi-api — over the MQTT transport it does not answer dmi-api's engine
 RPCs, so its order → result → report loop cannot close. The vendor sim, dmi-api's inbound handlers and
@@ -432,18 +552,24 @@ the order lands in `ERROR`).
 ## Known gaps
 
 - **The full-stack CI jobs are scoped, not universal.** Each provider loop lives in its own workflow
-  (`.github/workflows/e2e-idexx.yml`, `e2e-antech.yml`) because each needs a `paths:` filter and those
-  are per-workflow, not per-job. They run: on **push to `main`** always; on a **pull request** only
+  (`.github/workflows/e2e-idexx.yml`, `e2e-antech.yml`, `e2e-zoetis.yml`) because each needs a
+  `paths:` filter and those are per-workflow, not per-job. They run: on **push to `main`** always; on a **pull request** only
   when the harness, the mock, compose or that loop's scenario changes (a docs or tenant-isolation edit
   shouldn't pay for ~7 containers per provider — this matters more as the fan-out grows); and on
   demand via `workflow_dispatch`. They skip on **fork** PRs, which cannot read the org secrets they
   need. The fast `harness` job in `e2e.yml` still runs on every PR.
 - **The demo loop is blocked upstream** (tracked privately). Run it with `HARNESS_STACK=demo`.
-- **The antech loop is slow by construction.** Its integration hardcodes both Bull poll intervals to
-  30s with no env knob (idexx exposes `IDEXX_*_POLLING_INTERVAL_MS`, which the harness dials down to
-  ~3s), so the antech scenario waits whole intervals for a result. Making that interval
-  env-configurable would be a small change in the antech integration repo and would cut this suite's
-  runtime substantially — a possible team follow-up, out of scope here (that repo is read-only).
+- **The antech and zoetis loops are slow by construction.** Both integrations hardcode their two Bull
+  poll intervals to 30s with no env knob (idexx exposes `IDEXX_*_POLLING_INTERVAL_MS`, which the
+  harness dials down to ~3s), so those scenarios wait whole intervals for a result. Making the
+  interval env-configurable would be a small change in each integration repo and would cut this
+  suite's runtime substantially — a possible team follow-up, out of scope here (both repos are
+  read-only).
+- **Only the zoetis loop asserts dmi-api's ref mapping.** The idexx and antech scenarios place orders
+  with species/sex/breed strings that are not dmi ref codes, so the mapping no-ops and their
+  assertions cover forwarding only (see "Full-system findings"). Porting the zoetis approach — place
+  with canonical ref codes, assert the provider vocabulary at the mock — would close that gap for
+  them, but it is a change to another provider's scenario and belongs in its own PR.
 - **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
   results. Both mock-backed scenarios avoid this by stopping their integration in `afterAll` (removing

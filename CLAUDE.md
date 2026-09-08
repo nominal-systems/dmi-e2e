@@ -54,11 +54,34 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 
 ## Per-provider differences that bite
 
-- **Reconciliation is provider-specific.** Whether an order must carry a `pims:patient:id`
-  identifier — or must omit it — depends on what the provider's result mapper emits and whether it
-  attaches an order to each result. Check that in the integration's source **before** copying an
-  existing scenario; the wrong choice strands orders at `SUBMITTED` forever. Background:
+- **Reconciliation is provider-specific, and there are more than two shapes.** Whether an order must
+  carry a `pims:patient:id` identifier — or must omit it — depends on what the provider's result
+  mapper emits. But first check whether its results reach dmi-api's matching guard at all: a mapper
+  that attaches no `.order` to a result (zoetis) makes reconciliation pure `externalId`, and the
+  identifier becomes a free choice. Read the mapper **before** copying an existing scenario; the
+  wrong choice strands orders at `SUBMITTED` forever. Background:
   [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334).
+- **Ref-mapped fields need value assertions, or they are not tested at all.** dmi-api maps an order's
+  species/sex/breed from its canonical refs to provider codes before handing it to the engine, and
+  falls back to forwarding the raw string when nothing resolves — so a scenario that places an order
+  with a non-ref string exercises no mapping and cannot detect one breaking. Place with the canonical
+  ref code (look it up over `GET /refs/*`; dmi's codes are opaque UUIDs), assert the **provider's**
+  vocabulary arrived at the mock, and make sure the two strings differ. Which fields are mapped at
+  all varies: check the provider's `provider_ref` rows, not just its reference endpoints.
+- **Watch element multiplicity in XML dialects.** Where an integration calls `.find`/`.filter`/`.map`
+  on a parsed collection without normalising, a one-element response deserialises to an object and
+  throws. Grep the mapper and service for that before deciding how many of each element to emit. Then
+  **enforce the requirement in the mock's control plane** with an explanatory error — a shape rule
+  stated only in a comment leaves the next author a silent poll timeout.
+- **A more faithful mock can WEAKEN an assertion that was sound against a cruder one.** Assertion
+  strength does not transfer with the template — re-derive it per provider. Worked example: the idexx
+  and antech mocks drop an order from the orders feed permanently once acked, so the only route to a
+  `COMPLETED` order is the results channel, and waiting on `COMPLETED` is a fair reconciliation proof
+  there. The zoetis mock instead models the vendor's re-notification on status change, which is more
+  faithful — and that extra fidelity lets its orders poll reach `COMPLETED` on its own, so the same
+  assertion passes with the results channel severed outright. It has to wait on the report reaching
+  `FINAL`. Ask of every completion assertion: **which channels can satisfy this, and is the one I
+  mean the only one?**
 - **Poll intervals differ.** Some integrations expose an env knob the harness dials down (~3s);
   others hardcode ~30s. Budget scenario timeouts for at least one full poll tick and don't mistake
   the wait for a hang.

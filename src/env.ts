@@ -56,9 +56,10 @@ export interface HarnessEnv {
   fullStack: boolean
   /* Which full-system loop HARNESS_FULL_STACK=1 runs: 'idexx' (the real idexx integration + the
    * VetConnect Plus mock, the Phase 0 default), 'antech' (the real classic-antech integration + the
-   * Antech mock) or 'demo' (the pre-existing, upstream-blocked demo loop). Ignored unless fullStack
-   * is set. Each maps to its own compose profile and scenario file. */
-  stack: 'idexx' | 'antech' | 'demo'
+   * Antech mock), 'zoetis' (the real zoetis integration + the Zoetis mock) or 'demo' (the
+   * pre-existing, upstream-blocked demo loop). Ignored unless fullStack is set. Each maps to its own
+   * compose profile and scenario file. */
+  stack: 'idexx' | 'antech' | 'zoetis' | 'demo'
   demoProvider: {
     /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
      * demo-provider-api's `/demo` global prefix. */
@@ -107,6 +108,26 @@ export interface HarnessEnv {
      * which rejects a string — so this stays a number all the way to POST /integrations. */
     labId: number
   }
+  zoetis: {
+    /* Host-facing base URL of the Zoetis mock (published port). Tests drive the mock's control plane
+     * (/__control__/*) and readiness (/status) through this. */
+    mockBaseUrl: string
+    /* Compose-network base URL the zoetis integration container uses to reach the mock, stored
+     * verbatim in the dmi-api provider configuration so it must resolve inside the compose network.
+     * The integration appends /vetsync/v1/<endpoint> to it. Never point at a live Zoetis host
+     * (vetscanconnect.zoetis.com or otherwise). */
+    baseUrl: string
+    /* Provider-configuration credentials and the integration option, all DUMMY — the mock never
+     * authenticates for real. The integration joins two of them into the HTTP Basic username as
+     * `<partnerId>\<clientId>` (a domain-style user) with partnerPassword as the password, which is
+     * why partnerId and clientId come from different places: partnerId/partnerPassword are provider
+     * CONFIGURATION, clientId is an INTEGRATION option ("FUSE Client ID"). All four zoetis provider
+     * options are declared `string` by dmi-api's migrations — unlike antech, there is no
+     * integer-typed option to trip over. */
+    partnerId: string
+    partnerPassword: string
+    clientId: string
+  }
   /* Orchestration. Set HARNESS_BASE_URL to point at a dmi-api you started yourself, in which case
    * the harness neither builds nor spawns one, and never touches DMI_API_DIR. */
   manageContainers: boolean
@@ -122,12 +143,13 @@ const appPort = int('HARNESS_APP_PORT', 3010)
 const demoProviderPort = int('HARNESS_DEMO_PROVIDER_PORT', 3011)
 const vcpMockPort = int('HARNESS_VCP_MOCK_PORT', 3012)
 const antechMockPort = int('HARNESS_ANTECH_MOCK_PORT', 3013)
+const zoetisMockPort = int('HARNESS_ZOETIS_MOCK_PORT', 3014)
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
 
-function stackChoice (): 'idexx' | 'antech' | 'demo' {
+function stackChoice (): 'idexx' | 'antech' | 'zoetis' | 'demo' {
   const value = str('HARNESS_STACK', 'idexx').toLowerCase()
-  if (value !== 'idexx' && value !== 'antech' && value !== 'demo') {
-    throw new Error(`HARNESS_STACK must be 'idexx', 'antech' or 'demo', got '${value}'`)
+  if (value !== 'idexx' && value !== 'antech' && value !== 'zoetis' && value !== 'demo') {
+    throw new Error(`HARNESS_STACK must be 'idexx', 'antech', 'zoetis' or 'demo', got '${value}'`)
   }
   return value
 }
@@ -187,6 +209,13 @@ export const env: HarnessEnv = {
     password: str('HARNESS_ANTECH_PASSWORD', 'harness-pass'),
     clinicId: str('HARNESS_ANTECH_CLINIC_ID', '900001'),
     labId: int('HARNESS_ANTECH_LAB_ID', 1),
+  },
+  zoetis: {
+    mockBaseUrl: str('HARNESS_ZOETIS_MOCK_URL', `http://${host}:${zoetisMockPort}`),
+    baseUrl: str('HARNESS_ZOETIS_BASE_URL', 'http://zoetis-mock:3000'),
+    partnerId: str('HARNESS_ZOETIS_PARTNER_ID', 'harness-partner'),
+    partnerPassword: str('HARNESS_ZOETIS_PARTNER_PASSWORD', 'harness-pass'),
+    clientId: str('HARNESS_ZOETIS_CLIENT_ID', 'harness-client'),
   },
   manageContainers: flag('HARNESS_MANAGE_CONTAINERS', true),
   manageApp: flag('HARNESS_MANAGE_APP', explicitBaseUrl == null),
