@@ -34,6 +34,12 @@ const ORIGIN_OVERRIDE = process.env.VCP_MOCK_ORIGIN || ''
  * This lives outside the resettable state on purpose: /__control__/reset must not rewind it. */
 let nextOrderId = Date.now()
 
+/* The one IVLS analyzer this clinic owns. Advertised by `/api/v1/ivls/devices`, required on every
+ * in-house order (see validateCreateOrder), and stamped on every result's run summary — one constant
+ * so the device an order names, the device the vendor lists and the device a result came from are the
+ * same serial by construction. Invented; not a real analyzer's serial. */
+const IVLS_DEVICE_SERIAL = 'VCPMOCK0001'
+
 function log (message) {
   /* One-line, greppable, prefixed like the harness's other services. */
   console.log(`[vcp-mock] ${message}`)
@@ -141,7 +147,9 @@ function buildOrderResponse (order, origin) {
     veterinarian: order.veterinarian,
     patients: order.patients,
     tests: order.tests,
-    ivls: null,
+    /* Echoed from the request, never invented: an in-house order that arrived without a device was
+     * already rejected, so this is only ever what the integration actually sent. */
+    ivls: order.ivls,
     prevRefNum: null,
     notes: order.notes ?? '',
     technician: order.technician ?? null,
@@ -248,7 +256,7 @@ function buildResult (order, overrides) {
         name: 'Catalyst Dx Chemistry Analyzer',
         runDate: nowIso(),
         sampleType: 'Serum',
-        ivlsSerialNumber: 'VCPMOCK0001',
+        ivlsSerialNumber: IVLS_DEVICE_SERIAL,
       },
     ],
     notes: {},
@@ -268,7 +276,14 @@ function refList (items) {
  * integration that sends a malformed or stale code.
  *
  * `IHD_DHP` is a real IDEXX in-house code from the vendor's own reference-data catalogue. Shape
- * matters: the placeholder here used to be `SA`, which is not an IDEXX code in any form. */
+ * matters: the placeholder here used to be `SA`, which is not an IDEXX code in any form.
+ *
+ * `inHouse` is load-bearing since the integration started reading this catalogue to decide device
+ * inclusion (its issue #76): an order containing any `inHouse: true` code must carry an IVLS device,
+ * and an order of only reference-lab codes must not. The integration fetches this list once per
+ * integration and caches it in Redis, so the flag here is what it classifies the harness's orders
+ * by — and placement below enforces the same rule the real vendor does, so the two cannot drift
+ * apart silently. */
 const SERVICE_CATALOGUE = [
   {
     code: 'IHD_DHP',
@@ -323,6 +338,34 @@ function validateCreateOrder (payload) {
     return { code: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}` }
   }
 
+  /* The device rule, from the vendor's side. Live IDEXX cannot run an in-house test without knowing
+   * which analyzer to run it on, so an in-house order without an `ivls` device is refused. The
+   * integration now enforces the same rule before the request ever leaves it (issue #76) — which is
+   * exactly why the mock must enforce it too: a mock that accepted a device-less in-house order would
+   * let a regression in the integration's rule (or someone flipping IDEXX_DEVICE_RULE_ENABLED off in
+   * the compose file) leave this gate green. The serial must also be one this clinic owns: the only
+   * proof that the device dmi-api was given is the device the vendor received. The error codes for
+   * both refusals are extrapolated (not captured live); the refusals themselves are the contract. */
+  const inHouse = payload.tests.filter(
+    (code) => SERVICE_CATALOGUE.find((service) => service.code === String(code))?.inHouse === true,
+  )
+  const serials = (Array.isArray(payload.ivls) ? payload.ivls : [])
+    .map((device) => device?.serialNumber)
+    .filter((serial) => !isBlank(serial))
+  if (inHouse.length > 0 && serials.length === 0) {
+    return {
+      code: 'MISSING_REQUIRED_FIELD',
+      message: `in-house test(s) ${inHouse.join(', ')} require an ivls device, and none was sent`,
+    }
+  }
+  const foreign = serials.filter((serial) => serial !== IVLS_DEVICE_SERIAL)
+  if (foreign.length > 0) {
+    return {
+      code: 'INVALID_IVLS_DEVICE',
+      message: `unknown ivls serial number(s): ${foreign.join(', ')} (this clinic owns ${IVLS_DEVICE_SERIAL})`,
+    }
+  }
+
   return null
 }
 
@@ -375,6 +418,8 @@ async function handleCreateOrder (req, res) {
     patients: Array.isArray(payload.patients) ? payload.patients : [],
     tests: Array.isArray(payload.tests) ? payload.tests : [],
     veterinarian: payload.veterinarian || '',
+    /* Validated above; stored verbatim (serial only, the way the integration sends it). */
+    ivls: Array.isArray(payload.ivls) ? payload.ivls.map((device) => ({ serialNumber: device.serialNumber })) : null,
     technician: payload.technician || null,
     notes: payload.notes || '',
     receivedAt: nowIso(),
@@ -542,6 +587,7 @@ function handleControlListOrders (req, res) {
     receivedAt: order.receivedAt,
     confirmedAt: order.confirmedAt,
     tests: order.tests,
+    ivls: (order.ivls ?? []).map((device) => device.serialNumber),
   }))
   sendJson(res, 200, { count: orders.length, orders })
 }
@@ -560,6 +606,9 @@ function handleControlGetOrder (req, res, params) {
     receivedAt: order.receivedAt,
     confirmedAt: order.confirmedAt,
     tests: order.tests,
+    /* The IVLS serial(s) the integration attached, so the scenario can pin that the device dmi-api
+     * was given is the one the vendor received. */
+    ivls: (order.ivls ?? []).map((device) => device.serialNumber),
   })
 }
 
@@ -602,7 +651,20 @@ const routes = [
   ['GET', /^\/api\/v1\/ref\/species$/, (req, res) =>
     sendJson(res, 200, refList([{ code: 'CANINE', name: 'Canine' }, { code: 'FELINE', name: 'Feline' }]))],
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
-  ['GET', /^\/api\/v1\/ivls\/devices$/, (req, res) => sendJson(res, 200, { ivlsDeviceList: [] })],
+  /* `IdexxIvlsDevice` as the integration's device mapper reads it (deviceSerialNumber,
+   * vcpActivatedStatus, displayName). Nothing in the harness syncs devices yet; the list exists so
+   * the clinic's one analyzer is advertised where the vendor would advertise it. */
+  ['GET', /^\/api\/v1\/ivls\/devices$/, (req, res) =>
+    sendJson(res, 200, {
+      ivlsDeviceList: [
+        {
+          deviceSerialNumber: IVLS_DEVICE_SERIAL,
+          displayName: 'VetLab Station (mock)',
+          lastPolledCloudTime: nowIso(),
+          vcpActivatedStatus: 'ACTIVE',
+        },
+      ],
+    })],
 
   ['GET', /^\/ui$/, handleUiPage],
   ['GET', /^\/ui\/order\/(?<orderId>[^/]+)$/, handleUiOrderGet],

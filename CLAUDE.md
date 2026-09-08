@@ -82,6 +82,12 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   assertion passes with the results channel severed outright. It has to wait on the report reaching
   `FINAL`. Ask of every completion assertion: **which channels can satisfy this, and is the one I
   mean the only one?**
+- **The idexx integration decides device inclusion from the vendor catalogue.** It fetches
+  `/ref/tests`, and an order with any `inHouse` code must carry a `devices` serial or it is refused
+  before reaching the vendor; an all-reference-lab order has its devices stripped. The mock's
+  catalogue flags are therefore load-bearing, and the mock enforces the same rule so the integration's
+  kill switch (`IDEXX_DEVICE_RULE_ENABLED`) cannot quietly turn the check off. Read the order's
+  device serial from the mock's `/ivls/devices`, never a literal.
 - **Poll intervals differ.** Some integrations expose an env knob the harness dials down (~3s);
   others hardcode ~30s. Budget scenario timeouts for at least one full poll tick and don't mistake
   the wait for a hang.
