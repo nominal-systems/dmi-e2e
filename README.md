@@ -66,6 +66,36 @@ HARNESS_BUILD=0   npm run test:harness   # skip `npm run build` in the checkout
 HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:harness
 ```
 
+### Run reports
+
+Every run leaves an HTML report behind, whatever the suite and whether it went green or red:
+
+```
+reports/
+  index.html          one row per suite: result, counts, duration, when, what was under test
+  <suite>/index.html  the full jest-html-reporters page (self-contained; open it from file://)
+  <suite>/summary.json, <suite>/run.json   the data the index is built from
+```
+
+`<suite>` is `fast`, or the `HARNESS_STACK` name under `HARNESS_FULL_STACK=1`. Each run overwrites
+its own suite's directory only, so running zoetis never hides the last idexx result. "Under test"
+is `git describe` of this checkout, the dmi-api checkout and the integration checkout (`-dirty`
+when one has local changes) — recorded at setup, before anything is built, so a run that dies
+before the tests report still shows what it was testing and is listed as *did not complete*.
+
+**Serving it.** Set `HARNESS_PUBLISH_REPORT=1` and teardown copies the suite that just ran into
+`HARNESS_REPORT_PUBLISH_DIR` (default `/opt/homebrew/var/www/dmi-e2e`) and rebuilds the index
+*there*, over every suite it holds. `npm run report:publish [suite...]` does the same by hand for
+every local suite (or the named ones). The directory is meant for an nginx `location /dmi-e2e/`
+block — [docs/nginx/dmi-e2e.conf](docs/nginx/dmi-e2e.conf) is the snippet — which is how the
+shared mac mini serves the latest run of each loop behind its existing auth. The report is copied
+out of the repo rather than served in place because nginx's worker typically runs as `nobody`, which
+cannot read into a home directory; the copy is made world-readable. A report problem is logged and
+never fails the run: the suite's exit code is the suite's, not the reporter's.
+
+Nothing is published unless the flag is set, so a developer's local run never writes outside the
+repo; on their machine the `reports/` files open straight from the filesystem.
+
 ### Full-system mode
 
 The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1` selects a second
@@ -353,6 +383,9 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_KEEP_UP` | `0` | `1` to skip `docker compose down -v` on exit. |
 | `HARNESS_DEPS_READY_MS` / `HARNESS_APP_READY_MS` | `180000` | Readiness budgets. |
 | `HARNESS_REQUEST_MS` | `30000` | Per-request timeout. |
+| `HARNESS_REPORT_DIR` | `./reports` | Where each run writes `<suite>/index.html`, `summary.json`, `run.json` and the index. See "Run reports". |
+| `HARNESS_PUBLISH_REPORT` | `0` | `1` to copy the suite that just ran into `HARNESS_REPORT_PUBLISH_DIR` on teardown and rebuild the index there. |
+| `HARNESS_REPORT_PUBLISH_DIR` | `/opt/homebrew/var/www/dmi-e2e` | The directory nginx serves (`docs/nginx/dmi-e2e.conf`). Also the target of `npm run report:publish`. |
 
 dmi-api is started with a fixed environment (`src/env.ts`, `appEnv()`), the load-bearing parts of
 which are:
@@ -389,8 +422,12 @@ src/
   antech-mock/server.js       the Antech mock vendor (zero-dependency Node HTTP server)
   zoetis-mock/server.js       the Zoetis mock vendor (zero-dependency Node HTTP server)
   poll.ts                     pollUntil, shared by the full-system scenarios
+  report/summary-reporter.js  jest reporter: writes reports/<suite>/summary.json when the run ends
+  report/report.ts            run.json at setup, the run index, publishing to the nginx directory
+  report/publish.ts           `npm run report:publish`
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
+docs/nginx/dmi-e2e.conf       the nginx location block that serves the published reports
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite

@@ -35,6 +35,17 @@ const scenarioForStack = {
  * a missed tick rather than let a healthy-but-slow loop read as a hang. */
 const slowPollStacks = ['antech', 'zoetis']
 
+/* Run report: reports/<suite>/index.html (jest-html-reporters, one self-contained file) plus
+ * summary.json (src/report/summary-reporter.js) for the run index src/report/report.ts builds.
+ * `suite` and the directory mirror env.suite / env.report.dir in src/env.ts — this file is loaded
+ * before ts-jest, so it cannot import them. */
+const path = require('path')
+const suite = fullStack ? stack : 'fast'
+const reportDir = path.join(
+  path.resolve(process.env.HARNESS_REPORT_DIR || path.join(__dirname, 'reports')),
+  suite,
+)
+
 const projectCommon = {
   rootDir: __dirname,
   testEnvironment: 'node',
@@ -64,6 +75,19 @@ module.exports = {
   /* One shared database and one shared event stream: scenarios must not race each other. */
   maxWorkers: 1,
   verbose: true,
+  reporters: [
+    'default',
+    ['jest-html-reporters', {
+      publicPath: reportDir,
+      filename: 'index.html',
+      inlineSource: true,
+      pageTitle: `dmi-e2e · ${suite}`,
+      expand: true,
+      hideIcon: true,
+      openReport: false,
+    }],
+    ['<rootDir>/src/report/summary-reporter.js', { outputDir: reportDir }],
+  ],
   /* Fast scenarios are quick; the full loop is ~6s vendor auto-complete + up to 10s poll + boot
    * slack. Individual full-stack tests set tighter per-test timeouts where they wait on the engine.
    * The antech and zoetis loops are the slow ones — see slowPollStacks above. */
