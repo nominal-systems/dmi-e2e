@@ -2,6 +2,7 @@ import { ChildProcess } from 'child_process'
 import { composeUp, runMigrations, waitForDependencies } from './containers'
 import { startDmiApi } from './dmi-api'
 import { env } from './env'
+import { beginRun } from './report/report'
 
 /* Jest runs globalSetup and globalTeardown in the same process, so the app handle can be parked
  * on globalThis for teardown to reclaim. Test files run in workers and never see it. */
@@ -12,6 +13,11 @@ declare global {
 
 export default async function globalSetup (): Promise<void> {
   const log = (message: string): void => console.log(`[harness] ${message}`)
+
+  /* First, before anything can fail: record what this run is testing and clear the previous run's
+   * results, so the report can never show a stale result against a fresh run. */
+  const run = beginRun()
+  log(`suite '${run.suite}' — under test: ${Object.entries(run.versions).map(([name, version]) => `${name} ${version}`).join(', ')}`)
 
   if (env.manageContainers) {
     log('starting dependency containers')
