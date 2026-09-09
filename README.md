@@ -96,6 +96,37 @@ never fails the run: the suite's exit code is the suite's, not the reporter's.
 Nothing is published unless the flag is set, so a developer's local run never writes outside the
 repo; on their machine the `reports/` files open straight from the filesystem.
 
+### Nightly runs on the mac mini
+
+GitHub Actions reruns every suite nightly (`schedule:` in the four workflows) to catch upstream
+drift, but a cloud run leaves no report anywhere you can open. The mac mini therefore runs the same
+four suites itself each night and publishes each one, so the served index is never more than a day
+old.
+
+- [scripts/nightly.sh](scripts/nightly.sh) is the run. It fast-forwards this checkout, the dmi-api
+  checkout and the three integration checkouts (ff-only; a checkout that cannot fast-forward is
+  tested as it stands, and the report's "under test" column says so), makes sure Docker Desktop is
+  up, then runs `fast`, `idexx`, `antech` and `zoetis` in turn with `HARNESS_PUBLISH_REPORT=1`. A
+  red suite does not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed
+  and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
+  `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
+  pruned. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
+  and `GHP_TOKEN` (from `gh auth token`) are resolved inside. Runnable by hand, e.g.
+  `NIGHTLY_SUITES=fast scripts/nightly.sh`.
+- [docs/launchd/com.nominal.dmi-e2e.nightly.plist](docs/launchd/com.nominal.dmi-e2e.nightly.plist)
+  schedules it at 03:00 local time as a **user LaunchAgent** — not a daemon, not cron — because the
+  job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
+  nginx directory. `scripts/nightly-install.sh` renders the template for this checkout, writes it to
+  `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that. The job runs whatever branch
+  the checkout is on.
+
+```bash
+scripts/nightly-install.sh                                  # install / reinstall
+launchctl print gui/$UID/com.nominal.dmi-e2e.nightly        # state, last exit, next run
+launchctl kickstart gui/$UID/com.nominal.dmi-e2e.nightly    # run it now
+tail -f ~/Library/Logs/dmi-e2e/nightly-*.log                # follow
+```
+
 ### Full-system mode
 
 The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1` selects a second
@@ -431,6 +462,10 @@ src/
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 docs/nginx/dmi-e2e.conf       the nginx location block that serves the published reports
+docs/launchd/*.plist          the nightly LaunchAgent for the mac mini (template; scripts/nightly-install.sh renders it)
+scripts/
+  nightly.sh                  every suite in turn, each report published — what the LaunchAgent runs
+  nightly-install.sh          render + load (or --uninstall) the LaunchAgent on this machine
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite
