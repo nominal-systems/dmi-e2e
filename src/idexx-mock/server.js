@@ -344,8 +344,11 @@ function validateCreateOrder (payload) {
    * exactly why the mock must enforce it too: a mock that accepted a device-less in-house order would
    * let a regression in the integration's rule (or someone flipping IDEXX_DEVICE_RULE_ENABLED off in
    * the compose file) leave this gate green. The serial must also be one this clinic owns: the only
-   * proof that the device dmi-api was given is the device the vendor received. The error codes for
-   * both refusals are extrapolated (not captured live); the refusals themselves are the contract. */
+   * proof that the device dmi-api was given is the device the vendor received. The device-less
+   * refusal uses MISSING_IVLS_SERIAL_NUMBER, straight from the errorCode list in IDEXX's own PIMS
+   * Ordering API spec (the per-field family: MISSING_PATIENT, MISSING_TESTS, MISSING_VETERINARIAN,
+   * ...); the foreign-serial code has no counterpart in that list and is extrapolated — the
+   * refusals themselves, not the codes, are the contract there. */
   const inHouse = payload.tests.filter(
     (code) => SERVICE_CATALOGUE.find((service) => service.code === String(code))?.inHouse === true,
   )
@@ -354,7 +357,7 @@ function validateCreateOrder (payload) {
     .filter((serial) => !isBlank(serial))
   if (inHouse.length > 0 && serials.length === 0) {
     return {
-      code: 'MISSING_REQUIRED_FIELD',
+      code: 'MISSING_IVLS_SERIAL_NUMBER',
       message: `in-house test(s) ${inHouse.join(', ')} require an ivls device, and none was sent`,
     }
   }
