@@ -60,6 +60,19 @@ export interface HarnessEnv {
    * pre-existing, upstream-blocked demo loop). Ignored unless fullStack is set. Each maps to its own
    * compose profile and scenario file. */
   stack: 'idexx' | 'antech' | 'zoetis' | 'demo'
+  /* Short name of the jest suite this invocation runs — 'fast', or the stack name under
+   * HARNESS_FULL_STACK=1. Names the run's report directory (reports/<suite>/). */
+  suite: string
+  /* The real integration checkout the selected full-system loop builds its container from — the
+   * same DMI_<STACK>_INTEGRATION_DIR defaults docker-compose.yml uses. Only read to record what
+   * was under test in the run report. Undefined for the fast suite. */
+  integration: { name: string, dir: string } | undefined
+  /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
+   * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
+   * suite that just ran into publishDir on teardown — the directory an nginx serves — and rebuilds
+   * the index THERE over every suite it holds, so publishing one suite never hides another's latest
+   * run. Off by default so a developer's run never writes outside the repo. */
+  report: { dir: string, publish: boolean, publishDir: string }
   demoProvider: {
     /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
      * demo-provider-api's `/demo` global prefix. */
@@ -154,6 +167,16 @@ function stackChoice (): 'idexx' | 'antech' | 'zoetis' | 'demo' {
   return value
 }
 
+const fullStack = flag('HARNESS_FULL_STACK', false)
+const stack = stackChoice()
+
+function integrationCheckout (): { name: string, dir: string } | undefined {
+  if (!fullStack) return undefined
+  const name = stack === 'demo' ? 'dmi-engine-demo-provider-integration' : `dmi-engine-${stack}-integration`
+  const variable = `DMI_${stack.toUpperCase()}_INTEGRATION_DIR`
+  return { name, dir: path.resolve(str(variable, path.join(harnessRoot, '..', name))) }
+}
+
 export const env: HarnessEnv = {
   harnessRoot,
   dmiApiDir: path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api'))),
@@ -182,8 +205,16 @@ export const env: HarnessEnv = {
     hostname: str('HARNESS_ACTIVEMQ_HOST', host),
     port: int('HARNESS_ACTIVEMQ_PORT', 1884),
   },
-  fullStack: flag('HARNESS_FULL_STACK', false),
-  stack: stackChoice(),
+  fullStack,
+  stack,
+  suite: fullStack ? stack : 'fast',
+  integration: integrationCheckout(),
+  report: {
+    /* Mirrored in jest.config.js, which is loaded before ts-jest and cannot import this module. */
+    dir: path.resolve(str('HARNESS_REPORT_DIR', path.join(harnessRoot, 'reports'))),
+    publish: flag('HARNESS_PUBLISH_REPORT', false),
+    publishDir: path.resolve(str('HARNESS_REPORT_PUBLISH_DIR', '/opt/homebrew/var/www/dmi-e2e')),
+  },
   demoProvider: {
     baseUrl: str('HARNESS_DEMO_PROVIDER_URL', `http://${host}:${demoProviderPort}/demo`),
     internalUrl: str('HARNESS_DEMO_PROVIDER_INTERNAL_URL', 'http://dmi-demo-provider-api:3000/demo'),
