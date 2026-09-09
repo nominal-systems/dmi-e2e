@@ -39,6 +39,14 @@ on:
       - 'package-lock.json'
       - '.github/workflows/e2e-zoetis.yml'
   workflow_dispatch:
+  # Nightly drift detector. This workflow's pull_request trigger fires only on changes to dmi-e2e's
+  # own files, but the integration and dmi-api are checked out at `main` and move independently — an
+  # upstream change can turn this loop red with no PR here to catch it (exactly how the idexx
+  # device-rule change sat undetected until an unrelated push). The nightly reruns the whole loop
+  # against current main of all three, so drift surfaces within a day. Fires only from the default
+  # branch, and only once this file is on main.
+  schedule:
+    - cron: '17 3 * * *'  # 03:17 UTC; off the hour, where GitHub's scheduler is least backed up
 
 concurrency:
   group: e2e-zoetis-${{ github.ref }}

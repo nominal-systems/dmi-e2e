@@ -11,6 +11,12 @@ on:
         description: 'Attempt the demo full-stack harness job (blocked upstream; see full-stack job)'
         type: boolean
         default: false
+  # Nightly: the fast suite runs dmi-api (checked out at main) against real MySQL/Mongo/ActiveMQ and
+  # regression-tests its migrations and the tenant-isolation guards — dmi-api moves on its own, so
+  # this surfaces a main that broke without a dmi-e2e PR to trigger it. The demo full-stack job stays
+  # gated to workflow_dispatch, so the nightly runs the fast suite only.
+  schedule:
+    - cron: '17 3 * * *'  # 03:17 UTC; off the hour, where GitHub's scheduler is least backed up
 
 concurrency:
   group: e2e-${{ github.ref }}
