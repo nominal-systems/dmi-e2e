@@ -272,8 +272,8 @@ ${reports.map(failuresBlock).join('\n')}`
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dmi-e2e runs</title>
 <style>
-  :root { color-scheme: light dark; --ok: #1a7f37; --bad: #cf222e; --muted: #6e7781; --line: #d0d7de; --badge-fg: #fff; }
-  @media (prefers-color-scheme: dark) { :root { --ok: #3fb950; --bad: #f85149; --muted: #8b949e; --line: #30363d; } }
+  :root { color-scheme: light dark; --ok: #1a7f37; --bad: #cf222e; --warn: #9a6700; --muted: #6e7781; --line: #d0d7de; --badge-fg: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --ok: #3fb950; --bad: #f85149; --warn: #d29922; --muted: #8b949e; --line: #30363d; } }
   body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; }
   h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
   .sub { color: var(--muted); margin: 0 0 1.5rem; }
@@ -292,6 +292,7 @@ ${reports.map(failuresBlock).join('\n')}`
   .failures li { margin: .75rem 0; }
   pre { background: rgba(127,127,127,.12); padding: .6rem .8rem; border-radius: .3rem; overflow-x: auto; font-size: .8rem; margin: .3rem 0 0; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  time.stale { color: var(--warn); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -299,9 +300,20 @@ ${reports.map(failuresBlock).join('\n')}`
 <p class="sub">Latest run of each suite. Index generated <time datetime="${generatedAt}">${generatedAt}</time>.</p>
 ${body}
 <script>
+  /* Relative age, so a stale green is LOUD: the page is static and ages after it is written, which
+   * is exactly when "PASSED" stops meaning anything — a run older than 36h (a nightly that missed,
+   * plus slack) renders amber. The absolute local time stays on hover. */
+  const STALE_MS = 36 * 3600 * 1000
   for (const t of document.querySelectorAll('time[datetime]')) {
     const d = new Date(t.getAttribute('datetime'))
-    if (!isNaN(d)) t.textContent = d.toLocaleString()
+    if (isNaN(d)) continue
+    const s = Math.round((Date.now() - d.getTime()) / 1000)
+    t.title = d.toLocaleString()
+    t.textContent = s < 60 ? 'just now'
+      : s < 3600 ? Math.round(s / 60) + 'm ago'
+      : s < 86400 ? Math.round(s / 3600) + 'h ago'
+      : Math.round(s / 86400) + 'd ago'
+    if (Date.now() - d.getTime() > STALE_MS) t.classList.add('stale')
   }
 </script>
 </body>
