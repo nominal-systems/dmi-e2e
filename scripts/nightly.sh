@@ -64,8 +64,30 @@ if [ -z "${GHP_TOKEN:-}" ]; then
   export GHP_TOKEN
 fi
 
+# --- Docker without its credential store ---------------------------------------------------------
+# Docker Desktop's credential helper (`credsStore: "desktop"` in ~/.docker/config.json) blocks forever
+# in open() when it runs under launchd with a non-Apple binary as an ancestor — node and python3
+# trigger it, bash and perl do not, and an interactive terminal never does. The docker CLI consults
+# it for every registry lookup, so under launchd every image build then dies resolving its base
+# image with "DeadlineExceeded" (reproduced 2026-09-09, Docker Desktop 4.88.1, macOS 26). Nothing
+# here needs registry credentials, so the CLI runs from a config that mirrors ~/.docker — the CLI
+# plugins (compose, buildx) and contexts are looked up relative to it — minus the credential store.
+docker_config_without_credstore() {
+  local src=$HOME/.docker dir=$LOG_DIR/docker-config
+  mkdir -p "$dir"
+  for d in cli-plugins contexts; do [ -e "$src/$d" ] && ln -sfn "$src/$d" "$dir/$d"; done
+  node -e '
+    const fs = require("fs"); let c = {}
+    try { c = JSON.parse(fs.readFileSync(process.argv[1], "utf8")) } catch {}
+    delete c.credsStore; delete c.credHelpers; c.auths = {}
+    fs.writeFileSync(process.argv[2], JSON.stringify(c, null, 2) + "\n")
+  ' "$src/config.json" "$dir/config.json" || return 1
+  export DOCKER_CONFIG=$dir
+}
+docker_config_without_credstore || log "could not prepare DOCKER_CONFIG — using ~/.docker as is"
+
 log "start — root=$ROOT suites=[$SUITES] pull=$PULL publish=$HARNESS_PUBLISH_REPORT log=$LOG"
-log "node $(node -v 2>&1) at $(command -v node || echo MISSING); docker $(command -v docker || echo MISSING); token $([ -n "${GHP_TOKEN:-}" ] && echo present || echo MISSING)"
+log "node $(node -v 2>&1) at $(command -v node || echo MISSING); docker $(command -v docker || echo MISSING) config=${DOCKER_CONFIG:-~/.docker}; token $([ -n "${GHP_TOKEN:-}" ] && echo present || echo MISSING)"
 
 cd "$ROOT" || exit 1
 

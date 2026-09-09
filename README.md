@@ -111,8 +111,12 @@ old.
   and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
   `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
   pruned. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
-  and `GHP_TOKEN` (from `gh auth token`) are resolved inside. Runnable by hand, e.g.
-  `NIGHTLY_SUITES=fast scripts/nightly.sh`.
+  and `GHP_TOKEN` (from `gh auth token`) are resolved inside. It also runs the docker CLI from a
+  `DOCKER_CONFIG` that mirrors `~/.docker` minus the credential store: under launchd, Docker
+  Desktop's `docker-credential-desktop` blocks forever when a non-Apple binary (node, python3) is
+  among its ancestors, and every image build then fails resolving its base image with
+  `DeadlineExceeded`. Nothing here needs registry credentials, so the helper is simply never
+  consulted. Runnable by hand, e.g. `NIGHTLY_SUITES=fast scripts/nightly.sh`.
 - [docs/launchd/com.nominal.dmi-e2e.nightly.plist](docs/launchd/com.nominal.dmi-e2e.nightly.plist)
   schedules it at 03:00 local time as a **user LaunchAgent** — not a daemon, not cron — because the
   job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
