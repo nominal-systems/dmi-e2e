@@ -29,6 +29,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
   /* Read from the mock's own /api/v1/ref/tests rather than hard-coded, so the code the harness
    * orders is by construction one the vendor advertises — and the mock now rejects anything else. */
   let serviceCode: string
+  /* The IVLS analyzer serial the mock's clinic owns, read from its device list. */
+  let deviceSerial: string
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.idexx.mockBaseUrl)
 
@@ -42,6 +44,16 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       'read the mock orderable-test catalogue',
     )
     serviceCode = catalogue.list[0].code
+
+    /* Ordered tests here are in-house (the catalogue says so), and since dmi-engine-idexx-integration
+     * issue #76 the integration reads that catalogue and REFUSES an in-house order that carries no IVLS
+     * device — as live IDEXX would. The order therefore names the analyzer, and the serial comes from
+     * the mock's own device list rather than a literal, so the scenario cannot drift from the mock. */
+    const devices = expectOk<{ ivlsDeviceList: Array<{ deviceSerialNumber: string }> }>(
+      await mock.get('/api/v1/ivls/devices'),
+      'read the mock IVLS device list',
+    )
+    deviceSerial = devices.ivlsDeviceList[0].deviceSerialNumber
 
     const root = ApiClient.create()
     /* Quickstart bootstrap: org -> idexx provider config whose orderingBaseUrl/resultBaseUrl point at
@@ -116,7 +128,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
     it('POST /orders creates the order via the real idexx integration (externalId assigned)', async () => {
-      const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
+      /* `devices` is dmi-api's list of device serial numbers; the integration maps each to an IDEXX
+       * `ivls` entry, and its device rule (see beforeAll) requires one for an in-house code. */
+      const payload = orderPayload(org.integrationId, {
+        testCodes: [{ code: serviceCode }],
+        devices: [deviceSerial],
+      })
       requisitionId = payload.requisitionId as string
 
       /* autoSubmitOrder=true drives the integration's confirmOrder browser handshake against the
@@ -139,7 +156,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * the mock's uiURL -> harvest the cookie -> XHR PUT. The mock flips the order to SUBMITTED only
        * on that PUT. (If confirmOrder ever regressed, the integration swallows the error and the order
        * would still be created — so this is asserted separately from loop closure below.) */
-      const received = expectOk<{ status: string, corporateRequisitionId: string, tests: string[] }>(
+      const received = expectOk<{
+        status: string
+        corporateRequisitionId: string
+        tests: string[]
+        ivls: string[]
+      }>(
         await mock.get(`/__control__/orders/${requisitionId}`),
         'read order from mock control plane',
       )
@@ -149,6 +171,11 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       /* The ordered test survived the mapping into IDEXX's dialect. The mock rejects an order whose
        * codes are outside its catalogue, so this also pins that the integration forwards them. */
       expect(received.tests).toEqual([serviceCode])
+      /* The device dmi-api was given is the device the vendor received: the integration's include
+       * branch kept it and mapped the serial into IDEXX's `ivls` shape. A dropped or renamed device is
+       * already a 400 at placement (the mock refuses a device-less in-house order); this pins the
+       * value that got through. */
+      expect(received.ivls).toEqual([deviceSerial])
     })
 
     it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {

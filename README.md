@@ -160,7 +160,10 @@ VetConnect Plus vendor. It speaks IDEXX's **public, documented dialect** (develo
 closely enough for the real integration to drive it unmodified:
 
 - **Ordering** (`/api/v1/*`): `POST /order`, `GET/DELETE /order/:id`, the external-orders poll, auth
-  validate, and reference data.
+  validate, and reference data — including the test catalogue (`/ref/tests`) and the clinic's one
+  IVLS analyzer (`/ivls/devices`). The integration reads the catalogue's `inHouse` flag to decide
+  whether an order must carry a device, and the mock enforces the same rule at placement: an
+  in-house order without an `ivls` serial, or with one the clinic does not own, is refused.
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
   integration issues to submit the order.
