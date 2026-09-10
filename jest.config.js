@@ -4,43 +4,31 @@
  *   - fast (default):      smoke + tenant-isolation, dmi-api alone under NODE_ENV=seed.
  *   - full-stack:          a real provider loop, dmi-api under a normal NODE_ENV against the real
  *                          engine/vendor stack. Selected by HARNESS_FULL_STACK=1; HARNESS_STACK then
- *                          picks WHICH loop — 'idexx' (default: idexx integration + VetConnect Plus
- *                          mock) runs scenarios/idexx-full-stack.e2e.ts; 'antech' (classic antech
- *                          integration + Antech mock) runs scenarios/antech-full-stack.e2e.ts;
- *                          'zoetis' (zoetis integration + Zoetis mock) runs
- *                          scenarios/zoetis-full-stack.e2e.ts; 'demo' (upstream-blocked) runs
- *                          scenarios/full-stack-smoke.e2e.ts.
+ *                          picks WHICH loop, by its key in the stack registry (src/stacks.js), which
+ *                          is also where each loop's scenario file is named.
  *
  * Only the selected project is included, so globalSetup/globalTeardown (which read env.fullStack /
  * env.stack to bring up the right containers and app env) run exactly once per run. Global options
  * (globalSetup, globalTeardown, maxWorkers, testTimeout, verbose) live at the root — jest ignores
  * them inside a project config; only test-selection options are per-project. Scoped to scenarios/ so
- * the helpers in src/ are never picked up as test files. */
+ * the helpers in src/ are never picked up as test files.
+ *
+ * This file is loaded before ts-jest exists, so it cannot import src/env.ts. It reads the same
+ * plain-JS registry env.ts does, and both resolve HARNESS_STACK through the registry's validator. */
+const path = require('path')
+const { resolveStack, stacks, suiteName } = require('./src/stacks')
+
 const fullStack =
   process.env.HARNESS_FULL_STACK === '1' ||
   (process.env.HARNESS_FULL_STACK ?? '').toLowerCase() === 'true'
-const requestedStack = (process.env.HARNESS_STACK ?? 'idexx').toLowerCase()
-const stack = ['demo', 'antech', 'zoetis'].includes(requestedStack) ? requestedStack : 'idexx'
-
-const scenarioForStack = {
-  demo: '<rootDir>/scenarios/full-stack-smoke.e2e.ts',
-  antech: '<rootDir>/scenarios/antech-full-stack.e2e.ts',
-  zoetis: '<rootDir>/scenarios/zoetis-full-stack.e2e.ts',
-  idexx: '<rootDir>/scenarios/idexx-full-stack.e2e.ts',
-}
-
-/* The two loops whose integrations hardcode their Bull poll interval to 30s with no env knob (idexx
- * exposes IDEXX_*_POLLING_INTERVAL_MS, which the harness dials down to ~3s). A result can sit for a
- * full interval before the engine picks it up, so their default per-test budget is raised to absorb
- * a missed tick rather than let a healthy-but-slow loop read as a hang. */
-const slowPollStacks = ['antech', 'zoetis']
+/* Throws on an unknown value. src/env.ts would refuse it anyway; refusing here too means a typo can
+ * never silently select the default loop. */
+const stack = resolveStack(process.env.HARNESS_STACK)
 
 /* Run report: reports/<suite>/index.html (jest-html-reporters, one self-contained file) plus
  * summary.json (src/report/summary-reporter.js) for the run index src/report/report.ts builds.
- * `suite` and the directory mirror env.suite / env.report.dir in src/env.ts — this file is loaded
- * before ts-jest, so it cannot import them. */
-const path = require('path')
-const suite = fullStack ? stack : 'fast'
+ * The directory mirrors env.report.dir in src/env.ts. */
+const suite = suiteName(fullStack, stack)
 const reportDir = path.join(
   path.resolve(process.env.HARNESS_REPORT_DIR || path.join(__dirname, 'reports')),
   suite,
@@ -65,7 +53,7 @@ const fastProject = {
 const fullStackProject = {
   ...projectCommon,
   displayName: `full-stack:${stack}`,
-  testMatch: [scenarioForStack[stack]],
+  testMatch: [`<rootDir>/${stacks[stack].scenario}`],
 }
 
 module.exports = {
@@ -90,7 +78,8 @@ module.exports = {
   ],
   /* Fast scenarios are quick; the full loop is ~6s vendor auto-complete + up to 10s poll + boot
    * slack. Individual full-stack tests set tighter per-test timeouts where they wait on the engine.
-   * The antech and zoetis loops are the slow ones — see slowPollStacks above. */
-  testTimeout: fullStack ? (slowPollStacks.includes(stack) ? 240_000 : 120_000) : 60_000,
+   * A loop whose integration hardcodes its poll interval (the registry's `slowPoll`) can leave a
+   * result waiting a full tick, so its default budget absorbs a missed one. */
+  testTimeout: fullStack ? (stacks[stack].slowPoll ? 240_000 : 120_000) : 60_000,
   projects: [fullStack ? fullStackProject : fastProject],
 }

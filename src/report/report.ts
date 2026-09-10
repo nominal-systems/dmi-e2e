@@ -13,6 +13,7 @@ import {
 } from 'fs'
 import * as path from 'path'
 import { env } from '../env'
+import { stacks } from '../stacks'
 
 /* Run reports.
  *
@@ -90,7 +91,7 @@ export interface SuiteReport {
 }
 
 /* The order suites are listed in; anything unknown sorts after, alphabetically. */
-const SUITE_ORDER = ['fast', 'idexx', 'antech', 'zoetis', 'demo']
+const SUITE_ORDER = ['fast', ...Object.keys(stacks)]
 const HISTORY_MAX = 60
 /* How many past runs the index draws per suite. */
 const HISTORY_SHOWN = 20

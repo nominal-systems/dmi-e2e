@@ -76,13 +76,16 @@ jobs:
 
       - name: Install harness dependencies
         working-directory: dmi-e2e
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       # dmi-api's .npmrc reads ${GHP_TOKEN} to resolve @nominal-systems/dmi-engine-common from
       # GitHub Packages; in CI the workflow's own GITHUB_TOKEN fills that role.
+      # `npm ci` here too: dmi-api's lockfile is what is under test. If this step fails, dmi-api's
+      # package-lock.json is out of sync with its package.json — surface that upstream rather than
+      # switching back to `npm install`, which would quietly test a different dependency tree.
       - name: Install dmi-api dependencies
         working-directory: dmi-api
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
         env:
           GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

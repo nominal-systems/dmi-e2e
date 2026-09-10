@@ -393,7 +393,7 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
-| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs: `idexx` (real idexx integration + VetConnect Plus mock), `antech` (real classic-antech integration + Antech mock), `zoetis` (real zoetis integration + Zoetis mock) or `demo` (upstream-blocked demo loop). |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech` (real classic-antech integration + Antech mock), `zoetis` (real zoetis integration + Zoetis mock) or `demo` (upstream-blocked demo loop). Anything else is refused. |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -461,6 +461,7 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               profile (redis + the demo vendor + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
+  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, integration checkout, mock endpoint, poll class)
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key

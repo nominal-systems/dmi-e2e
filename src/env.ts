@@ -1,5 +1,6 @@
 import { existsSync } from 'fs'
 import * as path from 'path'
+import { resolveStack, stacks, suiteName } from './stacks'
 
 /* Harness configuration, resolved once from process.env against defaults that match
  * docker-compose.yml. This repo has no dependency on dmi-api's source: it locates a dmi-api
@@ -23,6 +24,9 @@ function flag (name: string, fallback: boolean): boolean {
   if (value == null || value === '') return fallback
   return value === '1' || value.toLowerCase() === 'true'
 }
+
+/* A key of the stack registry (src/stacks.js) — derived from the registry, never restated. */
+export type StackName = keyof typeof stacks
 
 export interface MysqlEnv {
   host: string
@@ -54,12 +58,10 @@ export interface HarnessEnv {
    * provider loop (redis + a vendor + its integration), instead of the default fast suite
    * (NODE_ENV=seed, dmi-api alone). */
   fullStack: boolean
-  /* Which full-system loop HARNESS_FULL_STACK=1 runs: 'idexx' (the real idexx integration + the
-   * VetConnect Plus mock, the Phase 0 default), 'antech' (the real classic-antech integration + the
-   * Antech mock), 'zoetis' (the real zoetis integration + the Zoetis mock) or 'demo' (the
-   * pre-existing, upstream-blocked demo loop). Ignored unless fullStack is set. Each maps to its own
-   * compose profile and scenario file. */
-  stack: 'idexx' | 'antech' | 'zoetis' | 'demo'
+  /* Which full-system loop HARNESS_FULL_STACK=1 runs — a key of the stack registry in
+   * src/stacks.js, where a loop's scenario, compose profile, integration checkout and mock endpoint
+   * are defined. Ignored unless fullStack is set. */
+  stack: StackName
   /* Short name of the jest suite this invocation runs — 'fast', or the stack name under
    * HARNESS_FULL_STACK=1. Names the run's report directory (reports/<suite>/). */
   suite: string
@@ -153,28 +155,23 @@ export interface HarnessEnv {
 const harnessRoot = path.resolve(__dirname, '..')
 const host = str('HARNESS_HOST', '127.0.0.1')
 const appPort = int('HARNESS_APP_PORT', 3010)
-const demoProviderPort = int('HARNESS_DEMO_PROVIDER_PORT', 3011)
-const vcpMockPort = int('HARNESS_VCP_MOCK_PORT', 3012)
-const antechMockPort = int('HARNESS_ANTECH_MOCK_PORT', 3013)
-const zoetisMockPort = int('HARNESS_ZOETIS_MOCK_PORT', 3014)
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
 
-function stackChoice (): 'idexx' | 'antech' | 'zoetis' | 'demo' {
-  const value = str('HARNESS_STACK', 'idexx').toLowerCase()
-  if (value !== 'idexx' && value !== 'antech' && value !== 'zoetis' && value !== 'demo') {
-    throw new Error(`HARNESS_STACK must be 'idexx', 'antech', 'zoetis' or 'demo', got '${value}'`)
-  }
-  return value
-}
-
 const fullStack = flag('HARNESS_FULL_STACK', false)
-const stack = stackChoice()
+const stack = resolveStack(process.env.HARNESS_STACK)
+
+/* Host-facing base URL of a loop's mock (published port) — what its /status and /__control__ plane
+ * answer on. The registry names the variables; this resolves them, so the per-provider blocks
+ * below and the stack-agnostic readiness wait in containers.ts cannot disagree. */
+export function mockBaseUrlFor (stackName: StackName): string {
+  const { mock } = stacks[stackName]
+  return str(mock.urlVariable, `http://${host}:${int(mock.portVariable, mock.defaultPort)}${mock.pathPrefix}`)
+}
 
 function integrationCheckout (): { name: string, dir: string } | undefined {
   if (!fullStack) return undefined
-  const name = stack === 'demo' ? 'dmi-engine-demo-provider-integration' : `dmi-engine-${stack}-integration`
-  const variable = `DMI_${stack.toUpperCase()}_INTEGRATION_DIR`
-  return { name, dir: path.resolve(str(variable, path.join(harnessRoot, '..', name))) }
+  const { repo, dirVariable } = stacks[stack].integration
+  return { name: repo, dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))) }
 }
 
 export const env: HarnessEnv = {
@@ -207,7 +204,7 @@ export const env: HarnessEnv = {
   },
   fullStack,
   stack,
-  suite: fullStack ? stack : 'fast',
+  suite: suiteName(fullStack, stack),
   integration: integrationCheckout(),
   report: {
     /* Mirrored in jest.config.js, which is loaded before ts-jest and cannot import this module. */
@@ -216,11 +213,11 @@ export const env: HarnessEnv = {
     publishDir: path.resolve(str('HARNESS_REPORT_PUBLISH_DIR', '/opt/homebrew/var/www/dmi-e2e')),
   },
   demoProvider: {
-    baseUrl: str('HARNESS_DEMO_PROVIDER_URL', `http://${host}:${demoProviderPort}/demo`),
+    baseUrl: mockBaseUrlFor('demo'),
     internalUrl: str('HARNESS_DEMO_PROVIDER_INTERNAL_URL', 'http://dmi-demo-provider-api:3000/demo'),
   },
   idexx: {
-    mockBaseUrl: str('HARNESS_VCP_MOCK_URL', `http://${host}:${vcpMockPort}`),
+    mockBaseUrl: mockBaseUrlFor('idexx'),
     orderingBaseUrl: str('HARNESS_IDEXX_ORDERING_URL', 'http://vetconnect-mock:3000'),
     resultBaseUrl: str('HARNESS_IDEXX_RESULT_URL', 'http://vetconnect-mock:3000'),
     pimsId: str('HARNESS_IDEXX_PIMS_ID', 'dmi-e2e-harness'),
@@ -230,7 +227,7 @@ export const env: HarnessEnv = {
     locale: str('HARNESS_IDEXX_LOCALE', 'en'),
   },
   antech: {
-    mockBaseUrl: str('HARNESS_ANTECH_MOCK_URL', `http://${host}:${antechMockPort}`),
+    mockBaseUrl: mockBaseUrlFor('antech'),
     baseUrl: str('HARNESS_ANTECH_BASE_URL', 'http://antech-mock:3000'),
     uiBaseUrl: str('HARNESS_ANTECH_UI_BASE_URL', 'http://antech-mock:3000'),
     /* Antech documents this as a 3-4 letter PIMS identifier; it only ever appears in a generated
@@ -242,7 +239,7 @@ export const env: HarnessEnv = {
     labId: int('HARNESS_ANTECH_LAB_ID', 1),
   },
   zoetis: {
-    mockBaseUrl: str('HARNESS_ZOETIS_MOCK_URL', `http://${host}:${zoetisMockPort}`),
+    mockBaseUrl: mockBaseUrlFor('zoetis'),
     baseUrl: str('HARNESS_ZOETIS_BASE_URL', 'http://zoetis-mock:3000'),
     partnerId: str('HARNESS_ZOETIS_PARTNER_ID', 'harness-partner'),
     partnerPassword: str('HARNESS_ZOETIS_PARTNER_PASSWORD', 'harness-pass'),
