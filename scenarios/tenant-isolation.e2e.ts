@@ -157,37 +157,37 @@ describe('tenant isolation', () => {
   })
 
   describe('reports', () => {
-    /* DEFECT F2 — reports.controller.ts has no `@UseGuards(ApiGuard)` at class or method level,
+    /* Was DEFECT F2, FIXED in dmi-api #361 (issue #340) — reports.controller.ts has no `@UseGuards(ApiGuard)` at class or method level,
      * and there is no global guard (no APP_GUARD, no useGlobalGuards anywhere in dmi-api's src/).
      * All three /reports routes appear to be reachable with no credentials at all, despite
      * dmi-api's README "Mapped Routes" table listing them as API Key. */
-    it.failing('GET /reports/:id rejects a caller with no API key', async () => {
+    it('GET /reports/:id rejects a caller with no API key', async () => {
       const response = await ctx.anonymous.get(`/reports/${aReportId}`)
 
       expect([401, 403]).toContain(response.status)
     })
 
-    /* DEFECT F3 — reports.service.ts `getReport(id, _organization)` carries a literal
+    /* Was DEFECT F3, FIXED in dmi-api #361 (issue #340) — reports.service.ts `getReport(id, _organization)` carries a literal
      * "TODO(gb): actually check the user can access this report" and ignores the organization.
      * Independent of F2: adding a guard alone would not fix this. */
-    it.failing('GET /reports/:id denies org B', async () => {
+    it('GET /reports/:id denies org B', async () => {
       const response = await ctx.orgB.api.get(`/reports/${aReportId}`)
 
       expect([403, 404]).toContain(response.status)
     })
 
-    /* DEFECT F2 — `getPresentedForm(reportId)` does not even take an organization. This report
+    /* Was DEFECT F2, FIXED in dmi-api #361 (issue #340) — `getPresentedForm(reportId)` does not even take an organization. This report
      * has no attachments, so an unguarded app answers 404 ("presented form not found") rather
      * than 401; either way, a guarded app would answer 401 before reaching the service. */
-    it.failing('GET /reports/:id/presentedForm rejects a caller with no API key', async () => {
+    it('GET /reports/:id/presentedForm rejects a caller with no API key', async () => {
       const response = await ctx.anonymous.get(`/reports/${aReportId}/presentedForm`)
 
       expect([401, 403]).toContain(response.status)
     })
 
-    /* DEFECT F5 — orders.service.ts `getOrderReport(organization, orderId)` ignores its
+    /* Was DEFECT F5, FIXED in dmi-api #361 (issue #340) — orders.service.ts `getOrderReport(organization, orderId)` ignores its
      * `organization` argument and returns `reportsService.findForOrder(orderId)` outright. */
-    it.failing('GET /orders/:id/report denies org B', async () => {
+    it('GET /orders/:id/report denies org B', async () => {
       const response = await ctx.orgB.api.get(`/orders/${aOrderId}/report`)
 
       expect([403, 404]).toContain(response.status)
@@ -196,25 +196,40 @@ describe('tenant isolation', () => {
 
   /* Kept last: these mutate state on success, and on success they are the vulnerability. */
   describe('cross-tenant writes', () => {
-    /* DEFECT F4 — orders.controller.ts `createOrder` takes no `@Organization()`, and
+    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — orders.controller.ts `createOrder` takes no `@Organization()`, and
      * orders.service.ts resolves `createOrderDto.integrationId` with no ownership check. ApiGuard
      * authenticates the caller but nothing authorizes the integration being referenced. */
-    it.failing('POST /orders rejects org B targeting org A\'s integration', async () => {
+    it('POST /orders rejects org B targeting org A\'s integration', async () => {
       const response = await ctx.orgB.api.post('/orders', orderPayload(ctx.orgA.integrationId, { testCodes: ANY_TEST_CODE }))
 
       expect([403, 404]).toContain(response.status)
     })
 
-    /* DEFECT F4 — integrations.controller.ts `createIntegration` likewise takes no
+    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — integrations.controller.ts `createIntegration` likewise takes no
      * `@Organization()`; `providerConfigurationId` is never checked for ownership. On success,
      * org B has bound its own practice to org A's provider configuration — meaning org B's
      * subsequent orders would be placed against org A's lab account. */
-    it.failing('POST /integrations rejects org B targeting org A\'s provider configuration', async () => {
+    it('POST /integrations rejects org B targeting org A\'s provider configuration', async () => {
       const response = await ctx.orgB.api.post('/integrations', {
         practiceId: ctx.orgB.practiceId,
         providerConfigurationId: ctx.orgA.providerConfigurationId,
         integrationOptions: { apiKey: 'harness-cross-tenant' },
       })
+
+      expect([403, 404]).toContain(response.status)
+    })
+
+    /* Fixed in dmi-api #361 (issue #340) — regression guard. `PUT /providers/:providerId/
+     * configurations/:configId` overwrote ANY config's encrypted credentials and reassigned its
+     * `organization` FK, with no ownership check — so org B, knowing org A's config id, could both
+     * repoint org A's provider credentials and steal the config into its own org. The body is
+     * untyped, and ownership is checked before validation, so this reaches the authorization path.
+     * Now scoped: a non-owned config is refused before any write. */
+    it('PUT /providers/:id/configurations/:id denies org B overwriting org A\'s config', async () => {
+      const response = await ctx.orgB.api.put(
+        `/providers/demo/configurations/${ctx.orgA.providerConfigurationId}`,
+        { configuration: { url: 'http://cross-tenant.invalid' } },
+      )
 
       expect([403, 404]).toContain(response.status)
     })
