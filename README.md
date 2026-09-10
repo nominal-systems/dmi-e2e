@@ -105,7 +105,8 @@ old.
 
 - [scripts/nightly.sh](scripts/nightly.sh) is the run. It fast-forwards this checkout, the dmi-api
   checkout and the three integration checkouts (ff-only; a checkout that cannot fast-forward is
-  tested as it stands, and the report's "under test" column says so), makes sure Docker Desktop is
+  tested as it stands, and the report's "under test" column says so — and they need **ssh
+  remotes**, because launchd has no credential source for https), makes sure Docker Desktop is
   up, then runs `fast`, `idexx`, `antech` and `zoetis` in turn with `HARNESS_PUBLISH_REPORT=1`. A
   red suite does not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed
   and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
