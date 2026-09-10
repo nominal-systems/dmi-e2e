@@ -293,6 +293,9 @@ ${reports.map(failuresBlock).join('\n')}`
   pre { background: rgba(127,127,127,.12); padding: .6rem .8rem; border-radius: .3rem; overflow-x: auto; font-size: .8rem; margin: .3rem 0 0; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   time.stale { color: var(--warn); font-weight: 700; }
+  time .abs { color: var(--muted); font-size: .85em; margin-left: .45em; }
+  time .abs::before { content: '· '; }
+  time.stale .abs { color: inherit; }
 </style>
 </head>
 <body>
@@ -300,19 +303,25 @@ ${reports.map(failuresBlock).join('\n')}`
 <p class="sub">Latest run of each suite. Index generated <time datetime="${generatedAt}">${generatedAt}</time>.</p>
 ${body}
 <script>
-  /* Relative age, so a stale green is LOUD: the page is static and ages after it is written, which
-   * is exactly when "PASSED" stops meaning anything — a run older than 36h (a nightly that missed,
-   * plus slack) renders amber. The absolute local time stays on hover. */
+  /* Relative age first, so a stale green is LOUD: the page is static and ages after it is written,
+   * which is exactly when "PASSED" stops meaning anything — a run older than 36h (a nightly that
+   * missed, plus slack) renders amber. The absolute time follows, in the viewer's own timezone —
+   * the ISO text in the markup is what a viewer without JavaScript sees. */
   const STALE_MS = 36 * 3600 * 1000
   for (const t of document.querySelectorAll('time[datetime]')) {
     const d = new Date(t.getAttribute('datetime'))
     if (isNaN(d)) continue
     const s = Math.round((Date.now() - d.getTime()) / 1000)
-    t.title = d.toLocaleString()
-    t.textContent = s < 60 ? 'just now'
+    const rel = document.createElement('span')
+    rel.textContent = s < 60 ? 'just now'
       : s < 3600 ? Math.round(s / 60) + 'm ago'
       : s < 86400 ? Math.round(s / 3600) + 'h ago'
       : Math.round(s / 86400) + 'd ago'
+    const abs = document.createElement('span')
+    abs.className = 'abs'
+    abs.textContent = d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    t.title = d.toLocaleString()
+    t.replaceChildren(rel, abs)
     if (Date.now() - d.getTime() > STALE_MS) t.classList.add('stale')
   }
 </script>

@@ -8,11 +8,17 @@
 # Knobs (all optional):
 #   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech zoetis)
 #   NIGHTLY_PULL          1 to fast-forward every checkout first, 0 to test what is there (default 1)
+#   NIGHTLY_BRANCH        branch this checkout must be on for an unattended run (default main): a
+#                         clean checkout on another branch is switched, a dirty one makes the run
+#                         refuse — a stray topic branch must never run unattended. Ignored when
+#                         NIGHTLY_PULL=0 (that is the "test what is here" mode).
+#   NIGHTLY_TOKEN_FILE    file holding the GitHub Packages token (default ~/.config/dmi-e2e/token),
+#                         so the job can run on a token scoped to read:packages alone
 #   NIGHTLY_SUITE_TIMEOUT seconds before a suite is killed  (default 2400)
 #   NIGHTLY_LOG_DIR       where the dated logs go            (default ~/Library/Logs/dmi-e2e)
 #   NIGHTLY_LOG_KEEP_DAYS logs older than this are pruned    (default 14)
 #   HARNESS_PUBLISH_REPORT  forced to 1 unless set — publishing is the point of this script
-#   GHP_TOKEN             taken from `gh auth token` when unset
+#   GHP_TOKEN             when unset: NIGHTLY_TOKEN_FILE if present, else `gh auth token`
 #
 # The whole body is one brace group so bash parses it completely before running a line of it —
 # the pull below may rewrite this very file mid-run.
@@ -23,6 +29,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOG_DIR=${NIGHTLY_LOG_DIR:-$HOME/Library/Logs/dmi-e2e}
 SUITES=${NIGHTLY_SUITES:-fast idexx antech zoetis}
 PULL=${NIGHTLY_PULL:-1}
+BRANCH=${NIGHTLY_BRANCH:-main}
+TOKEN_FILE=${NIGHTLY_TOKEN_FILE:-$HOME/.config/dmi-e2e/token}
 SUITE_TIMEOUT=${NIGHTLY_SUITE_TIMEOUT:-2400}
 KEEP_DAYS=${NIGHTLY_LOG_KEEP_DAYS:-14}
 LOCK=$LOG_DIR/nightly.lock
@@ -59,8 +67,16 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
   nvm use default >/dev/null 2>&1 || true
 fi
 export HARNESS_PUBLISH_REPORT=${HARNESS_PUBLISH_REPORT:-1}
+# The token only has to read GitHub Packages (dmi-api's and the integrations' @nominal-systems
+# dependencies); the checkouts are pulled over ssh. Prefer a dedicated read:packages token in
+# TOKEN_FILE over the developer's full `gh` login.
+token_source=env
 if [ -z "${GHP_TOKEN:-}" ]; then
-  GHP_TOKEN=$(gh auth token 2>/dev/null || true)
+  if [ -s "$TOKEN_FILE" ]; then
+    GHP_TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE"); token_source=$TOKEN_FILE
+  else
+    GHP_TOKEN=$(gh auth token 2>/dev/null || true); token_source="gh auth token"
+  fi
   export GHP_TOKEN
 fi
 
@@ -87,7 +103,7 @@ docker_config_without_credstore() {
 docker_config_without_credstore || log "could not prepare DOCKER_CONFIG — using ~/.docker as is"
 
 log "start — root=$ROOT suites=[$SUITES] pull=$PULL publish=$HARNESS_PUBLISH_REPORT log=$LOG"
-log "node $(node -v 2>&1) at $(command -v node || echo MISSING); docker $(command -v docker || echo MISSING) config=${DOCKER_CONFIG:-~/.docker}; token $([ -n "${GHP_TOKEN:-}" ] && echo present || echo MISSING)"
+log "node $(node -v 2>&1) at $(command -v node || echo MISSING); docker $(command -v docker || echo MISSING) config=${DOCKER_CONFIG:-~/.docker}; token $([ -n "${GHP_TOKEN:-}" ] && echo "from $token_source" || echo MISSING)"
 
 cd "$ROOT" || exit 1
 
@@ -126,7 +142,25 @@ pull() {
   fi
 }
 
+# An unattended run executes whatever it pulls, as this user, on this machine. Pin it to one branch
+# so a topic branch left checked out here never runs at 03:00.
+ensure_branch() {
+  local current
+  current=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)
+  [ "$current" = "$BRANCH" ] && return 0
+  if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+    log "checkout is on '$current' with local changes — refusing to switch to '$BRANCH'; not running"
+    return 1
+  fi
+  if ! git -C "$ROOT" switch --quiet "$BRANCH" 2>&1; then
+    log "could not switch from '$current' to '$BRANCH' — not running"
+    return 1
+  fi
+  log "switched checkout from '$current' to '$BRANCH'"
+}
+
 if [ "$PULL" = 1 ]; then
+  ensure_branch || exit 1
   lock_before=$(shasum package-lock.json 2>/dev/null)
   pull "$ROOT"
   if [ "$(shasum package-lock.json 2>/dev/null)" != "$lock_before" ]; then

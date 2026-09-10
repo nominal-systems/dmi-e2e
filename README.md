@@ -111,7 +111,11 @@ old.
   red suite does not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed
   and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
   `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
-  pruned. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
+  pruned. An unattended run executes whatever it pulls, so it is pinned to `main`
+  (`NIGHTLY_BRANCH`): a clean checkout on another branch is switched there first, a dirty one makes
+  the run refuse. The GitHub Packages token is read from `~/.config/dmi-e2e/token`
+  (`NIGHTLY_TOKEN_FILE`) when that file exists — a token scoped to `read:packages` alone is all the
+  job needs, since the checkouts are pulled over ssh — and from `gh auth token` otherwise. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
   and `GHP_TOKEN` (from `gh auth token`) are resolved inside. It also runs the docker CLI from a
   `DOCKER_CONFIG` that mirrors `~/.docker` minus the credential store: under launchd, Docker
   Desktop's `docker-credential-desktop` blocks forever when a non-Apple binary (node, python3) is
@@ -122,8 +126,7 @@ old.
   schedules it at 03:00 local time as a **user LaunchAgent** — not a daemon, not cron — because the
   job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
   nginx directory. `scripts/nightly-install.sh` renders the template for this checkout, writes it to
-  `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that. The job runs whatever branch
-  the checkout is on.
+  `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that.
 
 ```bash
 scripts/nightly-install.sh                                  # install / reinstall
