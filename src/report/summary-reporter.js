@@ -1,7 +1,7 @@
 'use strict'
 
 /* A jest reporter that writes `<outputDir>/summary.json` when the run completes: counts, timing,
- * and the failed tests with the first lines of their messages. It is the data the run index
+ * every test with its status and duration, and the failed tests with the first lines of their messages. It is the data the run index
  * (src/report/report.ts) renders next to the jest-html-reporters page, so a red is legible from
  * the index without opening the full report.
  *
@@ -27,9 +27,19 @@ class SummaryReporter {
 
   onRunComplete (_contexts, results) {
     const failures = []
+    const tests = []
     for (const file of results.testResults) {
       const relativeFile = path.relative(process.cwd(), file.testFilePath)
       for (const test of file.testResults) {
+        /* Every test, not just the failed ones: the index lists what a green run actually checked. */
+        tests.push({
+          name: test.fullName,
+          title: test.title,
+          ancestors: test.ancestorTitles,
+          file: relativeFile,
+          status: test.status,
+          durationMs: test.duration == null ? null : Math.round(test.duration),
+        })
         if (test.status !== 'failed') continue
         failures.push({
           name: test.fullName,
@@ -73,6 +83,7 @@ class SummaryReporter {
       todo: results.numTodoTests,
       suitesFailedToRun: results.numRuntimeErrorTestSuites,
       failures,
+      tests,
     }
 
     fs.mkdirSync(this.outputDir, { recursive: true })

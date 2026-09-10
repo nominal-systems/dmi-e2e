@@ -72,9 +72,15 @@ Every run leaves an HTML report behind, whatever the suite and whether it went g
 
 ```
 reports/
-  index.html          one row per suite: result, counts, duration, when, what was under test
+  index.html          a status banner, then one row per suite: result, counts, test and wall
+                      duration, when, the last 20 runs as a strip, what was under test (with a
+                      "changed" tag on anything that moved since the previous run, and commit
+                      links), plus a per-test list per suite; failures inline
   <suite>/index.html  the full jest-html-reporters page (self-contained; open it from file://)
   <suite>/summary.json, <suite>/run.json   the data the index is built from
+  <suite>/history.json  one entry per run this directory has seen (capped), for the strip and
+                      "last red"; written at setup as incomplete, upgraded at teardown, and merged
+                      — never replaced — when publishing
 ```
 
 `<suite>` is `fast`, or the `HARNESS_STACK` name under `HARNESS_FULL_STACK=1`. Each run overwrites
