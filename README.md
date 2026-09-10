@@ -96,6 +96,45 @@ never fails the run: the suite's exit code is the suite's, not the reporter's.
 Nothing is published unless the flag is set, so a developer's local run never writes outside the
 repo; on their machine the `reports/` files open straight from the filesystem.
 
+### Nightly runs on the mac mini
+
+GitHub Actions reruns every suite nightly (`schedule:` in the four workflows) to catch upstream
+drift, but a cloud run leaves no report anywhere you can open. The mac mini therefore runs the same
+four suites itself each night and publishes each one, so the served index is never more than a day
+old.
+
+- [scripts/nightly.sh](scripts/nightly.sh) is the run. It fast-forwards this checkout, the dmi-api
+  checkout and the three integration checkouts (ff-only; a checkout that cannot fast-forward is
+  tested as it stands, and the report's "under test" column says so — and they need **ssh
+  remotes**, because launchd has no credential source for https), makes sure Docker Desktop is
+  up, then runs `fast`, `idexx`, `antech` and `zoetis` in turn with `HARNESS_PUBLISH_REPORT=1`. A
+  red suite does not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed
+  and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
+  `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
+  pruned. An unattended run executes whatever it pulls, so it is pinned to `main`
+  (`NIGHTLY_BRANCH`): a clean checkout on another branch is switched there first, a dirty one makes
+  the run refuse. The GitHub Packages token is read from `~/.config/dmi-e2e/token`
+  (`NIGHTLY_TOKEN_FILE`) when that file exists — a token scoped to `read:packages` alone is all the
+  job needs, since the checkouts are pulled over ssh — and from `gh auth token` otherwise. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
+  and `GHP_TOKEN` (from `gh auth token`) are resolved inside. It also runs the docker CLI from a
+  `DOCKER_CONFIG` that mirrors `~/.docker` minus the credential store: under launchd, Docker
+  Desktop's `docker-credential-desktop` blocks forever when a non-Apple binary (node, python3) is
+  among its ancestors, and every image build then fails resolving its base image with
+  `DeadlineExceeded`. Nothing here needs registry credentials, so the helper is simply never
+  consulted. Runnable by hand, e.g. `NIGHTLY_SUITES=fast scripts/nightly.sh`.
+- [docs/launchd/com.nominal.dmi-e2e.nightly.plist](docs/launchd/com.nominal.dmi-e2e.nightly.plist)
+  schedules it at 03:00 local time as a **user LaunchAgent** — not a daemon, not cron — because the
+  job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
+  nginx directory. `scripts/nightly-install.sh` renders the template for this checkout, writes it to
+  `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that.
+
+```bash
+scripts/nightly-install.sh                                  # install / reinstall
+launchctl print gui/$UID/com.nominal.dmi-e2e.nightly        # state, last exit, next run
+launchctl kickstart gui/$UID/com.nominal.dmi-e2e.nightly    # run it now
+tail -f ~/Library/Logs/dmi-e2e/nightly-*.log                # follow
+```
+
 ### Full-system mode
 
 The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1` selects a second
@@ -431,6 +470,10 @@ src/
   global-setup.ts             orchestration, once per run
   global-teardown.ts          teardown, once per run
 docs/nginx/dmi-e2e.conf       the nginx location block that serves the published reports
+docs/launchd/*.plist          the nightly LaunchAgent for the mac mini (template; scripts/nightly-install.sh renders it)
+scripts/
+  nightly.sh                  every suite in turn, each report published — what the LaunchAgent runs
+  nightly-install.sh          render + load (or --uninstall) the LaunchAgent on this machine
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite

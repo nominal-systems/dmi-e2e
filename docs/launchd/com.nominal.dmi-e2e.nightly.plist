@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  dmi-e2e nightly — runs scripts/nightly.sh every night at 03:00 local time as the logged-in user.
+
+  Template: __REPO__ and __LOGS__ are filled in by scripts/nightly-install.sh, which writes the
+  rendered file to ~/Library/LaunchAgents and bootstraps it. A user LaunchAgent (not a daemon,
+  not cron) because the job needs what only the login session has: Docker Desktop, the `gh` token
+  and write access to the nginx directory. A job missed while the machine slept fires on wake.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nominal.dmi-e2e.nightly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/nightly.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- Only what escapes before the script redirects itself into its dated log. -->
+  <key>StandardOutPath</key>
+  <string>__LOGS__/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGS__/launchd.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
