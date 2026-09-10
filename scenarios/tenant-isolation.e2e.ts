@@ -131,11 +131,12 @@ describe('tenant isolation', () => {
   })
 
   describe('events', () => {
-    /* DEFECT F1 — events.service.ts `getEventsForOrganization` accepts an `organization` argument
-     * and never reads it; the Mongo filter is `{ seq: { $gt: seq } }` and nothing more. Any valid
-     * API key appears to read every tenant's events, and `event.data` for `order:created` embeds
-     * the full order (patient name, client name, veterinarian). Remove `.failing` once scoped. */
-    it.failing('GET /events does not expose another organization\'s events', async () => {
+    /* Was DEFECT F1 (cross-tenant event exposure): `getEventsForOrganization` ignored its
+     * `organization` argument — the Mongo filter was `{ seq: { $gt: seq } }` and nothing more — so
+     * any valid API key read every tenant's events, and `event.data` for `order:created` embeds the
+     * full order (patient, client, veterinarian names). FIXED: events are now scoped to the
+     * requesting org's practices (`practiceId: { $in: ... }`). Kept as a plain regression guard. */
+    it('GET /events does not expose another organization\'s events', async () => {
       const response = await ctx.orgB.api.get('/events', { start_seq: 0 })
 
       expect(response.status).toBe(200)
@@ -143,10 +144,11 @@ describe('tenant isolation', () => {
       expect(practiceIds).not.toContain(ctx.orgA.practiceId)
     })
 
-    /* DEFECT F1 (same root cause) — events.controller.ts computes `total` from
-     * `eventsService.count(query)` with that same unscoped query, so the count leaks too.
-     * Org A owns one order:created event; org B owns none. */
-    it.failing('GET /events does not count another organization\'s events', async () => {
+    /* Was DEFECT F1 (same root cause): the controller computed `total` from an unscoped
+     * `count(query)`, so the count leaked even when the data didn't. FIXED alongside the data query
+     * (both now run the practice-scoped filter). Org A owns one order:created event; org B owns
+     * none. Regression guard. */
+    it('GET /events does not count another organization\'s events', async () => {
       const forA = await ctx.orgA.api.get('/events', { start_seq: 0 })
       const forB = await ctx.orgB.api.get('/events', { start_seq: 0 })
 
