@@ -65,7 +65,7 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   species/sex/breed from its canonical refs to provider codes before handing it to the engine, and
   falls back to forwarding the raw string when nothing resolves — so a scenario that places an order
   with a non-ref string exercises no mapping and cannot detect one breaking. Place with the canonical
-  ref code (look it up over `GET /refs/*`; dmi's codes are opaque UUIDs), assert the **provider's**
+  ref code (look it up by name over `GET /refs/*` — `lookupRefCode()` in `src/refs.ts`; dmi's codes are opaque UUIDs), assert the **provider's**
   vocabulary arrived at the mock, and make sure the two strings differ. Which fields are mapped at
   all varies: check the provider's `provider_ref` rows, not just its reference endpoints.
 - **Watch element multiplicity in XML dialects.** Where an integration calls `.find`/`.filter`/`.map`
