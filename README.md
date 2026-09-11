@@ -466,6 +466,7 @@ src/
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
+  refs.ts                     canonical dmi ref codes looked up by name over GET /refs/*, for the ref-mapping value assertions
   idexx-mock/server.js        the VetConnect Plus mock vendor (zero-dependency Node HTTP server)
   antech-mock/server.js       the Antech mock vendor (zero-dependency Node HTTP server)
   zoetis-mock/server.js       the Zoetis mock vendor (zero-dependency Node HTTP server)
