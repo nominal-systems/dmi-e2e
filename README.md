@@ -461,7 +461,7 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               profile (redis + the demo vendor + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
-  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, integration checkout, mock endpoint, poll class)
+  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, integration checkout, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name (every run does too, at start)
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
