@@ -10,7 +10,8 @@
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "noEmit": true
+    "noEmit": true,
+    "allowJs": true
   },
   "include": ["src/**/*.ts", "scenarios/**/*.ts"],
   "exclude": ["node_modules"]
