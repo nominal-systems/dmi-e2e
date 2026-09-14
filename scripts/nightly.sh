@@ -164,14 +164,21 @@ if [ "$PULL" = 1 ]; then
   lock_before=$(shasum package-lock.json 2>/dev/null)
   pull "$ROOT"
   if [ "$(shasum package-lock.json 2>/dev/null)" != "$lock_before" ]; then
-    log "package-lock.json changed — npm install"
-    npm install --no-audit --no-fund >/dev/null 2>&1 || log "npm install failed (continuing)"
+    log "package-lock.json changed — npm ci"
+    npm ci --no-audit --no-fund >/dev/null 2>&1 || log "npm ci failed (continuing)"
   fi
   pull "${DMI_API_DIR:-$ROOT/../dmi-api}"
   for s in $SUITES; do
     [ "$s" = fast ] && continue
-    var="DMI_$(echo "$s" | tr '[:lower:]' '[:upper:]')_INTEGRATION_DIR"
-    pull "${!var:-$ROOT/../dmi-engine-$s-integration}"
+    # The registry (src/stacks.js, freshly pulled above) owns each loop's checkout: its repo name
+    # and the variable that overrides the location. A suite it does not know stops the run here,
+    # named, rather than pulling a guessed path — and nothing is derived from the key, so a key
+    # with a hyphen is fine.
+    if ! read -r repo var < <(node "$ROOT/src/stacks.js" integration "$s"); then
+      log "suite '$s' is not in src/stacks.js — not running"
+      exit 1
+    fi
+    pull "${!var:-$ROOT/../$repo}"
   done
 fi
 

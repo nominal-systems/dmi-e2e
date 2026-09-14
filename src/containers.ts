@@ -1,6 +1,7 @@
 import { spawn } from 'child_process'
 import * as net from 'net'
-import { appEnv, env, requireDmiApiDir } from './env'
+import { appEnv, env, mockBaseUrlFor, requireDmiApiDir } from './env'
+import { stacks } from './stacks'
 import { waitForMysql } from './sql'
 
 /* Lifecycle for the dependency stack (MySQL, Mongo, ActiveMQ) and for dmi-api's schema
@@ -100,14 +101,11 @@ async function waitForTcp (
 }
 
 /* Full-system services live behind compose profiles, so the default fast suite brings up only
- * MySQL/Mongo/ActiveMQ. Each full-system loop has its own profile: `idexx` (redis + the VetConnect
- * Plus mock + the real idexx integration), `antech` (redis + the Antech mock + the real classic
- * antech integration), `zoetis` (redis + the Zoetis mock + the real zoetis integration) and
- * `full-stack` (redis + the demo vendor + its MySQL + the demo integration).
- * `--profile` is a top-level flag and must precede the subcommand. */
+ * MySQL/Mongo/ActiveMQ. Each full-system loop has its own profile (redis + its mock + its real
+ * integration), named by the stack registry. `--profile` is a top-level flag and must precede the
+ * subcommand. */
 function composeProfile (): string {
-  if (env.stack === 'demo') return 'full-stack'
-  return env.stack
+  return stacks[env.stack].composeProfile
 }
 
 function composeBaseArgs (): string[] {
@@ -171,15 +169,8 @@ export async function waitForDependencies (): Promise<void> {
      * mints an API key from the demo vendor. Redis and the integration containers have no
      * harness-facing endpoint — their broker/queue clients reconnect on their own and the scenario's
      * completion wait absorbs their start. */
-    if (env.stack === 'demo') {
-      await waitForHttpOk(`${env.demoProvider.baseUrl}/status`, 'demo-provider-api', depsReadyMs)
-    } else if (env.stack === 'antech') {
-      await waitForHttpOk(`${env.antech.mockBaseUrl}/status`, 'antech-mock', depsReadyMs)
-    } else if (env.stack === 'zoetis') {
-      await waitForHttpOk(`${env.zoetis.mockBaseUrl}/status`, 'zoetis-mock', depsReadyMs)
-    } else {
-      await waitForHttpOk(`${env.idexx.mockBaseUrl}/status`, 'vetconnect-mock', depsReadyMs)
-    }
+    const { mock } = stacks[env.stack]
+    await waitForHttpOk(`${mockBaseUrlFor(env.stack)}/status`, mock.label, depsReadyMs)
   }
 }
 

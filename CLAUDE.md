@@ -92,7 +92,10 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   others hardcode ~30s. Budget scenario timeouts for at least one full poll tick and don't mistake
   the wait for a hang.
 - Reuse the shared foundation (`HARNESS_STACK` selector, compose profiles, `src/seed.ts`,
-  `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider.
+  `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider. **A new
+  loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile,
+  integration checkout, mock endpoint, poll class) plus its compose profile, scenario and workflow —
+  never another `if (env.stack === …)`; everything that varies by stack reads the registry.
 
 ## Data hygiene — this repo is public, and history is permanent
 

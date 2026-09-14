@@ -11,7 +11,8 @@
     "test": "jest",
     "test:harness": "jest",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint \"{src,scenarios}/**/*.ts\"",
+    "lint": "eslint \"{src,scenarios}/**/*.ts\" src/stacks.js",
+    "check:stacks": "node src/stacks.js check",
     "report:publish": "ts-node --transpile-only src/report/publish.ts"
   },
   "devDependencies": {

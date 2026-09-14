@@ -23,7 +23,8 @@ on:
     paths:
       # The harness plumbing, the VetConnect Plus mock and the broker config all live under src/.
       - 'src/**'
-      - 'scenarios/idexx-full-stack.e2e.ts'
+      # A glob, not the exact file: a renamed scenario must keep triggering this workflow.
+      - 'scenarios/idexx*.e2e.ts'
       - 'docker-compose.yml'
       - 'jest.config.js'
       - 'tsconfig.json'
@@ -110,11 +111,14 @@ jobs:
 
       - name: Install harness dependencies
         working-directory: dmi-e2e
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
+      # `npm ci` here too: dmi-api's lockfile is what is under test. If this step fails, dmi-api's
+      # package-lock.json is out of sync with its package.json — surface that upstream rather than
+      # switching back to `npm install`, which would quietly test a different dependency tree.
       - name: Install dmi-api dependencies
         working-directory: dmi-api
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
         env:
           GHP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
