@@ -61,7 +61,7 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   identifier becomes a free choice. Read the mapper **before** copying an existing scenario; the
   wrong choice strands orders at `SUBMITTED` forever. Background:
   [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334).
-- - **Ref-mapped fields need value assertions, or they are not tested at all.** dmi-api maps an
+- **Ref-mapped fields need value assertions, or they are not tested at all.** dmi-api maps an
   order's species/sex/breed from its canonical refs to provider codes before handing it to the
   engine, and falls back to forwarding the raw string when nothing resolves — so a scenario that
   places an order with a non-ref string exercises no mapping and cannot detect one breaking. Place
