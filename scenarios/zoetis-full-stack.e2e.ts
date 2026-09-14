@@ -1,6 +1,7 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
+import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
@@ -113,22 +114,6 @@ const BREED = 'Labrador Retriever'
  * so the element (and its pass-through) was uncovered. */
 const BIRTHDATE = '2020-01-15'
 
-interface RefItem { code: string, name: string }
-
-/* Resolve a canonical dmi ref code by its human-readable name. Throws loudly rather than returning
- * undefined: if the seed data ever stops carrying this ref, the scenario must fail at setup with a
- * message that says so, not place an order with `undefined` and fail somewhere confusing. */
-function refCodeByName (items: RefItem[], name: string, kind: string): string {
-  const matches = items.filter((item) => item.name === name)
-  if (matches.length !== 1) {
-    throw new Error(
-      `expected exactly one dmi ${kind} ref named '${name}', found ${matches.length}. ` +
-        'dmi-api\'s ref seed data has changed; pick another ref whose zoetis code differs from its own.',
-    )
-  }
-  return matches[0].code
-}
-
 describe('zoetis full-stack (Zoetis mock)', () => {
   let org: SeededOrg
   let admin: ApiClient
@@ -209,11 +194,9 @@ describe('zoetis full-stack (Zoetis mock)', () => {
     })
 
     /* Resolve the canonical ref codes the order will carry, over HTTP with the org's own API key —
-     * the same route an integrator would use to discover them. */
-    const species = expectOk<{ items: RefItem[] }>(await org.api.get('/refs/species'), 'list dmi species refs')
-    const sexes = expectOk<{ items: RefItem[] }>(await org.api.get('/refs/sexes'), 'list dmi sex refs')
-    speciesRefCode = refCodeByName(species.items, SPECIES_REF_NAME, 'species')
-    sexRefCode = refCodeByName(sexes.items, SEX_REF_NAME, 'sex')
+     * the same route an integrator would use to discover them (src/refs.ts). */
+    speciesRefCode = await lookupRefCode(org.api, 'species', SPECIES_REF_NAME)
+    sexRefCode = await lookupRefCode(org.api, 'sexes', SEX_REF_NAME)
 
     /* Start the integration so it schedules its Bull results/orders polling. dmi-api's admin start
      * emits `zoetis/integration/create` to the engine, which the integration handles by adding the
