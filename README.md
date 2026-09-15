@@ -218,8 +218,9 @@ touches a live Zoetis host. What differs from the other two:
   format — so element *multiplicity* is load-bearing in several places. See "The Zoetis mock" below.
 - **It has two acknowledge channels**, and the scenario asserts both: results ack as a batch, orders
   ack one at a time by POSTing to an `href` the order-status document itself advertises.
-- **Its species and sex really are ref-mapped**, which makes it the first loop where the scenario can
-  assert dmi-api's ref mapping end to end. See "Full-system findings".
+- **Its species and sex really are ref-mapped**, which made it the first loop where the scenario could
+  assert dmi-api's ref mapping end to end; the antech loop now does the same for species, sex and
+  breed. See "Full-system findings".
 
 **Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
 because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api
@@ -617,6 +618,11 @@ confirmed to interoperate with the current dmi-api. What the third provider taug
   `MALE_NEUTERED` — with the mock enforcing both. Input and expected output are deliberately
   different strings, so a no-op mapping fails loudly. Verified: pointing the order at a species with
   no zoetis mapping makes the mock reject placement with `'<uuid>' is not a Zoetis species code`.
+  The antech loop now does the same — and for **all three** fields, because antech maps breeds too
+  (numeric BreedIDs, from the ~1,100 dog-breed rows dmi-api's migrations seed): `Canis familiaris`,
+  `Male Sterilized`, `Labrador Retriever` in, `41` / `CM` / `130` at the mock, numeric ids as numbers.
+  The antech mock echoes these rather than validating them, so there the scenario assertion is the
+  whole guard: with an unmapped species the raw dmi code reaches the mock and the assertion names it.
 - **Zoetis breeds cannot be ref-mapped at all.** dmi-api seeds 1307 zoetis breed `provider_ref` rows
   and **every one has a NULL `code`** (the other three providers have none) — consistent with the
   integration's `getBreeds` being a no-op, since Zoetis publishes no breed catalogue. So a breed that
@@ -656,11 +662,11 @@ the order lands in `ERROR`).
   interval env-configurable would be a small change in each integration repo and would cut this
   suite's runtime substantially — a possible team follow-up, out of scope here (both repos are
   read-only).
-- **Only the zoetis loop asserts dmi-api's ref mapping.** The idexx and antech scenarios place orders
-  with species/sex/breed strings that are not dmi ref codes, so the mapping no-ops and their
-  assertions cover forwarding only (see "Full-system findings"). Porting the zoetis approach — place
-  with canonical ref codes, assert the provider vocabulary at the mock — would close that gap for
-  them, but it is a change to another provider's scenario and belongs in its own PR.
+- **Only the idexx loop still bypasses dmi-api's ref mapping.** It places orders with species/sex/breed
+  strings that are not dmi ref codes, so the mapping no-ops and its assertions cover forwarding only
+  (see "Full-system findings"); zoetis and antech assert the mapped values. Porting the same approach
+  — place with canonical ref codes via `lookupRefCode`, assert the provider vocabulary at the mock —
+  closes that gap; it is a change to that provider's scenario and belongs in its own PR.
 - **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
   results. Both mock-backed scenarios avoid this by stopping their integration in `afterAll` (removing

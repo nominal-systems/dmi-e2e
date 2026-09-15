@@ -491,12 +491,15 @@ async function handleOrderPlacement (req, res) {
     petAge: payload.PetAge ?? 0,
     petAgeUnits: String(payload.PetAgeUnits ?? 'Y'),
     /* Species/Breed arrive as whatever dmi-api's antech ref mapping produced for the order's
-     * species/breed (a numeric antech code when mapped, the raw code when not). Echoed back
-     * unchanged; the names below are cosmetic labels for the XML. */
+     * species/breed (a numeric antech code when mapped, the raw dmi code when not). Stored and
+     * echoed back unchanged — the mock never validates them; the SCENARIO pins the mapped values.
+     * The names are Antech's own labels for the ids it does know (genuine catalogue data, the same
+     * rows dmi-api's migrations map to), so the result document's names agree with its ids rather
+     * than labelling every BreedID "Labrador Retriever"; an id outside the map is still accepted. */
     speciesId: payload.SpeciesID,
     breedId: payload.BreedID,
-    speciesName: 'Canine',
-    breedName: 'Labrador Retriever',
+    speciesName: ({ 41: 'Canine', 42: 'Feline', 45: 'Bovine' })[payload.SpeciesID] ?? `Unknown species (${payload.SpeciesID})`,
+    breedName: ({ 130: 'Labrador Retriever' })[payload.BreedID] ?? `Unknown breed (${payload.BreedID})`,
     clientId: payload.ClientID != null ? String(payload.ClientID) : null,
     clientFirstName: String(payload.ClientFirstName ?? ''),
     clientLastName: String(payload.ClientLastName),
@@ -669,6 +672,11 @@ function publicOrder (order) {
     petName: order.petName,
     petId: order.petId,
     clientLastName: order.clientLastName,
+    /* The ref-mapped patient fields exactly as the integration sent them (numeric ids as numbers),
+     * so the scenario can pin that dmi-api's antech mapping produced them. */
+    petSex: order.petSex,
+    speciesId: order.speciesId,
+    breedId: order.breedId,
     placedAt: order.placedAt.toISOString(),
   }
 }
@@ -736,9 +744,9 @@ const routes = [
       Category: service.category,
     })))],
   ['GET', new RegExp(`^${API}/Pets/Breeds$`), (req, res) =>
-    sendJson(res, 200, [{ ID: 124, Name: 'Labrador Retriever', SpeciesId: 41 }])],
+    sendJson(res, 200, [{ ID: 130, Name: 'Labrador Retriever', SpeciesId: 41 }])],
   ['GET', new RegExp(`^${API}/Pets/Species$`), (req, res) =>
-    sendJson(res, 200, [{ ID: 41, Name: 'Canine', Breed: { ID: 124, Name: 'Labrador Retriever' } }])],
+    sendJson(res, 200, [{ ID: 41, Name: 'Canine', Breed: { ID: 130, Name: 'Labrador Retriever' } }])],
 
   /* The service catalogue, so a test orders a code the mock will actually accept instead of
    * hard-coding a literal that can drift out of step with it. */
