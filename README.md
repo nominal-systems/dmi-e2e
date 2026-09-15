@@ -498,23 +498,24 @@ general-purpose real-services suite for the platform). That first pass immediate
 distinct places where dmi-api's isolation or auth is missing. **None are fixed here** — that is out
 of scope, and they want a considered fix plus a data-exposure review, not a drive-by patch.
 
-Each finding has a test that asserts the *correct* behaviour and is marked `it.failing`. That keeps
-CI green while the defect exists, and turns the test red the moment someone fixes it — at which
-point the `.failing` marker should be deleted in the same commit.
+Each finding has a test that asserts the *correct* behaviour. While the defect is open the test is
+marked `it.failing`: that keeps CI green while the defect exists, and turns the test red the moment
+someone fixes it — at which point the `.failing` marker is deleted in the same commit and the test
+stays on as a plain regression guard. F2–F5 have reached that stage (dmi-api #361).
 
 | # | Route | Defect | Observed | Status |
 |---|---|---|---|---|
 | F1 | `GET /events` | `getEventsForOrganization` takes an `organization` and never reads it. Returns **every tenant's** events. | org B → **200**, sees org A's events; counts identical | **CONFIRMED** |
-| F2 | `GET /reports/*` | `ReportsController` has **no guard**, and there is no global guard. Reachable **unauthenticated**. | anon → **200** | **CONFIRMED** |
-| F3 | `GET /reports/:id` | `getReport(id, _organization)` ignores the organization (has a `TODO` admitting it). | org B → **200** | **CONFIRMED** |
-| F4 | `POST /orders`, `POST /integrations` | Neither takes an `@Organization()`; referenced IDs are never checked for ownership. Cross-tenant **writes**. | org B → **201 Created** | **CONFIRMED** |
-| F5 | `GET /orders/:id/report` | `getOrderReport(organization, orderId)` ignores the organization. | org B → **200** | **CONFIRMED** |
+| F2 | `GET /reports/*` | `ReportsController` had **no guard**, and there is no global guard. Was reachable **unauthenticated**. | anon → **200** | **FIXED** in dmi-api #361; guarded |
+| F3 | `GET /reports/:id` | `getReport(id, _organization)` ignored the organization (had a `TODO` admitting it). | org B → **200** | **FIXED** in dmi-api #361; guarded |
+| F4 | `POST /orders`, `POST /integrations`, `PUT /providers/:id/configurations/:id` | None took an `@Organization()`; referenced IDs were never checked for ownership. Cross-tenant **writes**. | org B → **201 Created** / **200** | **FIXED** in dmi-api #361; guarded |
+| F5 | `GET /orders/:id/report` | `getOrderReport(organization, orderId)` ignored the organization. | org B → **200** | **FIXED** in dmi-api #361; guarded |
 | F6 | `POST /users`, `GET /users` | HTTP Basic auth is unregistered: `BasicStrategy` is in no module's `providers`, so Passport has no `basic` strategy. | any → **500** "Unknown authentication strategy 'basic'" | **CONFIRMED** |
 
 **SUSPECTED** = read from dmi-api source. **CONFIRMED** = reproduced by this suite against a running
-app. As of the last run, **all six are CONFIRMED** — the suite executed end-to-end against a live
-dmi-api and every defect reproduced with the status codes above. The `HARNESS_IMPLEMENTATION_PLAN.md`
-log records the full probe output.
+app. **FIXED** = closed upstream, and the test now runs as a plain guard that fails if the defect
+returns. All six were CONFIRMED end-to-end against a live dmi-api with the status codes above; the
+`HARNESS_IMPLEMENTATION_PLAN.md` log records the full probe output. F1 and F6 remain open.
 
 F1 is the most serious: `GET /events` is reachable with any valid API key, and `event.data` for an
 `order:created` event embeds the whole order — patient name, client name, veterinarian. F2 needs no
