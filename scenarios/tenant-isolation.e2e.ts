@@ -10,7 +10,9 @@ import { closePool, insertReport } from '../src/sql'
  *   - it FAILS the moment someone fixes the defect, forcing the marker to be removed.
  *
  * That is deliberate. These are not snapshots of current behaviour; they are the expectations,
- * with a tripwire attached. Each one names the defect. See README.md — do not "fix" a red build
+ * with a tripwire attached. Each one names the defect. Once a defect is fixed upstream the marker
+ * comes off and the test stays as a plain regression guard (the reports and cross-tenant-write
+ * tests below, fixed in dmi-api #361, are the first). See README.md — do not "fix" a red build
  * here by relaxing an assertion. */
 
 /* `orderPayload` takes no default test code — every vendor rejects codes outside its own catalogue,
@@ -57,10 +59,10 @@ describe('tenant isolation', () => {
       expect(response.body.map((order: { id: string }) => order.id)).toContain(aOrderId)
     })
 
-    /* Load-bearing. Without it, a bad fixture (a report that was never inserted) would make the
-     * `it.failing` report tests below "pass" for the wrong reason: they would see a 404 for a
-     * nonexistent id, throw, and `failing` would call that success. This assertion holds both
-     * today and after F2/F3 are fixed, so it pins the fixture without enshrining the defect. */
+    /* Load-bearing. Without it, a bad fixture (a report that was never inserted) would let the
+     * report guards below pass for the wrong reason: a 404 for a nonexistent id satisfies
+     * `[403, 404]` just as well as a genuine refusal does. This assertion pins the fixture, so a
+     * refusal below means ownership was actually checked. */
     it('the seeded report exists and its owner can read it', async () => {
       const response = await ctx.orgA.api.get(`/reports/${aReportId}`)
 
