@@ -66,10 +66,10 @@ const HEMOLYSIS_INDEX = '1003'
  * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
  * the harness never runs the ref sync. They seed antech species (Canine 41, Feline 42, Bovine 45 and
  * the exotic species), sex codes (Male Sterilized -> CM, Female Sterilized -> SF, ...), and ~1,100
- * dog-breed mappings from Antech's own breed catalogue — each dmi breed ref is created from the
- * catalogue name with a mnemonic code (Labrador Retriever -> LABRADOR_RETRIEVER), and antech's
- * numeric BreedID hangs off it (130). Numeric antech ids arrive as numbers: the integration
- * parseInt()s an all-digit code before sending it. */
+ * dog-breed mappings from Antech's own breed catalogue. Every dmi breed ref carries an opaque UUID
+ * code shared across providers (which is why the lookup is by name), and antech's numeric BreedID
+ * hangs off it as a provider ref: Labrador Retriever -> 130. Numeric antech ids arrive as numbers:
+ * the integration parseInt()s an all-digit code before sending it. */
 const SPECIES_REF_NAME = 'Canis familiaris'
 const EXPECTED_ANTECH_SPECIES = 41
 const SEX_REF_NAME = 'Male Sterilized'

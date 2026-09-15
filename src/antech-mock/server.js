@@ -744,9 +744,9 @@ const routes = [
       Category: service.category,
     })))],
   ['GET', new RegExp(`^${API}/Pets/Breeds$`), (req, res) =>
-    sendJson(res, 200, [{ ID: 124, Name: 'Labrador Retriever', SpeciesId: 41 }])],
+    sendJson(res, 200, [{ ID: 130, Name: 'Labrador Retriever', SpeciesId: 41 }])],
   ['GET', new RegExp(`^${API}/Pets/Species$`), (req, res) =>
-    sendJson(res, 200, [{ ID: 41, Name: 'Canine', Breed: { ID: 124, Name: 'Labrador Retriever' } }])],
+    sendJson(res, 200, [{ ID: 41, Name: 'Canine', Breed: { ID: 130, Name: 'Labrador Retriever' } }])],
 
   /* The service catalogue, so a test orders a code the mock will actually accept instead of
    * hard-coding a literal that can drift out of step with it. */
