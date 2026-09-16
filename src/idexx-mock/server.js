@@ -360,9 +360,9 @@ function sendInvalidOrder (res, problems) {
  *
  * The codes are IDEXX's own: its PIMS Ordering API spec enumerates a per-field MISSING_* family
  * (MISSING_PATIENT, MISSING_VETERINARIAN, MISSING_TESTS, MISSING_IVLS_SERIAL_NUMBER, ...) and has no
- * generic "required field" code, so a refusal here names the field the way the vendor would. The
+ * generic "required field" code, so a refusal here names the field the way the provider would. The
  * spec's enum stops at the patient as a whole — it lists no code for a patient that arrived without
- * a name or species, though the vendor's live vocabulary is broader than the spec's list — so an
+ * a name or species, though the provider's live vocabulary is broader than the spec's list — so an
  * incomplete patient is MISSING_PATIENT with the message naming what is absent. `index` is carried
  * where the live endpoint was seen to carry it (an offending test, by its position) and, by the same
  * convention, on the other array-member problems; the scalar ones carry none. dmi-api validates
@@ -659,7 +659,7 @@ function controlOrderView (order) {
     confirmedAt: order.confirmedAt,
     tests: order.tests,
     /* The IVLS serial(s) the integration attached — or none, when it stripped them from an
-     * all-reference-lab order — so the scenario can pin that the device the vendor received is
+     * all-reference-lab order — so the scenario can pin that the device the provider received is
      * exactly the one the rule says it should. */
     ivls: (order.ivls ?? []).map((device) => device.serialNumber),
     /* The patient's species/breed/sex codes exactly as the integration sent them, so the scenario

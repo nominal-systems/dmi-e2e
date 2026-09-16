@@ -93,7 +93,7 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   catalogue flags are therefore load-bearing: pick codes by flag, never by position. The two halves
   are guarded differently, on purpose. The Include half the mock enforces too, so the integration's
   kill switch (`IDEXX_DEVICE_RULE_ENABLED`) cannot quietly turn the check off. The Exclude half it
-  does **not** — whether the vendor tolerates a device on a reference-lab order is unverified, so a
+  does **not** — whether the provider tolerates a device on a reference-lab order is unverified, so a
   refusal would be invention — which leaves the scenario's control-plane assertion (device sent,
   `ivls` empty) as the only detector on that side. Read the order's device serial from the mock's
   `/ivls/devices`, never a literal.

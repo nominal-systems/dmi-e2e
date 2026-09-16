@@ -242,7 +242,7 @@ closely enough for the real integration to drive it unmodified:
   the `inHouse` flag to decide whether an order must carry a device, and the mock enforces the
   in-house half at placement: an in-house order without an `ivls` serial, or with one the clinic does
   not own, is refused. The reference-lab half — the integration strips the devices it was given — is
-  echoed, not enforced: the vendor's tolerance of a device on such an order is unverified, so the
+  echoed, not enforced: the provider's tolerance of a device on such an order is unverified, so the
   scenario pins the empty device list at the control plane instead.
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the

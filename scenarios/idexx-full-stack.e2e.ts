@@ -20,7 +20,7 @@ import { closePool } from '../src/sql'
  * test seeds a result there, the integration maps it and emits `external_results` (-> report) and
  * `external_order_results` (-> order COMPLETED) back to dmi-api, then acks the batch. */
 
-/* The three patient fields dmi-api ref-maps on the way to the vendor, as (canonical dmi ref name ->
+/* The three patient fields dmi-api ref-maps on the way to the provider, as (canonical dmi ref name ->
  * the IDEXX code it must arrive as). idexx maps all three: species and sex to IDEXX's upper-case
  * mnemonics, breed to a breed mnemonic.
  *
@@ -29,10 +29,10 @@ import { closePool } from '../src/sql'
  * vocabulary, pinned as literals here. Input and expected output are deliberately different values:
  * if the idexx provider_ref rows stopped resolving, mapPatientRefs falls back to forwarding the raw
  * code, the mock — which echoes species/breed/sex and does not validate them — stores the raw code,
- * and the value assertion below goes red naming it, instead of a well-formed order the real vendor
+ * and the value assertion below goes red naming it, instead of a well-formed order the real provider
  * would reject.
  *
- * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
+ * Which rows exist is a property of dmi-api's migrations, not of anything synced from the provider —
  * the harness never runs the ref sync. They seed idexx species (CANINE, FELINE, ...), sex codes
  * (Male Sterilized -> MALE_NEUTERED, Female Sterilized -> FEMALE_SPAYED, ...) and ~1,100 dog-breed
  * mappings keyed by the canonical breed's UUID: Labrador Retriever -> LABRADOR_RETRIEVER. */
@@ -51,7 +51,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
   let requisitionId: string
   let reportId: string
   /* Read from the mock's own /api/v1/ref/tests rather than hard-coded, so the codes the harness
-   * orders are by construction ones the vendor advertises — and the mock rejects anything else. One
+   * orders are by construction ones the provider advertises — and the mock rejects anything else. One
    * in-house code (the loop's order) and one reference-lab code (the device rule's Exclude branch),
    * each picked by its `inHouse` flag rather than by position: the flag is what the integration
    * classifies the order by, so the scenario must not assume which entry is which. */
@@ -265,9 +265,9 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       )
 
       /* THE POINT OF THIS TEST. species, breed and sex are the only order fields dmi-api transforms
-       * on the way to the vendor, and they must arrive in IDEXX's vocabulary. Asserting the exact
+       * on the way to the provider, and they must arrive in IDEXX's vocabulary. Asserting the exact
        * mapped values is what makes a silently broken ref mapping fail here, naming the raw code
-       * that got through, instead of producing a well-formed order the real vendor would reject.
+       * that got through, instead of producing a well-formed order the real provider would reject.
        * The mock echoes these and never validates them, so this assertion is the only thing between
        * a mapping regression and a green run. */
       expect(received.speciesCode).toBe(EXPECTED_IDEXX_SPECIES)
@@ -368,9 +368,9 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     })
   })
 
-  describe('the device rule, Exclude branch: a reference-lab-only order reaches the vendor without a device', () => {
+  describe('the device rule, Exclude branch: a reference-lab-only order reaches the provider without a device', () => {
     /* The loop above executes the rule's Include half (an in-house order must carry a device), and
-     * there the mock enforces the vendor's side too. This is the OTHER half: the integration reads the
+     * there the mock enforces the provider's side too. This is the OTHER half: the integration reads the
      * catalogue, classifies an all-reference-lab order as Exclude, and STRIPS whatever devices the
      * PIMS sent before placement. Nothing enforces that half at the mock — whether live IDEXX would
      * even object to a device on a reference-lab order has never been probed, so a mock refusal would
@@ -408,14 +408,14 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
       expect(received.status).toBe('SUBMITTED')
       expect(received.tests).toEqual([referenceLabCode])
-      /* THE POINT OF THIS TEST: the device dmi-api was given must NOT reach the vendor. `[]`, not
+      /* THE POINT OF THIS TEST: the device dmi-api was given must NOT reach the provider. `[]`, not
        * "falsy": a mock that fabricated a device here, or an integration that forwarded the one it
        * should have dropped, both fail naming the serial. */
       expect(received.ivls).toEqual([])
     })
   })
 
-  describe("a refused order surfaces the vendor's error, not a generic fallback", () => {
+  describe("a refused order surfaces the provider's error, not a generic fallback", () => {
     /* The happy path never touches the integration's error path. The mock answers a refused order
      * the way the live endpoint does — an INVALID_ORDER entry, then the field-level entries under
      * IDEXX's own codes — and the integration's providerErrorMapper reads that envelope's
@@ -427,7 +427,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       /* An unknown code takes the device rule's Passthrough branch (the integration forwards whatever
        * devices the PIMS sent), reaches the mock, and is refused there as INVALID_LAB_SERVICE_ID with
        * the code in the message — the one refusal dmi-api cannot intercept first, since it does not
-       * know the vendor's catalogue. A separate order (its own requisitionId) that lands ERROR in
+       * know the provider's catalogue. A separate order (its own requisitionId) that lands ERROR in
        * dmi-api, so it does not perturb the loop asserted above. */
       const payload = refMappedOrderPayload({
         testCodes: [{ code: 'NOT-A-REAL-IDEXX-CODE' }],
@@ -440,7 +440,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       )
 
       expect(response.ok).toBe(false)
-      /* The vendor's code and the mock's message both reach dmi-api's errors[], which proves the
+      /* The provider's code and the mock's message both reach dmi-api's errors[], which proves the
        * mapper read the envelope. Its fallbacks must NOT fire: "… failed with <status> status code"
        * appears when the envelope is unreadable, "undefined error in idexx" when it is keyed `code`
        * instead of `errorCode`. */
@@ -451,11 +451,11 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     }, 30_000)
 
     it("the mock refuses an empty order with IDEXX's per-field codes, under its INVALID_ORDER entry", async () => {
-      /* Driven at the mock's vendor-facing API directly, the way the tests above read its catalogue
+      /* Driven at the mock's provider-facing API directly, the way the tests above read its catalogue
        * and device list: dmi-api validates every required field itself before an order reaches the
        * engine, so no path through the stack can make the integration send an empty order — these
        * refusals exist for an integration that drops a field it was given. This pins the vocabulary
-       * and shape they would surface with, so a drift from the vendor's codes is visible somewhere. */
+       * and shape they would surface with, so a drift from the provider's codes is visible somewhere. */
       const response = await mock.post('/api/v1/order', {})
 
       expect(response.status).toBe(400)
