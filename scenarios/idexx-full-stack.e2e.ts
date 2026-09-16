@@ -1,7 +1,8 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
-import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
+import { lookupRefCode } from '../src/refs'
+import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
 /* Phase 0 full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
@@ -19,6 +20,29 @@ import { closePool } from '../src/sql'
  * test seeds a result there, the integration maps it and emits `external_results` (-> report) and
  * `external_order_results` (-> order COMPLETED) back to dmi-api, then acks the batch. */
 
+/* The three patient fields dmi-api ref-maps on the way to the vendor, as (canonical dmi ref name ->
+ * the IDEXX code it must arrive as). idexx maps all three: species and sex to IDEXX's upper-case
+ * mnemonics, breed to a breed mnemonic.
+ *
+ * dmi's canonical codes are opaque UUIDs, so each is looked up BY NAME over `GET /refs/*`
+ * (src/refs.ts) and sent as the order's species/sex/breed; what must arrive at the mock is IDEXX's
+ * vocabulary, pinned as literals here. Input and expected output are deliberately different values:
+ * if the idexx provider_ref rows stopped resolving, mapPatientRefs falls back to forwarding the raw
+ * code, the mock — which echoes species/breed/sex and does not validate them — stores the raw code,
+ * and the value assertion below goes red naming it, instead of a well-formed order the real vendor
+ * would reject.
+ *
+ * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
+ * the harness never runs the ref sync. They seed idexx species (CANINE, FELINE, ...), sex codes
+ * (Male Sterilized -> MALE_NEUTERED, Female Sterilized -> FEMALE_SPAYED, ...) and ~1,100 dog-breed
+ * mappings keyed by the canonical breed's UUID: Labrador Retriever -> LABRADOR_RETRIEVER. */
+const SPECIES_REF_NAME = 'Canis familiaris'
+const EXPECTED_IDEXX_SPECIES = 'CANINE'
+const SEX_REF_NAME = 'Male Sterilized'
+const EXPECTED_IDEXX_SEX = 'MALE_NEUTERED'
+const BREED_REF_NAME = 'Labrador Retriever'
+const EXPECTED_IDEXX_BREED = 'LABRADOR_RETRIEVER'
+
 describe('idexx full-stack (VetConnect Plus mock)', () => {
   let org: SeededOrg
   let admin: ApiClient
@@ -26,26 +50,60 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
   let externalId: string
   let requisitionId: string
   let reportId: string
-  /* Read from the mock's own /api/v1/ref/tests rather than hard-coded, so the code the harness
-   * orders is by construction one the vendor advertises — and the mock now rejects anything else. */
+  /* Read from the mock's own /api/v1/ref/tests rather than hard-coded, so the codes the harness
+   * orders are by construction ones the vendor advertises — and the mock rejects anything else. One
+   * in-house code (the loop's order) and one reference-lab code (the device rule's Exclude branch),
+   * each picked by its `inHouse` flag rather than by position: the flag is what the integration
+   * classifies the order by, so the scenario must not assume which entry is which. */
   let serviceCode: string
+  let referenceLabCode: string
   /* The IVLS analyzer serial the mock's clinic owns, read from its device list. */
   let deviceSerial: string
+  /* Canonical dmi ref codes for the order's species/sex/breed, resolved by name at setup — see the
+   * ref-mapping constants above. */
+  let speciesRefCode: string
+  let sexRefCode: string
+  let breedRefCode: string
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.idexx.mockBaseUrl)
+
+  /* An order payload whose patient carries the canonical dmi ref codes. The default patient is kept
+   * and only its species/sex/breed replaced — NOT a `patient:` override, which would replace the
+   * whole default and silently drop the `pims:patient:id` identifier this loop's reconciliation
+   * depends on (see orderPayload). Without it dmi-api's matching guard sees a different patient id
+   * on the result, reconciles it into a fresh orphan order, and this one stays SUBMITTED: a red
+   * that looks like a broken result loop but is a broken payload. */
+  function refMappedOrderPayload (overrides: OrderPayloadOverrides): Record<string, unknown> {
+    const payload = orderPayload(org.integrationId, overrides)
+    payload.patient = {
+      ...(payload.patient as Record<string, unknown>),
+      sex: sexRefCode,
+      species: speciesRefCode,
+      breed: breedRefCode,
+    }
+    return payload
+  }
 
   beforeAll(async () => {
     /* A fresh container starts clean; reset is only load-bearing for warm reruns (HARNESS_KEEP_UP),
      * where it clears the previous run's seeded orders/results. Harmless on a cold start. */
     await mock.post('/__control__/reset').catch(() => undefined)
 
-    const catalogue = expectOk<{ list: Array<{ code: string }> }>(
+    const catalogue = expectOk<{ list: Array<{ code: string, inHouse: boolean }> }>(
       await mock.get('/api/v1/ref/tests'),
       'read the mock orderable-test catalogue',
     )
-    serviceCode = catalogue.list[0].code
+    const codeWhere = (inHouse: boolean): string => {
+      const entry = catalogue.list.find((service) => service.inHouse === inHouse)
+      if (entry == null) {
+        throw new Error(`the mock catalogue advertises no ${inHouse ? 'in-house' : 'reference-lab'} test code; both halves of the device rule need one`)
+      }
+      return entry.code
+    }
+    serviceCode = codeWhere(true)
+    referenceLabCode = codeWhere(false)
 
-    /* Ordered tests here are in-house (the catalogue says so), and since dmi-engine-idexx-integration
+    /* The loop's ordered test is in-house (the catalogue says so), and since dmi-engine-idexx-integration
      * issue #76 the integration reads that catalogue and REFUSES an in-house order that carries no IVLS
      * device — as live IDEXX would. The order therefore names the analyzer, and the serial comes from
      * the mock's own device list rather than a literal, so the scenario cannot drift from the mock. */
@@ -74,6 +132,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         locale: env.idexx.locale,
       },
     })
+
+    /* Resolve the canonical ref codes the order will carry, over HTTP with the org's own API key —
+     * the same route an integrator would use to discover them (src/refs.ts). */
+    speciesRefCode = await lookupRefCode(org.api, 'species', SPECIES_REF_NAME)
+    sexRefCode = await lookupRefCode(org.api, 'sexes', SEX_REF_NAME)
+    breedRefCode = await lookupRefCode(org.api, 'breeds', BREED_REF_NAME)
 
     /* Start the integration so it schedules its Bull results/orders polling. dmi-api's admin start
      * emits `idexx/integration/create` to the engine, which the integration handles by adding the
@@ -124,13 +188,29 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(org.providerConfigurationId).toBeTruthy()
       expect(org.integrationId).toBeTruthy()
     })
+
+    /* Guards the mapping assertions below against passing for the wrong reason: the codes the order
+     * is placed with must resolve, and must not already BE the IDEXX codes — otherwise "the IDEXX
+     * code arrived" would hold with the mapping switched off. */
+    it('the dmi refs the order will be placed with resolve, and are not already the IDEXX codes', () => {
+      expect(speciesRefCode).toBeTruthy()
+      expect(sexRefCode).toBeTruthy()
+      expect(breedRefCode).toBeTruthy()
+      expect(speciesRefCode).not.toBe(EXPECTED_IDEXX_SPECIES)
+      expect(sexRefCode).not.toBe(EXPECTED_IDEXX_SEX)
+      expect(breedRefCode).not.toBe(EXPECTED_IDEXX_BREED)
+    })
   })
 
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
     it('POST /orders creates the order via the real idexx integration (externalId assigned)', async () => {
       /* `devices` is dmi-api's list of device serial numbers; the integration maps each to an IDEXX
-       * `ivls` entry, and its device rule (see beforeAll) requires one for an in-house code. */
-      const payload = orderPayload(org.integrationId, {
+       * `ivls` entry, and its device rule (see beforeAll) requires one for an in-house code.
+       *
+       * species/sex/breed are canonical dmi ref codes, NOT IDEXX codes: dmi-api maps all three to
+       * the IDEXX vocabulary on the way to the engine, and a test below asserts the mapped values
+       * arrived. */
+      const payload = refMappedOrderPayload({
         testCodes: [{ code: serviceCode }],
         devices: [deviceSerial],
       })
@@ -176,6 +256,23 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * already a 400 at placement (the mock refuses a device-less in-house order); this pins the
        * value that got through. */
       expect(received.ivls).toEqual([deviceSerial])
+    })
+
+    it('the mock received the order with the REF-MAPPED species, breed and sex, not the raw dmi codes', async () => {
+      const received = expectOk<{ speciesCode: string, breedCode: string, genderCode: string }>(
+        await mock.get(`/__control__/orders/${requisitionId}`),
+        'read order from mock control plane',
+      )
+
+      /* THE POINT OF THIS TEST. species, breed and sex are the only order fields dmi-api transforms
+       * on the way to the vendor, and they must arrive in IDEXX's vocabulary. Asserting the exact
+       * mapped values is what makes a silently broken ref mapping fail here, naming the raw code
+       * that got through, instead of producing a well-formed order the real vendor would reject.
+       * The mock echoes these and never validates them, so this assertion is the only thing between
+       * a mapping regression and a green run. */
+      expect(received.speciesCode).toBe(EXPECTED_IDEXX_SPECIES)
+      expect(received.breedCode).toBe(EXPECTED_IDEXX_BREED)
+      expect(received.genderCode).toBe(EXPECTED_IDEXX_SEX)
     })
 
     it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {
@@ -268,6 +365,53 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(Array.from(types)).toEqual(
         expect.arrayContaining(['order:created', 'order:updated', 'report:created', 'report:updated']),
       )
+    })
+  })
+
+  describe('the device rule, Exclude branch: a reference-lab-only order reaches the vendor without a device', () => {
+    /* The loop above executes the rule's Include half (an in-house order must carry a device), and
+     * there the mock enforces the vendor's side too. This is the OTHER half: the integration reads the
+     * catalogue, classifies an all-reference-lab order as Exclude, and STRIPS whatever devices the
+     * PIMS sent before placement. Nothing enforces that half at the mock — whether live IDEXX would
+     * even object to a device on a reference-lab order has never been probed, so a mock refusal would
+     * be invention — which makes this assertion the only detector of the branch being skipped: by a
+     * regression, or by someone flipping the integration's IDEXX_DEVICE_RULE_ENABLED kill switch off.
+     *
+     * So the order DELIBERATELY sends the device (input ≠ expected output, the same falsifiability
+     * pattern as the ref-mapping test) and pins that none arrived. Placement-scoped: no result is
+     * seeded — the mock stamps every result with an IVLS run summary, which a reference-lab result
+     * would not carry — and it is a separate order (its own requisitionId), so it does not perturb
+     * the loop asserted above. */
+    let referenceLabRequisitionId: string
+
+    it('POST /orders with a reference-lab code AND a device is accepted', async () => {
+      const payload = refMappedOrderPayload({
+        testCodes: [{ code: referenceLabCode }],
+        devices: [deviceSerial],
+      })
+      referenceLabRequisitionId = payload.requisitionId as string
+
+      const created = expectOk<{ id: string, externalId: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place idexx reference-lab order',
+      )
+
+      expect(created.id).toBeTruthy()
+      expect(created.externalId).toBeTruthy()
+    }, 30_000)
+
+    it('the mock received the reference-lab test and NO device: the integration stripped the one it was given', async () => {
+      const received = expectOk<{ status: string, tests: string[], ivls: string[] }>(
+        await mock.get(`/__control__/orders/${referenceLabRequisitionId}`),
+        'read reference-lab order from mock control plane',
+      )
+
+      expect(received.status).toBe('SUBMITTED')
+      expect(received.tests).toEqual([referenceLabCode])
+      /* THE POINT OF THIS TEST: the device dmi-api was given must NOT reach the vendor. `[]`, not
+       * "falsy": a mock that fabricated a device here, or an integration that forwarded the one it
+       * should have dropped, both fail naming the serial. */
+      expect(received.ivls).toEqual([])
     })
   })
 })

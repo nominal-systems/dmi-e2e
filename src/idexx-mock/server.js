@@ -241,10 +241,15 @@ function buildResult (order, overrides) {
       clientId: client.id || '',
       clientFirstName: client.firstName,
       clientLastName: client.lastName,
-      genderName: 'Male',
-      speciesCode: patient.speciesCode || 'CANINE',
-      speciesName: 'Canine',
-      breedName: patient.breedCode || 'Labrador Retriever',
+      /* IDEXX results carry NAMES for sex/species/breed where the order carried CODES. The codes
+       * arrive as whatever dmi-api's idexx ref mapping produced (IDEXX's own vocabulary when mapped,
+       * the raw dmi code when not); the names are IDEXX's labels for the codes this mock knows, so
+       * the result document agrees with the order it answers. A code outside the maps is echoed as
+       * its own label — never invented, never rejected: the SCENARIO pins the mapped values. */
+      genderName: GENDER_NAMES[patient.genderCode] ?? String(patient.genderCode ?? ''),
+      speciesCode: patient.speciesCode,
+      speciesName: SPECIES_NAMES[patient.speciesCode] ?? String(patient.speciesCode),
+      breedName: BREED_NAMES[patient.breedCode] ?? String(patient.breedCode ?? ''),
       age: 3,
       yearOfBirth: '2021',
     },
@@ -270,6 +275,19 @@ function refList (items) {
   return { version: '1', list: items }
 }
 
+/* IDEXX's own reference vocabulary for the codes the harness's orders carry — the same codes
+ * dmi-api's migrations map its canonical refs to for this provider. Served by `/api/v1/ref/*` and
+ * used to label results (see buildResult). Genuine catalogue identifiers, not anyone's data. */
+const SPECIES_NAMES = { CANINE: 'Canine', FELINE: 'Feline' }
+const GENDER_NAMES = {
+  MALE_INTACT: 'Male',
+  MALE_NEUTERED: 'Male Neutered',
+  FEMALE_INTACT: 'Female',
+  FEMALE_SPAYED: 'Female Spayed',
+  UNKNOWN: 'Unknown',
+}
+const BREED_NAMES = { LABRADOR_RETRIEVER: 'Labrador Retriever' }
+
 /* The orderable-test catalogue, and the ONLY definition of it: `/api/v1/ref/tests` advertises this
  * list and order placement enforces it, the way live IDEXX does (an unknown code is rejected with
  * INVALID_LAB_SERVICE_ID). A mock that advertises a catalogue but accepts anything cannot catch an
@@ -283,7 +301,12 @@ function refList (items) {
  * and an order of only reference-lab codes must not. The integration fetches this list once per
  * integration and caches it in Redis, so the flag here is what it classifies the harness's orders
  * by — and placement below enforces the same rule the real vendor does, so the two cannot drift
- * apart silently. */
+ * apart silently.
+ *
+ * `2212` is a real IDEXX reference-lab code ("Chemistry Panel 1—Canine"), verified orderable against
+ * the vendor's own endpoint. It is here so the OTHER half of the rule executes: an order of only
+ * reference-lab codes has its devices stripped by the integration before placement. The scenario
+ * picks each code by its flag, never by position. */
 const SERVICE_CATALOGUE = [
   {
     code: 'IHD_DHP',
@@ -291,6 +314,13 @@ const SERVICE_CATALOGUE = [
     listPrice: '45.00',
     currencyCode: 'USD',
     inHouse: true,
+  },
+  {
+    code: '2212',
+    name: 'Chemistry Panel 1—Canine',
+    listPrice: '105.55',
+    currencyCode: 'USD',
+    inHouse: false,
   },
 ]
 const SERVICE_CODES = new Set(SERVICE_CATALOGUE.map((service) => service.code))
@@ -303,39 +333,55 @@ function isBlank (value) {
  * field is `errorCode`, not `code`: the integration's own providerErrorMapper reads
  * `providerError.errorCode` (and its IDEXX-captured fixtures carry that name), so emitting `code`
  * here renders every rejection as "undefined error in idexx: ..." — legible enough to debug by
- * accident, but it leaves the mapper's real branch unexercised by the gate. */
-function sendError (res, status, errorCode, message) {
-  log(`rejected: ${errorCode} — ${message}`)
-  sendJson(res, status, { errors: [{ errorCode, message }] })
+ * accident, but it leaves the mapper's real branch unexercised by the gate. One entry per problem,
+ * as the vendor sends them. */
+function sendErrors (res, status, errors) {
+  for (const { errorCode, message } of errors) log(`rejected: ${errorCode} — ${message}`)
+  sendJson(res, status, { errors })
 }
 
-/* What a create-order payload must carry for the mock to accept it.
+/* What a create-order payload must carry for the mock to accept it. Returns the list of refusals
+ * (empty when the order is acceptable).
  *
  * This mock VALIDATES rather than defaults, on purpose. Silently filling in a missing field is the
  * most dangerous thing a vendor mock can do: dmi-api reconciles a provider result back to its order
  * on patient name (+ PIMS patient id, + client last name), so a mock that invents the patient it was
  * not sent will also satisfy reconciliation — and an integration that stopped forwarding the patient
  * would leave this gate permanently green. Age and weight are genuinely optional on an IDEXX order
- * and keep their fallbacks. */
+ * and keep their fallbacks.
+ *
+ * The codes are IDEXX's own: its PIMS Ordering API spec enumerates a per-field MISSING_* family
+ * (MISSING_PATIENT, MISSING_VETERINARIAN, MISSING_TESTS, MISSING_IVLS_SERIAL_NUMBER, ...) and has no
+ * generic "required field" code, so a refusal here names the field the way the vendor would. The
+ * enum stops at the patient as a whole — there is no code for a patient that arrived without a name
+ * or species — so an incomplete patient is MISSING_PATIENT with the message naming what is absent.
+ * dmi-api validates every one of these fields itself before the order reaches the engine, so this
+ * refusal is only ever reached by an integration that dropped a field it was given. */
 function validateCreateOrder (payload) {
   const patient = Array.isArray(payload.patients) ? payload.patients[0] : undefined
-  const missing = []
+  const errors = []
   if (patient === undefined) {
-    missing.push('patients[0]')
+    errors.push({ errorCode: 'MISSING_PATIENT', message: 'patients[0] is required' })
   } else {
-    if (isBlank(patient.name)) missing.push('patients[0].name')
-    if (isBlank(patient.speciesCode)) missing.push('patients[0].speciesCode')
-    if (isBlank(patient.client?.lastName)) missing.push('patients[0].client.lastName')
+    const absent = []
+    if (isBlank(patient.name)) absent.push('name')
+    if (isBlank(patient.speciesCode)) absent.push('speciesCode')
+    if (isBlank(patient.client?.lastName)) absent.push('client.lastName')
+    if (absent.length > 0) {
+      errors.push({ errorCode: 'MISSING_PATIENT', message: `patients[0] is incomplete: missing ${absent.join(', ')}` })
+    }
   }
-  if (isBlank(payload.veterinarian)) missing.push('veterinarian')
-  if (!Array.isArray(payload.tests) || payload.tests.length === 0) missing.push('tests')
-  if (missing.length > 0) {
-    return { code: 'MISSING_REQUIRED_FIELD', message: `missing or empty: ${missing.join(', ')}` }
+  if (isBlank(payload.veterinarian)) {
+    errors.push({ errorCode: 'MISSING_VETERINARIAN', message: 'veterinarian is required' })
   }
+  if (!Array.isArray(payload.tests) || payload.tests.length === 0) {
+    errors.push({ errorCode: 'MISSING_TESTS', message: 'tests is required and must not be empty' })
+  }
+  if (errors.length > 0) return errors
 
   const unknown = payload.tests.filter((code) => !SERVICE_CODES.has(String(code)))
   if (unknown.length > 0) {
-    return { code: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}` }
+    return [{ errorCode: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}` }]
   }
 
   /* The device rule, from the vendor's side. Live IDEXX cannot run an in-house test without knowing
@@ -346,9 +392,13 @@ function validateCreateOrder (payload) {
    * the compose file) leave this gate green. The serial must also be one this clinic owns: the only
    * proof that the device dmi-api was given is the device the vendor received. The device-less
    * refusal uses MISSING_IVLS_SERIAL_NUMBER, straight from the errorCode list in IDEXX's own PIMS
-   * Ordering API spec (the per-field family: MISSING_PATIENT, MISSING_TESTS, MISSING_VETERINARIAN,
-   * ...); the foreign-serial code has no counterpart in that list and is extrapolated — the
-   * refusals themselves, not the codes, are the contract there. */
+   * Ordering API spec (the per-field family above); the foreign-serial code has no counterpart in
+   * that list and is extrapolated — the refusals themselves, not the codes, are the contract there.
+   *
+   * The OTHER half of the rule is deliberately NOT enforced here: whether live IDEXX tolerates a
+   * device on an all-reference-lab order has never been probed, so a refusal would be the mock's
+   * invention. A device on a reference-lab order is accepted and echoed, and the scenario pins at
+   * the control plane that none arrived — the integration is supposed to have stripped it. */
   const inHouse = payload.tests.filter(
     (code) => SERVICE_CATALOGUE.find((service) => service.code === String(code))?.inHouse === true,
   )
@@ -356,20 +406,20 @@ function validateCreateOrder (payload) {
     .map((device) => device?.serialNumber)
     .filter((serial) => !isBlank(serial))
   if (inHouse.length > 0 && serials.length === 0) {
-    return {
-      code: 'MISSING_IVLS_SERIAL_NUMBER',
+    return [{
+      errorCode: 'MISSING_IVLS_SERIAL_NUMBER',
       message: `in-house test(s) ${inHouse.join(', ')} require an ivls device, and none was sent`,
-    }
+    }]
   }
   const foreign = serials.filter((serial) => serial !== IVLS_DEVICE_SERIAL)
   if (foreign.length > 0) {
-    return {
-      code: 'INVALID_IVLS_DEVICE',
+    return [{
+      errorCode: 'INVALID_IVLS_DEVICE',
       message: `unknown ivls serial number(s): ${foreign.join(', ')} (this clinic owns ${IVLS_DEVICE_SERIAL})`,
-    }
+    }]
   }
 
-  return null
+  return []
 }
 
 /* ---- ordering handlers (/api/v1) ---- */
@@ -399,9 +449,9 @@ async function handleCreateOrder (req, res) {
 
   const payload = await readBody(req)
 
-  const rejection = validateCreateOrder(payload)
-  if (rejection != null) {
-    sendError(res, 400, rejection.code, rejection.message)
+  const rejections = validateCreateOrder(payload)
+  if (rejections.length > 0) {
+    sendErrors(res, 400, rejections)
     return
   }
 
@@ -602,6 +652,7 @@ function handleControlGetOrder (req, res, params) {
     sendJson(res, 404, { message: `no order for requisitionId ${params.requisitionId}` })
     return
   }
+  const patient = order.patients[0] || {}
   sendJson(res, 200, {
     idexxOrderId: order.idexxOrderId,
     corporateRequisitionId: order.corporateRequisitionId,
@@ -609,9 +660,15 @@ function handleControlGetOrder (req, res, params) {
     receivedAt: order.receivedAt,
     confirmedAt: order.confirmedAt,
     tests: order.tests,
-    /* The IVLS serial(s) the integration attached, so the scenario can pin that the device dmi-api
-     * was given is the one the vendor received. */
+    /* The IVLS serial(s) the integration attached — or none, when it stripped them from an
+     * all-reference-lab order — so the scenario can pin that the device the vendor received is
+     * exactly the one the rule says it should. */
     ivls: (order.ivls ?? []).map((device) => device.serialNumber),
+    /* The patient's species/breed/sex codes exactly as the integration sent them, so the scenario
+     * can pin that dmi-api's idexx ref mapping produced IDEXX's vocabulary and not the raw dmi codes. */
+    speciesCode: patient.speciesCode,
+    breedCode: patient.breedCode,
+    genderCode: patient.genderCode,
   })
 }
 
@@ -648,11 +705,11 @@ const routes = [
   ['DELETE', /^\/api\/v1\/order\/(?<id>[^/]+)$/, handleDeleteOrder],
   ['GET', /^\/api\/v1\/orders\/external$/, handleExternalOrders],
   ['GET', /^\/api\/v1\/ref\/breeds$/, (req, res) =>
-    sendJson(res, 200, refList([{ code: 'LABRADOR', name: 'Labrador Retriever', speciesCode: 'CANINE' }]))],
+    sendJson(res, 200, refList(Object.entries(BREED_NAMES).map(([code, name]) => ({ code, name, speciesCode: 'CANINE' }))))],
   ['GET', /^\/api\/v1\/ref\/genders$/, (req, res) =>
-    sendJson(res, 200, refList([{ code: 'MALE', name: 'Male' }, { code: 'FEMALE', name: 'Female' }]))],
+    sendJson(res, 200, refList(Object.entries(GENDER_NAMES).map(([code, name]) => ({ code, name }))))],
   ['GET', /^\/api\/v1\/ref\/species$/, (req, res) =>
-    sendJson(res, 200, refList([{ code: 'CANINE', name: 'Canine' }, { code: 'FELINE', name: 'Feline' }]))],
+    sendJson(res, 200, refList(Object.entries(SPECIES_NAMES).map(([code, name]) => ({ code, name }))))],
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
   /* `IdexxIvlsDevice` as the integration's device mapper reads it (deviceSerialNumber,
    * vcpActivatedStatus, displayName). Nothing in the harness syncs devices yet; the list exists so

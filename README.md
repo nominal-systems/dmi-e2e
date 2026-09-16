@@ -219,8 +219,8 @@ touches a live Zoetis host. What differs from the other two:
 - **It has two acknowledge channels**, and the scenario asserts both: results ack as a batch, orders
   ack one at a time by POSTing to an `href` the order-status document itself advertises.
 - **Its species and sex really are ref-mapped**, which made it the first loop where the scenario could
-  assert dmi-api's ref mapping end to end; the antech loop now does the same for species, sex and
-  breed. See "Full-system findings".
+  assert dmi-api's ref mapping end to end; the antech and idexx loops now do the same for species, sex
+  and  breed. See "Full-system findings".
 
 **Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
 because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api
@@ -237,9 +237,13 @@ closely enough for the real integration to drive it unmodified:
 
 - **Ordering** (`/api/v1/*`): `POST /order`, `GET/DELETE /order/:id`, the external-orders poll, auth
   validate, and reference data — including the test catalogue (`/ref/tests`) and the clinic's one
-  IVLS analyzer (`/ivls/devices`). The integration reads the catalogue's `inHouse` flag to decide
-  whether an order must carry a device, and the mock enforces the same rule at placement: an
-  in-house order without an `ivls` serial, or with one the clinic does not own, is refused.
+  IVLS analyzer (`/ivls/devices`). The catalogue carries one in-house code and one genuine
+  reference-lab code, so both halves of the integration's device rule execute. The integration reads
+  the `inHouse` flag to decide whether an order must carry a device, and the mock enforces the
+  in-house half at placement: an in-house order without an `ivls` serial, or with one the clinic does
+  not own, is refused. The reference-lab half — the integration strips the devices it was given — is
+  echoed, not enforced: the vendor's tolerance of a device on such an order is unverified, so the
+  scenario pins the empty device list at the control plane instead.
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
   integration issues to submit the order.
@@ -624,6 +628,11 @@ confirmed to interoperate with the current dmi-api. What the third provider taug
   `Male Sterilized`, `Labrador Retriever` in, `41` / `CM` / `130` at the mock, numeric ids as numbers.
   The antech mock echoes these rather than validating them, so there the scenario assertion is the
   whole guard: with an unmapped species the raw dmi code reaches the mock and the assertion names it.
+  The idexx loop asserts **all three** as well, because idexx maps breeds too (upper-case
+  mnemonics, from the ~1,100 dog-breed rows dmi-api's migrations seed): `Canis familiaris`,
+  `Male Sterilized`, `Labrador Retriever` in, `CANINE` / `MALE_NEUTERED` / `LABRADOR_RETRIEVER` at the
+  mock. The idexx mock echoes these rather than validating them, so there the scenario assertion is
+  the whole guard: with an unmapped ref the raw dmi code reaches the mock and the assertion names it.
 - **Zoetis breeds cannot be ref-mapped at all.** dmi-api seeds 1307 zoetis breed `provider_ref` rows
   and **every one has a NULL `code`** (the other three providers have none) — consistent with the
   integration's `getBreeds` being a no-op, since Zoetis publishes no breed catalogue. So a breed that
@@ -663,11 +672,6 @@ the order lands in `ERROR`).
   interval env-configurable would be a small change in each integration repo and would cut this
   suite's runtime substantially — a possible team follow-up, out of scope here (both repos are
   read-only).
-- **Only the idexx loop still bypasses dmi-api's ref mapping.** It places orders with species/sex/breed
-  strings that are not dmi ref codes, so the mapping no-ops and its assertions cover forwarding only
-  (see "Full-system findings"); zoetis and antech assert the mapped values. Porting the same approach
-  — place with canonical ref codes via `lookupRefCode`, assert the provider vocabulary at the mock —
-  closes that gap; it is a change to that provider's scenario and belongs in its own PR.
 - **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
   results. Both mock-backed scenarios avoid this by stopping their integration in `afterAll` (removing
