@@ -17,7 +17,7 @@
 #   - `antech`: redis, the Antech mock (built from this repo's src/antech-mock, zero deps), and the
 #     REAL dmi-engine-antech-integration container (the classic antech provider, id `antech`).
 #   - `zoetis`: redis, the Zoetis mock (built from this repo's src/zoetis-mock, zero deps), and the
-#     REAL dmi-engine-zoetis-integration container (the classic zoetis provider, id `zoetis`).
+#     REAL dmi-engine-zoetis-integration container (the zoetis provider, id `zoetis`).
 #   - `full-stack`: redis, the demo provider API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve

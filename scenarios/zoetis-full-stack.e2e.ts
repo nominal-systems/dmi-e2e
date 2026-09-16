@@ -364,8 +364,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(received.vetName).toBe('Vet, Ann')
       expect(received.testCodes).toEqual([serviceCode])
       /* The integration option, carried into the request document's ClientId (and into the HTTP Basic
-       * username). Asserting it proves integrationOptions reached the provider call, not just the
-       * provider configuration. */
+       * username). Asserting it proves integrationOptions reached the HTTP call to the provider, not just the provider configuration. */
       expect(received.clientId).toBe(env.zoetis.clientId)
     })
 

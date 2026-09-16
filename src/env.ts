@@ -55,7 +55,7 @@ export interface HarnessEnv {
   mongoUri: string
   activemq: { hostname: string, port: number }
   /* HARNESS_FULL_STACK=1 selects a full-system suite: dmi-api under a normal NODE_ENV against a real
-   * provider loop (redis + a provider + its integration), instead of the default fast suite
+   * provider loop (redis + a provider mock + its integration), instead of the default fast suite
    * (NODE_ENV=seed, dmi-api alone). */
   fullStack: boolean
   /* Which full-system loop HARNESS_FULL_STACK=1 runs — a key of the stack registry in

@@ -229,10 +229,9 @@ integration, and its fix is tracked privately (routed upstream), not in this rep
 `full-stack-smoke.e2e.ts` ships with its completion assertions `describe.skip`ped and an active test
 that *confirms* the break; it is unaffected by, and independent of, the idexx loop.
 
-### The VetConnect Plus mock
+### The idexx mock (VetConnect Plus)
 
-`src/idexx-mock/server.js` is a small, zero-dependency Node HTTP server that stands in for IDEXX's
-VetConnect Plus provider. It speaks IDEXX's **public, documented dialect** (developer.vetconnectplus.com)
+`src/idexx-mock/server.js` is a small, zero-dependency Node HTTP server that stands in for IDEXX (its VetConnect Plus API). It speaks IDEXX's **public, documented dialect** (developer.vetconnectplus.com)
 closely enough for the real integration to drive it unmodified:
 
 - **Ordering** (`/api/v1/*`): `POST /order`, `GET/DELETE /order/:id`, the external-orders poll, auth

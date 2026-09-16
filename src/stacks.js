@@ -38,7 +38,8 @@ const stacks = {
      * its version. */
     integration: { repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' },
     /* The mock's host-facing endpoint: its published port, the URL variable that overrides the
-     * whole thing, and the name readiness logs call it. Readiness is `<baseUrl>/status`. */
+     * whole thing, and the name readiness logs call it. Readiness is `<baseUrl>/status`. One name
+     * per mock: label, urlVariable and portVariable all derive from `<stack>-mock` (CLAUDE.md). */
     mock: {
       label: 'idexx-mock',
       urlVariable: 'HARNESS_IDEXX_MOCK_URL',
