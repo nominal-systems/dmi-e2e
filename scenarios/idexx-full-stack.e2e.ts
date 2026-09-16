@@ -414,4 +414,58 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(received.ivls).toEqual([])
     })
   })
+
+  describe("a refused order surfaces the vendor's error, not a generic fallback", () => {
+    /* The happy path never touches the integration's error path. The mock answers a refused order
+     * the way the live endpoint does — an INVALID_ORDER entry, then the field-level entries under
+     * IDEXX's own codes — and the integration's providerErrorMapper reads that envelope's
+     * `errorCode`/`message`/`index` and renders each entry into dmi-api's `errors[]`. These two tests
+     * are what make the envelope's codes and shape non-decorative: renaming a code, or keying the
+     * envelope `code` instead of `errorCode`, goes red here and nowhere else. */
+
+    it('an order for a code outside the catalogue is refused end to end, naming the code', async () => {
+      /* An unknown code takes the device rule's Passthrough branch (the integration forwards whatever
+       * devices the PIMS sent), reaches the mock, and is refused there as INVALID_LAB_SERVICE_ID with
+       * the code in the message — the one refusal dmi-api cannot intercept first, since it does not
+       * know the vendor's catalogue. A separate order (its own requisitionId) that lands ERROR in
+       * dmi-api, so it does not perturb the loop asserted above. */
+      const payload = refMappedOrderPayload({
+        testCodes: [{ code: 'NOT-A-REAL-IDEXX-CODE' }],
+        devices: [deviceSerial],
+      })
+
+      const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
+      console.log(
+        `[idexx-scenario] refused-order response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+
+      expect(response.ok).toBe(false)
+      /* The vendor's code and the mock's message both reach dmi-api's errors[], which proves the
+       * mapper read the envelope. Its fallbacks must NOT fire: "… failed with <status> status code"
+       * appears when the envelope is unreadable, "undefined error in idexx" when it is keyed `code`
+       * instead of `errorCode`. */
+      expect(response.text).toMatch(/INVALID_LAB_SERVICE_ID/)
+      expect(response.text).toMatch(/NOT-A-REAL-IDEXX-CODE/)
+      expect(response.text).not.toMatch(/failed with \d+ status code/)
+      expect(response.text).not.toMatch(/undefined error in idexx/)
+    }, 30_000)
+
+    it("the mock refuses an empty order with IDEXX's per-field codes, under its INVALID_ORDER entry", async () => {
+      /* Driven at the mock's vendor-facing API directly, the way the tests above read its catalogue
+       * and device list: dmi-api validates every required field itself before an order reaches the
+       * engine, so no path through the stack can make the integration send an empty order — these
+       * refusals exist for an integration that drops a field it was given. This pins the vocabulary
+       * and shape they would surface with, so a drift from the vendor's codes is visible somewhere. */
+      const response = await mock.post('/api/v1/order', {})
+
+      expect(response.status).toBe(400)
+      const errors = response.body.errors as Array<{ errorCode: string, index?: number }>
+      expect(errors.map((error) => error.errorCode)).toEqual([
+        'INVALID_ORDER',
+        'MISSING_PATIENT',
+        'MISSING_VETERINARIAN',
+        'MISSING_TESTS',
+      ])
+    })
+  })
 })

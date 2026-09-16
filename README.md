@@ -220,7 +220,7 @@ touches a live Zoetis host. What differs from the other two:
   ack one at a time by POSTing to an `href` the order-status document itself advertises.
 - **Its species and sex really are ref-mapped**, which made it the first loop where the scenario could
   assert dmi-api's ref mapping end to end; the antech and idexx loops now do the same for species, sex
-  and  breed. See "Full-system findings".
+  and breed. See "Full-system findings".
 
 **Status: the `demo` scenario is blocked upstream.** Its end-to-end order→report loop cannot close
 because the demo integration on `main` is not compatible with the current dmi-api. The dmi-api

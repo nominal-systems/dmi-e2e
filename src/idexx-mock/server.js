@@ -303,10 +303,11 @@ const BREED_NAMES = { LABRADOR_RETRIEVER: 'Labrador Retriever' }
  * by — and placement below enforces the same rule the real vendor does, so the two cannot drift
  * apart silently.
  *
- * `2212` is a real IDEXX reference-lab code ("Chemistry Panel 1—Canine"), verified orderable against
- * the vendor's own endpoint. It is here so the OTHER half of the rule executes: an order of only
- * reference-lab codes has its devices stripped by the integration before placement. The scenario
- * picks each code by its flag, never by position. */
+ * `2212` is a real IDEXX reference-lab code: an order for it was placed and confirmed on IDEXX's
+ * development endpoint while this harness was being built, and the name is the one that catalogue
+ * returned (the list price here is illustrative). It is here so the OTHER half of the rule executes:
+ * an order of only reference-lab codes has its devices stripped by the integration before placement.
+ * The scenario picks each code by its flag, never by position. */
 const SERVICE_CATALOGUE = [
   {
     code: 'IHD_DHP',
@@ -318,7 +319,7 @@ const SERVICE_CATALOGUE = [
   {
     code: '2212',
     name: 'Chemistry Panel 1—Canine',
-    listPrice: '105.55',
+    listPrice: '100.00',
     currencyCode: 'USD',
     inHouse: false,
   },
@@ -333,15 +334,22 @@ function isBlank (value) {
  * field is `errorCode`, not `code`: the integration's own providerErrorMapper reads
  * `providerError.errorCode` (and its IDEXX-captured fixtures carry that name), so emitting `code`
  * here renders every rejection as "undefined error in idexx: ..." — legible enough to debug by
- * accident, but it leaves the mapper's real branch unexercised by the gate. One entry per problem,
- * as the vendor sends them. */
-function sendErrors (res, status, errors) {
-  for (const { errorCode, message } of errors) log(`rejected: ${errorCode} — ${message}`)
-  sendJson(res, status, { errors })
+ * accident, but it leaves the mapper's real branch unexercised by the gate.
+ *
+ * A refused order is answered the way the live endpoint answers one — observed on IDEXX's
+ * development endpoint and in the integration's captured fixtures: a leading INVALID_ORDER entry
+ * ("see data for field level details"), then one entry per problem, the field-level ones carrying
+ * `index` (the position in the array the field belongs to). The mapper branches on `index`, so the
+ * shape, not just the codes, is what it gets exercised against. */
+const INVALID_ORDER = { errorCode: 'INVALID_ORDER', message: 'Invalid order, see data for field level details' }
+
+function sendInvalidOrder (res, problems) {
+  for (const { errorCode, message } of problems) log(`rejected: ${errorCode} — ${message}`)
+  sendJson(res, 400, { errors: [INVALID_ORDER, ...problems] })
 }
 
-/* What a create-order payload must carry for the mock to accept it. Returns the list of refusals
- * (empty when the order is acceptable).
+/* What a create-order payload must carry for the mock to accept it. Returns the field-level
+ * problems (empty when the order is acceptable).
  *
  * This mock VALIDATES rather than defaults, on purpose. Silently filling in a missing field is the
  * most dangerous thing a vendor mock can do: dmi-api reconciles a provider result back to its order
@@ -353,35 +361,40 @@ function sendErrors (res, status, errors) {
  * The codes are IDEXX's own: its PIMS Ordering API spec enumerates a per-field MISSING_* family
  * (MISSING_PATIENT, MISSING_VETERINARIAN, MISSING_TESTS, MISSING_IVLS_SERIAL_NUMBER, ...) and has no
  * generic "required field" code, so a refusal here names the field the way the vendor would. The
- * enum stops at the patient as a whole — there is no code for a patient that arrived without a name
- * or species — so an incomplete patient is MISSING_PATIENT with the message naming what is absent.
- * dmi-api validates every one of these fields itself before the order reaches the engine, so this
- * refusal is only ever reached by an integration that dropped a field it was given. */
+ * spec's enum stops at the patient as a whole — it lists no code for a patient that arrived without
+ * a name or species, though the vendor's live vocabulary is broader than the spec's list — so an
+ * incomplete patient is MISSING_PATIENT with the message naming what is absent. `index` is carried
+ * where the live endpoint was seen to carry it (an offending test, by its position) and, by the same
+ * convention, on the other array-member problems; the scalar ones carry none. dmi-api validates
+ * every required field itself before the order reaches the engine, so the MISSING_* refusals are
+ * only ever reached by an integration that dropped a field it was given; the catalogue refusal is
+ * reachable end to end and the scenario exercises it. */
 function validateCreateOrder (payload) {
   const patient = Array.isArray(payload.patients) ? payload.patients[0] : undefined
-  const errors = []
+  const problems = []
   if (patient === undefined) {
-    errors.push({ errorCode: 'MISSING_PATIENT', message: 'patients[0] is required' })
+    problems.push({ errorCode: 'MISSING_PATIENT', message: 'patients[0] is required' })
   } else {
     const absent = []
     if (isBlank(patient.name)) absent.push('name')
     if (isBlank(patient.speciesCode)) absent.push('speciesCode')
     if (isBlank(patient.client?.lastName)) absent.push('client.lastName')
     if (absent.length > 0) {
-      errors.push({ errorCode: 'MISSING_PATIENT', message: `patients[0] is incomplete: missing ${absent.join(', ')}` })
+      problems.push({ errorCode: 'MISSING_PATIENT', message: `patients[0] is incomplete: missing ${absent.join(', ')}`, index: 0 })
     }
   }
   if (isBlank(payload.veterinarian)) {
-    errors.push({ errorCode: 'MISSING_VETERINARIAN', message: 'veterinarian is required' })
+    problems.push({ errorCode: 'MISSING_VETERINARIAN', message: 'veterinarian is required' })
   }
   if (!Array.isArray(payload.tests) || payload.tests.length === 0) {
-    errors.push({ errorCode: 'MISSING_TESTS', message: 'tests is required and must not be empty' })
+    problems.push({ errorCode: 'MISSING_TESTS', message: 'tests is required and must not be empty' })
   }
-  if (errors.length > 0) return errors
+  if (problems.length > 0) return problems
 
-  const unknown = payload.tests.filter((code) => !SERVICE_CODES.has(String(code)))
-  if (unknown.length > 0) {
-    return [{ errorCode: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}` }]
+  const unknownAt = payload.tests.findIndex((code) => !SERVICE_CODES.has(String(code)))
+  if (unknownAt !== -1) {
+    const unknown = payload.tests.filter((code) => !SERVICE_CODES.has(String(code)))
+    return [{ errorCode: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}`, index: unknownAt }]
   }
 
   /* The device rule, from the vendor's side. Live IDEXX cannot run an in-house test without knowing
@@ -411,11 +424,13 @@ function validateCreateOrder (payload) {
       message: `in-house test(s) ${inHouse.join(', ')} require an ivls device, and none was sent`,
     }]
   }
-  const foreign = serials.filter((serial) => serial !== IVLS_DEVICE_SERIAL)
-  if (foreign.length > 0) {
+  const foreignAt = serials.findIndex((serial) => serial !== IVLS_DEVICE_SERIAL)
+  if (foreignAt !== -1) {
+    const foreign = serials.filter((serial) => serial !== IVLS_DEVICE_SERIAL)
     return [{
       errorCode: 'INVALID_IVLS_DEVICE',
       message: `unknown ivls serial number(s): ${foreign.join(', ')} (this clinic owns ${IVLS_DEVICE_SERIAL})`,
+      index: foreignAt,
     }]
   }
 
@@ -449,9 +464,9 @@ async function handleCreateOrder (req, res) {
 
   const payload = await readBody(req)
 
-  const rejections = validateCreateOrder(payload)
-  if (rejections.length > 0) {
-    sendErrors(res, 400, rejections)
+  const problems = validateCreateOrder(payload)
+  if (problems.length > 0) {
+    sendInvalidOrder(res, problems)
     return
   }
 
@@ -632,28 +647,11 @@ async function handleControlSeedResult (req, res, params) {
   sendJson(res, 201, { seeded: true, requisitionId, idexxOrderId, result: idexx })
 }
 
-function handleControlListOrders (req, res) {
-  const orders = [...state.orders.values()].map((order) => ({
-    idexxOrderId: order.idexxOrderId,
-    corporateRequisitionId: order.corporateRequisitionId,
-    status: order.status,
-    receivedAt: order.receivedAt,
-    confirmedAt: order.confirmedAt,
-    tests: order.tests,
-    ivls: (order.ivls ?? []).map((device) => device.serialNumber),
-  }))
-  sendJson(res, 200, { count: orders.length, orders })
-}
-
-function handleControlGetOrder (req, res, params) {
-  const idexxOrderId = state.requisitionToOrderId.get(params.requisitionId)
-  const order = idexxOrderId != null ? state.orders.get(idexxOrderId) : undefined
-  if (order == null) {
-    sendJson(res, 404, { message: `no order for requisitionId ${params.requisitionId}` })
-    return
-  }
+/* The control plane's view of a received order — the same shape from the list and the by-requisition
+ * lookup. */
+function controlOrderView (order) {
   const patient = order.patients[0] || {}
-  sendJson(res, 200, {
+  return {
     idexxOrderId: order.idexxOrderId,
     corporateRequisitionId: order.corporateRequisitionId,
     status: order.status,
@@ -669,7 +667,22 @@ function handleControlGetOrder (req, res, params) {
     speciesCode: patient.speciesCode,
     breedCode: patient.breedCode,
     genderCode: patient.genderCode,
-  })
+  }
+}
+
+function handleControlListOrders (req, res) {
+  const orders = [...state.orders.values()].map(controlOrderView)
+  sendJson(res, 200, { count: orders.length, orders })
+}
+
+function handleControlGetOrder (req, res, params) {
+  const idexxOrderId = state.requisitionToOrderId.get(params.requisitionId)
+  const order = idexxOrderId != null ? state.orders.get(idexxOrderId) : undefined
+  if (order == null) {
+    sendJson(res, 404, { message: `no order for requisitionId ${params.requisitionId}` })
+    return
+  }
+  sendJson(res, 200, controlOrderView(order))
 }
 
 async function handleControlScenario (req, res) {
