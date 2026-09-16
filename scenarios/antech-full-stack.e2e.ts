@@ -1,6 +1,7 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
+import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
@@ -50,6 +51,32 @@ const GLUCOSE = '1001'
 const CREATININE = '1002'
 const HEMOLYSIS_INDEX = '1003'
 
+/* The three patient fields dmi-api ref-maps on the way to the vendor, as (canonical dmi ref name ->
+ * the antech code it must arrive as). Unlike zoetis, antech maps ALL THREE: species and sex, and
+ * breed to a numeric BreedID.
+ *
+ * dmi's canonical codes are opaque, so each is looked up BY NAME over `GET /refs/*` (src/refs.ts)
+ * and sent as the order's species/sex/breed; what must arrive at the mock is antech's vocabulary,
+ * pinned as literals here. Input and expected output are deliberately different values: if the
+ * antech provider_ref rows stopped resolving, mapPatientRefs falls back to forwarding the raw code,
+ * the mock — which echoes species/breed/sex and does not validate them — stores the raw code, and
+ * the value assertion below goes red naming it, instead of a well-formed order the real vendor
+ * would reject.
+ *
+ * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
+ * the harness never runs the ref sync. They seed antech species (Canine 41, Feline 42, Bovine 45 and
+ * the exotic species), sex codes (Male Sterilized -> CM, Female Sterilized -> SF, ...), and ~1,100
+ * dog-breed mappings from Antech's own breed catalogue. Every dmi breed ref carries an opaque UUID
+ * code shared across providers (which is why the lookup is by name), and antech's numeric BreedID
+ * hangs off it as a provider ref: Labrador Retriever -> 130. Numeric antech ids arrive as numbers:
+ * the integration parseInt()s an all-digit code before sending it. */
+const SPECIES_REF_NAME = 'Canis familiaris'
+const EXPECTED_ANTECH_SPECIES = 41
+const SEX_REF_NAME = 'Male Sterilized'
+const EXPECTED_ANTECH_SEX = 'CM'
+const BREED_REF_NAME = 'Labrador Retriever'
+const EXPECTED_ANTECH_BREED = 130
+
 describe('antech full-stack (Antech mock)', () => {
   let org: SeededOrg
   let admin: ApiClient
@@ -65,6 +92,11 @@ describe('antech full-stack (Antech mock)', () => {
   /* Highest event seq observed before the result is seeded, so the /events assertion can prove which
    * events the RESULT loop produced rather than counting ones order creation already emitted. */
   let seqBeforeSeed = 0
+  /* Canonical dmi ref codes for the order's species/sex/breed, resolved by name at setup — see the
+   * ref-mapping constants above. */
+  let speciesRefCode: string
+  let sexRefCode: string
+  let breedRefCode: string
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
   const mock = ApiClient.create(env.antech.mockBaseUrl)
 
@@ -101,6 +133,12 @@ describe('antech full-stack (Antech mock)', () => {
         LabId: env.antech.labId,
       },
     })
+
+    /* Resolve the canonical ref codes the order will carry, over HTTP with the org's own API key —
+     * the same route an integrator would use to discover them (src/refs.ts). */
+    speciesRefCode = await lookupRefCode(org.api, 'species', SPECIES_REF_NAME)
+    sexRefCode = await lookupRefCode(org.api, 'sexes', SEX_REF_NAME)
+    breedRefCode = await lookupRefCode(org.api, 'breeds', BREED_REF_NAME)
 
     /* Start the integration so it schedules its Bull results/orders polling. dmi-api's admin start
      * emits `antech/integration/create` to the engine, which the integration handles by adding the
@@ -151,6 +189,18 @@ describe('antech full-stack (Antech mock)', () => {
       expect(org.providerConfigurationId).toBeTruthy()
       expect(org.integrationId).toBeTruthy()
     })
+
+    /* Guards the mapping assertions below against passing for the wrong reason: the codes the order
+     * is placed with must resolve, and must not already BE the antech codes — otherwise "the antech
+     * code arrived" would hold with the mapping switched off. */
+    it('the dmi refs the order will be placed with resolve, and are not already the antech codes', () => {
+      expect(speciesRefCode).toBeTruthy()
+      expect(sexRefCode).toBeTruthy()
+      expect(breedRefCode).toBeTruthy()
+      expect(speciesRefCode).not.toBe(String(EXPECTED_ANTECH_SPECIES))
+      expect(sexRefCode).not.toBe(EXPECTED_ANTECH_SEX)
+      expect(breedRefCode).not.toBe(String(EXPECTED_ANTECH_BREED))
+    })
   })
 
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
@@ -167,9 +217,13 @@ describe('antech full-stack (Antech mock)', () => {
        * identifier to work around dmi-api#334.
        *
        * autoSubmitOrder is not passed: it drives idexx's confirmOrder handshake and antech has no
-       * equivalent — placement is a single POST and the order is SUBMITTED once it lands. */
+       * equivalent — placement is a single POST and the order is SUBMITTED once it lands.
+       *
+       * species/sex/breed are canonical dmi ref codes, NOT antech codes: dmi-api maps all three to
+       * the antech vocabulary on the way to the engine, and a test below asserts the mapped values
+       * arrived. */
       const payload = orderPayload(org.integrationId, {
-        patient: { name: 'Rex', sex: 'MALE', species: 'DOG', breed: 'LABRADOR' },
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: breedRefCode },
         /* testCodes is required (orderPayload no longer defaults it — a shared default is wrong for
          * every provider but the one it was written for). Pass a real Antech mnemonic read from the
          * mock's catalogue; the mock enforces that catalogue and rejects anything outside it. */
@@ -220,6 +274,23 @@ describe('antech full-stack (Antech mock)', () => {
       expect(received.clientLastName).toBe('Doe')
       /* The vendor-assigned accession that keys the results XML and the acknowledge call. */
       expect(received.labAccessionId).toBeTruthy()
+    })
+
+    it('the mock received the order with the REF-MAPPED species, breed and sex, not the raw dmi codes', async () => {
+      const received = expectOk<{ speciesId: number | string, breedId: number | string, petSex: string }>(
+        await mock.get(`/__control__/orders/${requisitionId}`),
+        'read order from mock control plane',
+      )
+
+      /* THE POINT OF THIS TEST. species, breed and sex are the only order fields dmi-api transforms
+       * on the way to the vendor, and they must arrive in ANTECH's vocabulary. Asserting the exact
+       * mapped values — types included: numeric ids arrive as numbers — is what makes a silently
+       * broken ref mapping fail here, naming the raw code that got through, instead of producing a
+       * well-formed order the real vendor would reject. The mock echoes these and never validates
+       * them, so this assertion is the only thing between a mapping regression and a green run. */
+      expect(received.speciesId).toBe(EXPECTED_ANTECH_SPECIES)
+      expect(received.breedId).toBe(EXPECTED_ANTECH_BREED)
+      expect(received.petSex).toBe(EXPECTED_ANTECH_SEX)
     })
 
     it('seeding a result at the mock closes the loop: the order reaches COMPLETED', async () => {
@@ -379,7 +450,7 @@ describe('antech full-stack (Antech mock)', () => {
        * name in the body. A separate order (unique requisitionId) that never reaches COMPLETED — it
        * lands ERROR in dmi-api — so it does not perturb the loop asserted above. */
       const payload = orderPayload(org.integrationId, {
-        patient: { name: 'Rex', sex: 'MALE', species: 'DOG', breed: 'LABRADOR' },
+        patient: { name: 'Rex', sex: sexRefCode, species: speciesRefCode, breed: breedRefCode },
         testCodes: [{ code: 'NOT-A-REAL-ANTECH-CODE' }],
       })
 
