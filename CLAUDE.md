@@ -60,7 +60,11 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   that attaches no `.order` to a result (zoetis) makes reconciliation pure `externalId`, and the
   identifier becomes a free choice. Read the mapper **before** copying an existing scenario; the
   wrong choice strands orders at `SUBMITTED` forever. Background:
-  [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334).
+  [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334). And mind the shared
+  `orderPayload()`: a `patient:` override replaces the whole default patient, identifier included —
+  where the provider needs the identifier, merge the fields you change into the default instead.
+  The symptom of dropping it is a result that reconciles into a fresh orphan order while the placed
+  one stays `SUBMITTED`, which reads like a broken result loop.
 - **Ref-mapped fields need value assertions, or they are not tested at all.** dmi-api maps an
   order's species/sex/breed from its canonical refs to provider codes before handing it to the
   engine, and falls back to forwarding the raw string when nothing resolves — so a scenario that
@@ -86,9 +90,13 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 - **The idexx integration decides device inclusion from the vendor catalogue.** It fetches
   `/ref/tests`, and an order with any `inHouse` code must carry a `devices` serial or it is refused
   before reaching the vendor; an all-reference-lab order has its devices stripped. The mock's
-  catalogue flags are therefore load-bearing, and the mock enforces the same rule so the integration's
-  kill switch (`IDEXX_DEVICE_RULE_ENABLED`) cannot quietly turn the check off. Read the order's
-  device serial from the mock's `/ivls/devices`, never a literal.
+  catalogue flags are therefore load-bearing: pick codes by flag, never by position. The two halves
+  are guarded differently, on purpose. The Include half the mock enforces too, so the integration's
+  kill switch (`IDEXX_DEVICE_RULE_ENABLED`) cannot quietly turn the check off. The Exclude half it
+  does **not** — whether the provider tolerates a device on a reference-lab order is unverified, so a
+  refusal would be invention — which leaves the scenario's control-plane assertion (device sent,
+  `ivls` empty) as the only detector on that side. Read the order's device serial from the mock's
+  `/ivls/devices`, never a literal.
 - **Poll intervals differ.** Some integrations expose an env knob the harness dials down (~3s);
   others hardcode ~30s. Budget scenario timeouts for at least one full poll tick and don't mistake
   the wait for a hang.
