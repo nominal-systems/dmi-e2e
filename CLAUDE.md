@@ -89,7 +89,7 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   mean the only one?**
 - **The idexx integration decides device inclusion from the provider catalogue.** It fetches
   `/ref/tests`, and an order with any `inHouse` code must carry a `devices` serial or it is refused
-  before reaching the vendor; an all-reference-lab order has its devices stripped. The mock's
+  before reaching the provider; an all-reference-lab order has its devices stripped. The mock's
   catalogue flags are therefore load-bearing: pick codes by flag, never by position. The two halves
   are guarded differently, on purpose. The Include half the mock enforces too, so the integration's
   kill switch (`IDEXX_DEVICE_RULE_ENABLED`) cannot quietly turn the check off. The Exclude half it

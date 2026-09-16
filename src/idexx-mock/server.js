@@ -300,7 +300,7 @@ const BREED_NAMES = { LABRADOR_RETRIEVER: 'Labrador Retriever' }
  * inclusion (its issue #76): an order containing any `inHouse: true` code must carry an IVLS device,
  * and an order of only reference-lab codes must not. The integration fetches this list once per
  * integration and caches it in Redis, so the flag here is what it classifies the harness's orders
- * by — and placement below enforces the same rule the real vendor does, so the two cannot drift
+ * by — and placement below enforces the same rule the real provider does, so the two cannot drift
  * apart silently.
  *
  * `2212` is a real IDEXX reference-lab code: an order for it was placed and confirmed on IDEXX's
