@@ -18,7 +18,7 @@
 #     REAL dmi-engine-antech-integration container (the classic antech provider, id `antech`).
 #   - `zoetis`: redis, the Zoetis mock (built from this repo's src/zoetis-mock, zero deps), and the
 #     REAL dmi-engine-zoetis-integration container (the classic zoetis provider, id `zoetis`).
-#   - `full-stack`: redis, the demo vendor API + its own MySQL, and the demo provider integration
+#   - `full-stack`: redis, the demo provider API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
 # @nominal-systems/* from GitHub Packages; the mock needs no token.
@@ -59,7 +59,7 @@ services:
     ports:
       - '${HARNESS_ACTIVEMQ_PORT:-1884}:1883'
 
-  # ---- full-stack profile: the demo provider loop (order -> engine -> vendor -> report) ----
+  # ---- full-stack profile: the demo provider loop (order -> engine -> provider -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
   # Shared by every full-system loop (demo, idexx, antech and zoetis).
@@ -69,7 +69,7 @@ services:
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
 
-  # The demo vendor's own database. DATABASE_SYNCHRONIZE=true lets the vendor auto-create its schema
+  # The demo provider's own database. DATABASE_SYNCHRONIZE=true lets the provider auto-create its schema
   # on boot, so there is no migration step for it.
   demo-provider-mysql:
     image: mysql:8
@@ -87,7 +87,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # Simulated vendor (NestJS + MySQL). X-Api-Key auth minted via GET /demo/keys; orders auto-complete
+  # Simulated provider (NestJS + MySQL). X-Api-Key auth minted via GET /demo/keys; orders auto-complete
   # ~6s after creation. Built from its own Node-14 Dockerfile (production stage).
   dmi-demo-provider-api:
     profiles: ['full-stack']
@@ -112,7 +112,7 @@ services:
         condition: service_healthy
 
   # Demo provider integration (standalone NestJS microservice, one container per provider, matching
-  # production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the vendor over HTTP
+  # production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the provider over HTTP
   # using the base URL carried inside each MQTT message (the provider configuration's `url`).
   dmi-engine-demo-provider-integration:
     profiles: ['full-stack']
@@ -164,15 +164,15 @@ services:
       - redis
       - dmi-demo-provider-api
 
-  # ---- idexx profile: the VetConnect Plus loop (order -> engine -> mock vendor -> report) ----
+  # ---- idexx profile: the VetConnect Plus loop (order -> engine -> mock provider -> report) ----
 
-  # VetConnect Plus (IDEXX) mock vendor, built from this repo's zero-dependency Node server. Serves
+  # VetConnect Plus (IDEXX) mock provider, built from this repo's zero-dependency Node server. Serves
   # both the ordering (/api/v1) and results (/api/v3) dialects plus the confirmOrder browser
   # handshake, and a /__control__ plane the scenario drives to seed results deterministically. Built
   # inline (a one-line COPY) rather than bind-mounted so the image is self-contained on any host, and
   # it needs no GHP_TOKEN. `orderingBaseUrl`/`resultBaseUrl` in the dmi-api provider config point at
   # this service's compose-network name, never at live *.vetconnectplus.com.
-  vetconnect-mock:
+  idexx-mock:
     profiles: ['idexx']
     build:
       context: ./src/idexx-mock
@@ -185,11 +185,11 @@ services:
     environment:
       PORT: '3000'
     ports:
-      - '${HARNESS_VCP_MOCK_PORT:-3012}:3000'
+      - '${HARNESS_IDEXX_MOCK_PORT:-3012}:3000'
 
   # The REAL idexx provider integration (standalone NestJS microservice, one container per provider,
   # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
-  # vendor over HTTP using the orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the
+  # provider over HTTP using the orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the
   # provider configuration). Built from its own (Node-20) Dockerfile's `production` stage — unlike
   # the demo repo it needs no inline workaround. The polling intervals are dialed down from the
   # 30s default so the results loop closes quickly in the harness.
@@ -212,11 +212,11 @@ services:
     depends_on:
       - activemq
       - redis
-      - vetconnect-mock
+      - idexx-mock
 
-  # ---- antech profile: the classic Antech loop (order -> engine -> mock vendor -> report) ----
+  # ---- antech profile: the classic Antech loop (order -> engine -> mock provider -> report) ----
 
-  # Antech mock vendor, built from this repo's zero-dependency Node server. Serves Antech's
+  # Antech mock provider, built from this repo's zero-dependency Node server. Serves Antech's
   # /api/v1.1 dialect (token login, order placement, the JSON status poll / acknowledge pair, the
   # results XML document and the PDF manifest) plus a /__control__ plane the scenario drives to seed
   # results deterministically. Built inline (a one-line COPY) rather than bind-mounted so the image
@@ -239,7 +239,7 @@ services:
 
   # The REAL classic-antech provider integration (standalone NestJS microservice, one container per
   # provider, matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches
-  # the mock vendor over HTTP using the baseUrl carried inside each MQTT message (the provider
+  # the mock provider over HTTP using the baseUrl carried inside each MQTT message (the provider
   # configuration). Built from its own (Node-20) Dockerfile's `production` stage — like idexx, and
   # unlike the demo repo, it needs no inline workaround.
   #
@@ -265,9 +265,9 @@ services:
       - redis
       - antech-mock
 
-  # ---- zoetis profile: the Zoetis VetSync loop (order -> engine -> mock vendor -> report) ----
+  # ---- zoetis profile: the Zoetis VetSync loop (order -> engine -> mock provider -> report) ----
 
-  # Zoetis mock vendor, built from this repo's zero-dependency Node server. Serves Zoetis's
+  # Zoetis mock provider, built from this repo's zero-dependency Node server. Serves Zoetis's
   # /vetsync/v1 dialect (Basic auth, single-POST order placement, the orders/results polls and BOTH
   # acknowledge channels, and the services/species/genders reference data) plus a /__control__ plane
   # the scenario drives to seed results deterministically. Built inline (a one-line COPY) rather than
@@ -292,7 +292,7 @@ services:
 
   # The REAL zoetis provider integration (standalone NestJS microservice, one container per provider,
   # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
-  # vendor over HTTP using the baseUrl carried inside each MQTT message (the provider configuration).
+  # provider over HTTP using the baseUrl carried inside each MQTT message (the provider configuration).
   # Built from its own (Node-20) Dockerfile's `production` stage — like idexx and antech, and unlike
   # the demo repo, it needs no inline workaround.
   #

@@ -7,10 +7,10 @@ import { closePool } from '../src/sql'
 
 /* Phase 1 full-system gate for Zoetis (HARNESS_FULL_STACK=1, HARNESS_STACK=zoetis): dmi-api under a
  * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine-zoetis-integration`
- * container (provider id `zoetis`) and a Zoetis mock vendor (src/zoetis-mock). It drives the whole
+ * container (provider id `zoetis`) and a Zoetis mock provider (src/zoetis-mock). It drives the whole
  * loop as an integrator would — configure the zoetis provider pointed at the mock, create an
  * integration, start it, place an order over HTTP, let the mock produce a result, and watch the
- * order->result->report loop close — with every hop real except the vendor, which is the mock so the
+ * order->result->report loop close — with every hop real except the provider, which is the mock so the
  * run is deterministic and never touches a live Zoetis host.
  *
  * The order flows: POST /orders -> dmi-api RPCs `zoetis/orders/create` to the integration -> the
@@ -33,7 +33,7 @@ import { closePool } from '../src/sql'
  *     format — so element MULTIPLICITY is load-bearing in several places. See the header of
  *     src/zoetis-mock/server.js for the full list; the mock is built to satisfy all of them.
  *   - Placement is a SINGLE POST. There is no login step (antech) and no confirmOrder browser
- *     handshake (idexx). The vendor answers with a WAITING-FOR-SAMPLE status document — which the
+ *     handshake (idexx). The provider answers with a WAITING-FOR-SAMPLE status document — which the
  *     create-response mapping reports as a dmi SUBMITTED order; see the two-readings pin below.
  *   - Auth is HTTP Basic with a domain-style username, `<partnerId>\<clientId>` — joining a provider
  *     CONFIGURATION field to an INTEGRATION option. The mock accepts any credential VALUES (they are
@@ -82,7 +82,7 @@ const HISTOGRAM_IMAGE = 'GLU_HIST_IMG64'
 const HISTOGRAM_DATA = 'GLU_HIST_DATA'
 
 /* The two order fields that go through a real dmi-api ref-mapping transformation on their way to the
- * vendor, expressed as (canonical dmi ref name -> the zoetis code it must arrive as).
+ * provider, expressed as (canonical dmi ref name -> the zoetis code it must arrive as).
  *
  * This pairing is the whole point of the mapping assertions below. dmi-api's canonical ref codes are
  * opaque UUIDs, so the scenario looks each one up BY NAME over `GET /refs/*` (rather than hard-coding
@@ -91,7 +91,7 @@ const HISTOGRAM_DATA = 'GLU_HIST_DATA'
  * here, because they are also what the mock's /species and /genders endpoints advertise.
  *
  * Input and expected output are deliberately DIFFERENT strings. If dmi-api's zoetis provider_ref
- * rows stopped resolving, `mapPatientRefs` falls back to passing the raw value through, the vendor
+ * rows stopped resolving, `mapPatientRefs` falls back to passing the raw value through, the provider
  * would receive a UUID, and the mock — which enforces its own vocabulary — rejects the order at
  * placement. That is a loud red at the first test, which is exactly what a silent mapping regression
  * should produce. Picking a species/sex whose dmi and zoetis codes happen to be spelled the same
@@ -104,7 +104,7 @@ const EXPECTED_ZOETIS_GENDER = 'MALE_NEUTERED'
 /* Breed is NOT ref-mapped for zoetis and this value is chosen to make that explicit rather than to
  * hide it: dmi-api seeds 1307 zoetis breed provider_ref rows but every one of them has a NULL code
  * (the integration's getBreeds is a no-op — Zoetis publishes no breed catalogue), so nothing here can
- * resolve to a vendor code. A plain descriptive string therefore passes through verbatim, and
+ * resolve to a provider code. A plain descriptive string therefore passes through verbatim, and
  * asserting it at the mock tests FORWARDING, which is the only thing there is to test for this field.
  * Deliberately not a dmi breed ref code: that would resolve to NULL and strip the breed entirely. */
 const BREED = 'Labrador Retriever'
@@ -265,7 +265,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * header. For zoetis it is a free choice rather than a workaround, because its results never
        * reach dmi-api's patient-matching guard; omitting it keeps the order minimal.
        *
-       * species/sex are canonical dmi ref codes, NOT vendor codes: dmi-api maps them to the zoetis
+       * species/sex are canonical dmi ref codes, NOT provider codes: dmi-api maps them to the zoetis
        * vocabulary on the way to the engine, and the next test asserts the mapped values arrived.
        *
        * autoSubmitOrder is not passed: it drives idexx's confirmOrder handshake, and zoetis placement
@@ -297,10 +297,10 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(externalId).toBe(requisitionId)
 
       /* First half of the two-readings pin (the second half is the still-SUBMITTED test below). The
-       * vendor answers placement with a WAITING-FOR-SAMPLE status document, and the CREATE-RESPONSE
+       * provider answers placement with a WAITING-FOR-SAMPLE status document, and the CREATE-RESPONSE
        * mapping (zoetis-responses.helper.ts mapOrderStatus) has no case for that value — it falls to
        * its default and reports the new order as dmi SUBMITTED. The ORDERS-POLL mapping
-       * (ZoetisMapper.getOrderStatus) reads the same vendor state as WAITING_FOR_INPUT. Today the two
+       * (ZoetisMapper.getOrderStatus) reads the same provider state as WAITING_FOR_INPUT. Today the two
        * paths disagree about the same document; this pin records the create-response half, so a
        * deliberate change to either mapping flips a named assertion instead of drifting silently. */
       expect(created.status).toBe('SUBMITTED')
@@ -328,17 +328,17 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       )
 
       expect(received.practiceRef).toBe(requisitionId)
-      /* The vendor-side status of a freshly placed order. WAITING-FOR-SAMPLE, never SUBMITTED —
-       * SUBMITTED is dmi vocabulary the vendor does not speak. */
+      /* The provider-side status of a freshly placed order. WAITING-FOR-SAMPLE, never SUBMITTED —
+       * SUBMITTED is dmi vocabulary the provider does not speak. */
       expect(received.status).toBe('WAITING-FOR-SAMPLE')
 
       /* THE POINT OF THIS TEST. species and sex are the only order fields dmi-api transforms on the
-       * way to the vendor, and they must arrive in the ZOETIS vocabulary. Asserting the exact mapped
+       * way to the provider, and they must arrive in the ZOETIS vocabulary. Asserting the exact mapped
        * strings — rather than that the fields are merely present — is what makes a silently broken
-       * ref mapping fail here instead of producing a well-formed order the vendor cannot read.
+       * ref mapping fail here instead of producing a well-formed order the provider cannot read.
        * (Belt and braces: the mock also enforces both vocabularies at placement, so a raw UUID would
        * already have been rejected with a 400 in the test above. Both checks are deliberate — one
-       * proves the vendor refuses it, this one proves what was actually sent.) */
+       * proves the provider refuses it, this one proves what was actually sent.) */
       expect(received.species).toBe(EXPECTED_ZOETIS_SPECIES)
       expect(received.gender).toBe(EXPECTED_ZOETIS_GENDER)
       /* Breed is not ref-mapped for zoetis (see the BREED note above): it must arrive verbatim.
@@ -364,7 +364,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(received.vetName).toBe('Vet, Ann')
       expect(received.testCodes).toEqual([serviceCode])
       /* The integration option, carried into the request document's ClientId (and into the HTTP Basic
-       * username). Asserting it proves integrationOptions reached the vendor call, not just the
+       * username). Asserting it proves integrationOptions reached the provider call, not just the
        * provider configuration. */
       expect(received.clientId).toBe(env.zoetis.clientId)
     })
@@ -626,9 +626,9 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       )
     })
 
-    it('a rejected order surfaces as an error — through the generic message, because vendor errors are XML', async () => {
+    it('a rejected order surfaces as an error — through the generic message, because provider errors are XML', async () => {
       /* Exercises the integration's error path, which the happy path never touches. The mock rejects
-       * a code outside its catalogue with a 400 in the vendor's XML error dialect —
+       * a code outside its catalogue with a 400 in the provider's XML error dialect —
        * `<error><message context="...">...</message></error>` — and dmi-api re-throws the engine
        * error out of createOrder, so POST /orders answers non-2xx. A separate order (unique
        * requisitionId) that never reaches COMPLETED — it lands ERROR in dmi-api — so it does not
@@ -636,10 +636,10 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        *
        * What surfaces is the GENERIC mapper message, and pinning it exactly is deliberate:
        * providerErrorMapper's structured branch reads `error.response.data.error.*`, properties
-       * axios only produces from a JSON body. With the vendor's real XML dialect `data` stays a
+       * axios only produces from a JSON body. With the provider's real XML dialect `data` stays a
        * string, the structured branch is unreachable, and the mapper falls through to
        * "A request to <path> failed with <status> status code." — so the field-name assertion this
-       * test used to make is gone on purpose; the generic surface IS the vendor-real behaviour. If
+       * test used to make is gone on purpose; the generic surface IS the provider-real behaviour. If
        * the integration ever learns to parse XML error envelopes, this pin goes red and gets
        * deliberately re-pointed at the structured surface. */
       const payload = orderPayload(org.integrationId, {
@@ -728,7 +728,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
        * direction. A PENDING result cannot move the order at all: dmi-api's
        * ProviderResultUtils.setOrderStatusFromResult only acts on COMPLETED and PARTIAL result
        * statuses, and this result is PENDING. So PARTIAL here is unambiguously the ORDERS poll
-       * carrying the mock's `PARTIAL-RESULTS` vendor status through ZoetisMapper.getOrderStatus —
+       * carrying the mock's `PARTIAL-RESULTS` provider status through ZoetisMapper.getOrderStatus —
        * the one assertion in this file that is specifically about that channel's status mapping. */
       const response = await pollUntil(
         async () => await org.api.get(`/orders/${progressiveOrderId}`),
@@ -783,9 +783,9 @@ describe('zoetis full-stack (Zoetis mock)', () => {
   })
 
   describe('a failed batch acknowledgement is retried, and the redelivery does not duplicate', () => {
-    /* The vendor's acknowledge model is at-least-once, and this is the case it exists for. The
+    /* The provider's acknowledge model is at-least-once, and this is the case it exists for. The
      * integration emits results to dmi-api and THEN acks them (ZoetisResultsProcessor), so an ack
-     * that fails leaves the batch unacked at the vendor: it is re-served on the next tick and dmi-api
+     * that fails leaves the batch unacked at the provider: it is re-served on the next tick and dmi-api
      * sees the same result a second time. Nothing in the loop above ever exercises that, because the
      * ack has never failed. */
     let retryOrderId: string
@@ -797,7 +797,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       retryRequisitionId = placed.requisitionId
 
       /* One-shot: the first batch acknowledge 500s and the injection is consumed, so the retry on the
-       * following tick succeeds. That models a transient vendor failure rather than an outage, which
+       * following tick succeeds. That models a transient provider failure rather than an outage, which
        * is what makes "eventually acknowledged" the right assertion. */
       expectOk(
         await mock.post('/__control__/scenarios', {
@@ -1000,7 +1000,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect([...received.testCodes].sort()).toEqual([serviceCode, secondCode].sort())
     }, 60_000)
 
-    it('cancelling one test removes exactly that code at the vendor and keeps the other', async () => {
+    it('cancelling one test removes exactly that code at the provider and keeps the other', async () => {
       const response = await org.api.delete(`/orders/${cancelOrderId}/tests/${secondCode}`)
       expect(response.ok).toBe(true)
 
@@ -1018,7 +1018,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
      * exists and goes red the moment someone fixes it, forcing the marker off. Mechanically:
      * dmi-api's cancelOrderTests (orders.service.ts) re-saves the order with
      * `tests: [...order.tests, ...tests]` — the cancelled test is appended to the local list, never
-     * removed — so the list still carries the cancelled code even though the vendor-side
+     * removed — so the list still carries the cancelled code even though the provider-side
      * cancellation (previous test) really happened. */
     it.failing('the dmi order\'s local test list shrinks to the remaining code', async () => {
       const order = await org.api.get(`/orders/${cancelOrderId}`)
@@ -1027,7 +1027,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect((order.body.tests as Array<{ code: string }>).map((test) => test.code)).toEqual([serviceCode])
     })
 
-    it('cancelling the order flips the vendor to CANCELLED and strips its cancel link', async () => {
+    it('cancelling the order flips the provider to CANCELLED and strips its cancel link', async () => {
       const response = await org.api.delete(`/orders/${cancelOrderId}`)
       expect(response.status).toBe(204)
 
@@ -1048,7 +1048,7 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       const order = await org.api.get(`/orders/${cancelOrderId}`)
       expect(order.body.status).toBe('CANCELLED')
 
-      /* Vendor side: status flipped, and the state-dependent link set (see linkRelsFor in the mock)
+      /* Provider side: status flipped, and the state-dependent link set (see linkRelsFor in the mock)
        * no longer advertises `cancel` — the editable flag's wire form tracks the state machine. */
       const received = expectOk<{ status: string, linkRels: string[] }>(
         await mock.get(`/__control__/orders/${cancelRequisitionId}`),
@@ -1129,11 +1129,11 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       voyRequisitionId = created.externalId
     }, 60_000)
 
-    it('re-placing an order under an existing PracticeRef is refused end to end (vendor 409)', async () => {
+    it('re-placing an order under an existing PracticeRef is refused end to end (provider 409)', async () => {
       /* The mock refuses a duplicate PracticeRef with a 409 rather than silently overwriting an
        * order that may already have results — dmi-api itself has no unique constraint on
        * requisitionId (the orders index is non-unique), so the refusal genuinely comes from the
-       * vendor side. The surface is the same generic mapper message as the rejection test above
+       * provider side. The surface is the same generic mapper message as the rejection test above
        * (XML error bodies never reach providerErrorMapper's structured branch); the 409 in the text
        * is what distinguishes this refusal from a validation 400. */
       const payload = orderPayload(org.integrationId, {

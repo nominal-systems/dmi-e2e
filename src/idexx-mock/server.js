@@ -1,6 +1,6 @@
 'use strict'
 
-/* VetConnect Plus (IDEXX) mock vendor for the dmi-e2e full-stack harness. A zero-dependency Node
+/* VetConnect Plus (IDEXX) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node
  * HTTP server that speaks IDEXX's public, documented dialect closely enough for the REAL
  * `dmi-engine-idexx-integration` container to drive it: ordering (`/api/v1/*`), the confirmOrder
  * browser handshake (`/ui` -> HTML+cookie -> XHR PUT), and results (`/api/v3/*`, latest-batch poll
@@ -10,7 +10,7 @@
  * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is.
  *
  * Data: every patient, client, veterinarian and clinic identifier here is INVENTED — no captured
- * clinic or patient data, ever. Vendor vocabulary (analyte numbers, analyzer and test codes,
+ * clinic or patient data, ever. Provider vocabulary (analyte numbers, analyzer and test codes,
  * species-level reference ranges) is taken from IDEXX's own catalogue and specs so the payloads are
  * shaped like the real thing; that is product/catalogue data, not anyone's record.
  *
@@ -25,7 +25,7 @@ const PORT = Number(process.env.PORT || 3000)
  * these from inside the compose network, so it must resolve there; we derive it from the incoming
  * request's Host header by default (whatever host the integration used to reach us), and allow an
  * explicit override for odd setups. */
-const ORIGIN_OVERRIDE = process.env.VCP_MOCK_ORIGIN || ''
+const ORIGIN_OVERRIDE = process.env.IDEXX_MOCK_ORIGIN || ''
 
 /* Monotonic idexx order id, seeded from process start time so every order gets a GLOBALLY-unique
  * externalId — even across control-plane resets and across container restarts against a warm dmi-api
@@ -36,13 +36,13 @@ let nextOrderId = Date.now()
 
 /* The one IVLS analyzer this clinic owns. Advertised by `/api/v1/ivls/devices`, required on every
  * in-house order (see validateCreateOrder), and stamped on every result's run summary — one constant
- * so the device an order names, the device the vendor lists and the device a result came from are the
+ * so the device an order names, the device the provider lists and the device a result came from are the
  * same serial by construction. Invented; not a real analyzer's serial. */
 const IVLS_DEVICE_SERIAL = 'VCPMOCK0001'
 
 function log (message) {
   /* One-line, greppable, prefixed like the harness's other services. */
-  console.log(`[vcp-mock] ${message}`)
+  console.log(`[idexx-mock] ${message}`)
 }
 
 function uuid () {
@@ -293,7 +293,7 @@ const BREED_NAMES = { LABRADOR_RETRIEVER: 'Labrador Retriever' }
  * INVALID_LAB_SERVICE_ID). A mock that advertises a catalogue but accepts anything cannot catch an
  * integration that sends a malformed or stale code.
  *
- * `IHD_DHP` is a real IDEXX in-house code from the vendor's own reference-data catalogue. Shape
+ * `IHD_DHP` is a real IDEXX in-house code from the provider's own reference-data catalogue. Shape
  * matters: the placeholder here used to be `SA`, which is not an IDEXX code in any form.
  *
  * `inHouse` is load-bearing since the integration started reading this catalogue to decide device
@@ -352,7 +352,7 @@ function sendInvalidOrder (res, problems) {
  * problems (empty when the order is acceptable).
  *
  * This mock VALIDATES rather than defaults, on purpose. Silently filling in a missing field is the
- * most dangerous thing a vendor mock can do: dmi-api reconciles a provider result back to its order
+ * most dangerous thing a provider mock can do: dmi-api reconciles a provider result back to its order
  * on patient name (+ PIMS patient id, + client last name), so a mock that invents the patient it was
  * not sent will also satisfy reconciliation — and an integration that stopped forwarding the patient
  * would leave this gate permanently green. Age and weight are genuinely optional on an IDEXX order
@@ -397,13 +397,13 @@ function validateCreateOrder (payload) {
     return [{ errorCode: 'INVALID_LAB_SERVICE_ID', message: `unknown test code(s): ${unknown.join(', ')}`, index: unknownAt }]
   }
 
-  /* The device rule, from the vendor's side. Live IDEXX cannot run an in-house test without knowing
+  /* The device rule, from the provider's side. Live IDEXX cannot run an in-house test without knowing
    * which analyzer to run it on, so an in-house order without an `ivls` device is refused. The
    * integration now enforces the same rule before the request ever leaves it (issue #76) — which is
    * exactly why the mock must enforce it too: a mock that accepted a device-less in-house order would
    * let a regression in the integration's rule (or someone flipping IDEXX_DEVICE_RULE_ENABLED off in
    * the compose file) leave this gate green. The serial must also be one this clinic owns: the only
-   * proof that the device dmi-api was given is the device the vendor received. The device-less
+   * proof that the device dmi-api was given is the device the provider received. The device-less
    * refusal uses MISSING_IVLS_SERIAL_NUMBER, straight from the errorCode list in IDEXX's own PIMS
    * Ordering API spec (the per-field family above); the foreign-serial code has no counterpart in
    * that list and is extrapolated — the refusals themselves, not the codes, are the contract there.
@@ -517,7 +517,7 @@ async function handleDeleteOrder (req, res, params) {
 
 async function handleExternalOrders (req, res) {
   /* PIMS-initiated orders the integration would pull in. The harness places orders through dmi-api,
-   * not through the vendor UI, so this poll is intentionally empty (the integration treats an empty
+   * not through the provider UI, so this poll is intentionally empty (the integration treats an empty
    * `orders` array as "nothing new"). */
   const now = nowIso()
   sendJson(res, 200, { timestamp: now, startDate: now, endDate: now, orders: [] })
@@ -709,7 +709,7 @@ function handleControlReset (req, res) {
  * groups in the RegExp become `params`. Ordering-vs-results is by path prefix (/api/v1 vs /api/v3),
  * so a single origin serves both the orderingBaseUrl and resultBaseUrl the integration is given. */
 const routes = [
-  ['GET', /^\/status$/, (req, res) => sendJson(res, 200, { status: 'ok', service: 'vcp-mock' })],
+  ['GET', /^\/status$/, (req, res) => sendJson(res, 200, { status: 'ok', service: 'idexx-mock' })],
   ['GET', /^\/health$/, (req, res) => sendJson(res, 200, { status: 'ok' })],
 
   ['GET', /^\/api\/v1\/auth\/validate$/, handleAuthValidate],
@@ -726,7 +726,7 @@ const routes = [
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
   /* `IdexxIvlsDevice` as the integration's device mapper reads it (deviceSerialNumber,
    * vcpActivatedStatus, displayName). Nothing in the harness syncs devices yet; the list exists so
-   * the clinic's one analyzer is advertised where the vendor would advertise it. */
+   * the clinic's one analyzer is advertised where the provider would advertise it. */
   ['GET', /^\/api\/v1\/ivls\/devices$/, (req, res) =>
     sendJson(res, 200, {
       ivlsDeviceList: [

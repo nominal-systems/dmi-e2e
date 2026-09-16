@@ -7,10 +7,10 @@ import { closePool } from '../src/sql'
 
 /* Phase 1 full-system gate for Antech (HARNESS_FULL_STACK=1, HARNESS_STACK=antech): dmi-api under a
  * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine-antech-integration`
- * container (the classic antech provider, id `antech`) and an Antech mock vendor (src/antech-mock).
+ * container (the classic antech provider, id `antech`) and an Antech mock provider (src/antech-mock).
  * It drives the whole loop as an integrator would — configure the antech provider pointed at the
  * mock, create an integration, start it, place an order over HTTP, let the mock produce a result,
- * and watch the order->result->report loop close — with every hop real except the vendor, which is
+ * and watch the order->result->report loop close — with every hop real except the provider, which is
  * the mock so the run is deterministic and never touches a live Antech host.
  *
  * The order flows: POST /orders -> dmi-api RPCs `antech/orders/create` to the integration -> the
@@ -272,7 +272,7 @@ describe('antech full-stack (Antech mock)', () => {
       /* The patient/client the mock echoes back on results is what dmi-api reconciles against. */
       expect(received.petName).toBe('Rex')
       expect(received.clientLastName).toBe('Doe')
-      /* The vendor-assigned accession that keys the results XML and the acknowledge call. */
+      /* The provider-assigned accession that keys the results XML and the acknowledge call. */
       expect(received.labAccessionId).toBeTruthy()
     })
 
@@ -440,7 +440,7 @@ describe('antech full-stack (Antech mock)', () => {
       )
     })
 
-    it('a rejected order surfaces the vendor field error, not a generic fallback', async () => {
+    it('a rejected order surfaces the provider field error, not a generic fallback', async () => {
       /* Exercises the integration's error path, which the happy path never touches — the antech
        * mirror of the idexx review's finding (a mock error envelope the mapper can't read leaves
        * rejections red but the mapper's real branch unexercised). The mock rejects a code outside its

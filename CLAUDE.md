@@ -9,7 +9,7 @@ short version is that this suite's only product is a trustworthy red.
 
 Black-box e2e for the DMI platform: a fast suite (smoke + tenant isolation against a real dmi-api),
 plus per-provider full-stack loops (`HARNESS_FULL_STACK=1 HARNESS_STACK=<provider>`) that boot the
-**real** provider integration container against a **synthetic** vendor mock and assert the
+**real** provider integration container against a **synthetic** provider mock and assert the
 order → result → report loop closes. This repo is **public**.
 
 ## Every assertion must be able to fail
@@ -29,9 +29,9 @@ green; the assertions were decorative. So:
 - **Never "fix" a red build by relaxing an assertion.** See the README's section of the same name —
   reds here are usually the suite doing its job.
 
-## Mocks imitate the vendor, not the test
+## Mocks imitate the provider, not the test
 
-A mock written alongside its own test encodes the author's *reading* of the vendor contract; when
+A mock written alongside its own test encodes the author's *reading* of the provider contract; when
 that reading is wrong, mock and integration agree on a fiction and the test is green forever.
 
 - **Read the integration's source first, write the mock second.** The contract is what the
@@ -39,18 +39,18 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   field names and element forms there; don't assume.
 - **Validate, never default.** A mock that fills in a missing field can fabricate exactly the value
   the scenario asserts — the test then passes *because* of the defect it should catch. Reject
-  missing required fields with the vendor's error status; a regressed integration must produce a
+  missing required fields with the provider's error status; a regressed integration must produce a
   loud red.
 - **Error envelopes are part of the contract.** Match the *field names* and the *code values* the
   integration's error mapper actually reads (e.g. an envelope keyed `errorCode` where the mock said
   `code` leaves the mapper's real branch unexercised — the test stays red-capable but proves less
   than it claims). After wiring a rejection, trigger it once and read the surfaced HTTP error:
   "goes red" is not the same as "surfaces correctly".
-- **Model the vendor's acknowledge semantics** (results persist until acked, then stop). A mock that
+- **Model the provider's acknowledge semantics** (results persist until acked, then stop). A mock that
   serves results unconditionally forever leaves the integration's ack path untested.
-- **Use real vendor catalogue codes** (test mnemonics) in the mock's catalogue, and **enforce it** —
+- **Use real provider catalogue codes** (test mnemonics) in the mock's catalogue, and **enforce it** —
   an invented code that both mock and scenario agree on is evidence about the author, not the
-  vendor.
+  provider.
 
 ## Per-provider differences that bite
 
@@ -82,12 +82,12 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   strength does not transfer with the template — re-derive it per provider. Worked example: the idexx
   and antech mocks drop an order from the orders feed permanently once acked, so the only route to a
   `COMPLETED` order is the results channel, and waiting on `COMPLETED` is a fair reconciliation proof
-  there. The zoetis mock instead models the vendor's re-notification on status change, which is more
+  there. The zoetis mock instead models the provider's re-notification on status change, which is more
   faithful — and that extra fidelity lets its orders poll reach `COMPLETED` on its own, so the same
   assertion passes with the results channel severed outright. It has to wait on the report reaching
   `FINAL`. Ask of every completion assertion: **which channels can satisfy this, and is the one I
   mean the only one?**
-- **The idexx integration decides device inclusion from the vendor catalogue.** It fetches
+- **The idexx integration decides device inclusion from the provider catalogue.** It fetches
   `/ref/tests`, and an order with any `inHouse` code must carry a `devices` serial or it is refused
   before reaching the vendor; an all-reference-lab order has its devices stripped. The mock's
   catalogue flags are therefore load-bearing: pick codes by flag, never by position. The two halves
@@ -105,6 +105,10 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile,
   integration checkout, mock endpoint, poll class) plus its compose profile, scenario and workflow —
   never another `if (env.stack === …)`; everything that varies by stack reads the registry.
+- **One name per mock: `<stack>-mock`, in every position** — directory, compose service, log
+  prefix, `/status` service name, readiness label, env prefix `HARNESS_<STACK>_MOCK_*`. The
+  provider's product name (VetConnect Plus, VetSync) belongs in prose only; a mock that goes by
+  several names is a mock nobody can grep for.
 
 ## Data hygiene — this repo is public, and history is permanent
 
@@ -113,9 +117,9 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   later removed is still published).
 - **Mock data is synthetic, authored fresh from the shapes.** Treat fixtures inside the private
   integration repos as potentially containing real clinic/patient data: read them to learn
-  structure, copy no values. Genuine vendor *catalogue* identifiers (test codes) are fine and
+  structure, copy no values. Genuine provider *catalogue* identifiers (test codes) are fine and
   preferred.
-- **Never point the harness at a live vendor host.** All base URLs resolve to the mock or the
+- **Never point the harness at a live provider host.** All base URLs resolve to the mock or the
   compose network.
 
 ## Git and PR discipline

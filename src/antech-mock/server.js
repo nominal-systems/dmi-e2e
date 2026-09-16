@@ -1,6 +1,6 @@
 'use strict'
 
-/* Antech (classic) mock vendor for the dmi-e2e full-stack harness. A zero-dependency Node HTTP
+/* Antech (classic) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node HTTP
  * server that speaks Antech's dialect closely enough for the REAL `dmi-engine-antech-integration`
  * container to drive it: token login, order placement, the JSON status poll / acknowledge pair, the
  * results XML document and the PDF manifest. A separate control plane (`/__control__/*`) lets tests
@@ -19,7 +19,7 @@ const http = require('http')
 
 const PORT = Number(process.env.PORT || 3000)
 
-/* Every vendor route lives under this prefix — the integration builds each URL as
+/* Every provider route lives under this prefix — the integration builds each URL as
  * `${baseUrl}/api/v1.1/${endpoint}` (antech.service.ts). */
 const API = '/api/v1.1'
 
@@ -170,7 +170,7 @@ const PANEL = {
  * catalogue below is a real constraint rather than decoration: a scenario that drifts onto an
  * implausible code fails here instead of quietly passing against a mock that accepts anything.
  *
- * The codes are genuine Antech service mnemonics (vendor catalogue identifiers, published to
+ * The codes are genuine Antech service mnemonics (provider catalogue identifiers, published to
  * integrators — not clinic or patient data); every description and price attached to them here is
  * invented. */
 const SERVICES = [
@@ -379,7 +379,7 @@ function buildManifestPdf (clinicAccessionId) {
   )
 }
 
-/* ---- vendor handlers ---- */
+/* ---- provider handlers ---- */
 
 async function handleLogin (req, res) {
   const scenario = takeScenario('login')
@@ -416,7 +416,7 @@ async function handleOrderPlacement (req, res) {
   const payload = await readBody(req)
 
   /* Validate rather than default. This is the difference between a mock that tests the integration
-   * and one that flatters it: every field below is one the real vendor needs and the scenario later
+   * and one that flatters it: every field below is one the real provider needs and the scenario later
    * asserts on, so substituting a fallback here would make the mock AGREE with an integration that
    * had stopped sending it — the order-forwarding assertions would then pass against the mock's own
    * invented values and could never fail. A missing field must be a loud 400, not a silent default.
@@ -452,7 +452,7 @@ async function handleOrderPlacement (req, res) {
   const clinicAccessionId = String(payload.ClinicAccessionID)
   const firstTest = payload.Tests[0]
   const mnemonic = String(firstTest.Code ?? '')
-  /* The vendor only accepts codes from its own catalogue (see SERVICES). Rejecting an unknown code
+  /* The provider only accepts codes from its own catalogue (see SERVICES). Rejecting an unknown code
    * is what stops the harness from drifting onto a plausible-looking code the real Antech would
    * refuse — which is precisely how the bare IDEXX-flavoured `SA` slipped in originally. */
   if (!SERVICES.some((service) => service.mnemonic === mnemonic)) {
@@ -469,7 +469,7 @@ async function handleOrderPlacement (req, res) {
 
   const order = {
     clinicAccessionId,
-    /* Lab-side ids the vendor assigns. `labAccessionId` is the ack key and the XML join key. */
+    /* Lab-side ids the provider assigns. `labAccessionId` is the ack key and the XML join key. */
     labAccessionId: `HRN${nextLabAccession++}`,
     accResultId: String(nextLabAccession),
     clinicId: String(payload.ClinicID ?? '900001'),
@@ -594,7 +594,7 @@ async function handleAckStatus (req, res) {
    * The response body is ignored by the integration.
    *
    * Acknowledging an id the mock never issued is answered 200 rather than 4xx — deliberately. Ack is
-   * idempotent-by-nature at the vendor (a retried batch must not fail), and the integration's error
+   * idempotent-by-nature at the provider (a retried batch must not fail), and the integration's error
    * path is fragile enough that a 4xx here would surface as a confusing unrelated failure. It IS
    * logged, so an integration acking phantom ids is visible in the container logs rather than
    * silently absorbed. */
@@ -716,7 +716,7 @@ function handleControlReset (req, res) {
 /* ---- router ---- */
 
 /* Each route is [method, RegExp over the pathname, handler(req,res,params,query)]. Named capture
- * groups in the RegExp become `params`. The accessToken query param every vendor route carries is
+ * groups in the RegExp become `params`. The accessToken query param every provider route carries is
  * deliberately not validated — the harness's credentials are dummy by design. */
 const routes = [
   ['GET', /^\/status$/, (req, res) => sendJson(res, 200, { status: 'ok', service: 'antech-mock' })],
@@ -731,7 +731,7 @@ const routes = [
 
   /* Reference data. The harness never triggers a ref sync, but the integration exposes these and a
    * mock that 404s on them would be a trap for the next scenario. The service list is the same
-   * SERVICES catalogue that order placement enforces, so what the vendor advertises and what it
+   * SERVICES catalogue that order placement enforces, so what the provider advertises and what it
    * accepts cannot drift apart. */
   ['GET', new RegExp(`^${API}/External/ServiceList$`), (req, res) =>
     sendJson(res, 200, SERVICES.map((service, index) => ({

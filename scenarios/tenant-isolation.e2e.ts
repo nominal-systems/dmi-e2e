@@ -15,9 +15,9 @@ import { closePool, insertReport } from '../src/sql'
  * tests below, fixed in dmi-api #361, are the first). See README.md — do not "fix" a red build
  * here by relaxing an assertion. */
 
-/* `orderPayload` takes no default test code — every vendor rejects codes outside its own catalogue,
+/* `orderPayload` takes no default test code — every provider rejects codes outside its own catalogue,
  * so a shared default is wrong for all but one provider. This suite runs under NODE_ENV=seed, where
- * dmi-api returns before any engine round-trip, so no vendor ever sees this code; it just has to be
+ * dmi-api returns before any engine round-trip, so no provider ever sees this code; it just has to be
  * present and stable. */
 const ANY_TEST_CODE = [{ code: 'HARNESS-TENANT-ISOLATION' }]
 
