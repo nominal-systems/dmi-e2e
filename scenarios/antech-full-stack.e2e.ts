@@ -51,7 +51,7 @@ const GLUCOSE = '1001'
 const CREATININE = '1002'
 const HEMOLYSIS_INDEX = '1003'
 
-/* The three patient fields dmi-api ref-maps on the way to the vendor, as (canonical dmi ref name ->
+/* The three patient fields dmi-api ref-maps on the way to the provider, as (canonical dmi ref name ->
  * the antech code it must arrive as). Unlike zoetis, antech maps ALL THREE: species and sex, and
  * breed to a numeric BreedID.
  *
@@ -60,10 +60,10 @@ const HEMOLYSIS_INDEX = '1003'
  * pinned as literals here. Input and expected output are deliberately different values: if the
  * antech provider_ref rows stopped resolving, mapPatientRefs falls back to forwarding the raw code,
  * the mock — which echoes species/breed/sex and does not validate them — stores the raw code, and
- * the value assertion below goes red naming it, instead of a well-formed order the real vendor
+ * the value assertion below goes red naming it, instead of a well-formed order the real provider
  * would reject.
  *
- * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
+ * Which rows exist is a property of dmi-api's migrations, not of anything synced from the provider —
  * the harness never runs the ref sync. They seed antech species (Canine 41, Feline 42, Bovine 45 and
  * the exotic species), sex codes (Male Sterilized -> CM, Female Sterilized -> SF, ...), and ~1,100
  * dog-breed mappings from Antech's own breed catalogue. Every dmi breed ref carries an opaque UUID
@@ -283,10 +283,10 @@ describe('antech full-stack (Antech mock)', () => {
       )
 
       /* THE POINT OF THIS TEST. species, breed and sex are the only order fields dmi-api transforms
-       * on the way to the vendor, and they must arrive in ANTECH's vocabulary. Asserting the exact
+       * on the way to the provider, and they must arrive in ANTECH's vocabulary. Asserting the exact
        * mapped values — types included: numeric ids arrive as numbers — is what makes a silently
        * broken ref mapping fail here, naming the raw code that got through, instead of producing a
-       * well-formed order the real vendor would reject. The mock echoes these and never validates
+       * well-formed order the real provider would reject. The mock echoes these and never validates
        * them, so this assertion is the only thing between a mapping regression and a green run. */
       expect(received.speciesId).toBe(EXPECTED_ANTECH_SPECIES)
       expect(received.breedId).toBe(EXPECTED_ANTECH_BREED)
