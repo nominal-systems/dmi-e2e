@@ -122,7 +122,9 @@ export function describeCheckout (dir: string): string {
 export function versionsUnderTest (): Record<string, string> {
   const versions: Record<string, string> = { 'dmi-e2e': describeCheckout(env.harnessRoot) }
   versions['dmi-api'] = env.manageApp ? describeCheckout(env.dmiApiDir) : `external, at ${env.baseUrl}`
-  if (env.integration != null) versions[env.integration.name] = describeCheckout(env.integration.dir)
+  /* Every checkout the registry lists for the loop — one for a self-contained integration, the
+   * host engine plus the injected provider modules for a loop hosted by a shared container. */
+  for (const checkout of env.checkouts) versions[checkout.name] = describeCheckout(checkout.dir)
   return versions
 }
 

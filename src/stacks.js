@@ -2,8 +2,8 @@
 
 /* The stack registry — the one place that knows what each full-system loop is made of. Every
  * consumer derives from it: jest.config.js (which scenario file to run, the poll-budget class, the
- * report suite name), src/env.ts (validation of HARNESS_STACK, the integration checkout the run
- * report records, the mock's host-facing URL), src/containers.ts (compose profile, readiness),
+ * report suite name), src/env.ts (validation of HARNESS_STACK, the checkouts the run report
+ * records, the mock's host-facing URL), src/containers.ts (compose profile, readiness),
  * src/report/report.ts (suite order) and scripts/nightly.sh (which checkouts to pull, via the CLI
  * at the bottom). Adding a loop is one entry here plus its compose profile, scenario and workflow
  * — never another if/else keyed on the stack name — and `verifyStacks()` below checks that the
@@ -14,14 +14,16 @@
  * src/env.ts imports it under `allowJs`, and its `StackName` type is `keyof typeof stacks` —
  * derived from this object, not restated.
  *
- * The stack key is the harness's name for a loop (the HARNESS_STACK value, the report suite, the
- * workflow) and is distinct from `providerId`, dmi-api's id for the provider. They coincide today,
- * but a provider with several API generations gets one dmi-api id per generation (`antech`,
- * `antech-v6`) while the harness may want a different key for the classic loop (`antech-v3`), and
- * two stacks may be served by one integration container. Keep both. `providerId` has no reader
- * yet: each scenario still carries its own literal (`providerId: 'idexx'` in the seed options),
- * so the two must be kept in step by hand until the first consumer — the shared-container work —
- * makes the scenarios read it from here. */
+ * The stack key is the harness's name for a loop — the HARNESS_STACK value, the report suite, the
+ * workflow, the compose profile, the mock (`<key>-mock`, CLAUDE.md) and the env prefix — and is
+ * distinct from `providerId`, dmi-api's id for the provider. They coincide for most loops, but a
+ * provider with several API generations gets one dmi-api id per generation (`antech` is classic
+ * Antech, V3; `antech-v6` the next), and the harness keys the classic loop `antech-v3` so that
+ * nothing derived from the key — files, env variables, the workflow's `paths:` glob — can be
+ * mistaken for the V6 loop's. Keys must not be prefixes of one another for the same reason
+ * (`verifyStacks()` refuses that). `providerId` has no reader yet: each scenario still carries
+ * its own literal (`providerId: 'idexx'` in the seed options), so the two must be kept in step
+ * by hand until the first consumer makes the scenarios read it from here. */
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const fs = require('fs')
@@ -33,10 +35,13 @@ const stacks = {
     providerId: 'idexx',
     scenario: 'scenarios/idexx-full-stack.e2e.ts',
     composeProfile: 'idexx',
-    /* The real integration container is built from this sibling checkout — the variable overrides
-     * the location, with the same default docker-compose.yml uses — and the run report records
-     * its version. */
-    integration: { repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' },
+    /* The sibling checkouts this loop's containers are built from: for a loop like this one, the
+     * real integration's repo; for a loop hosted by a shared engine container, the host repo plus
+     * the provider module(s) injected into it. Each variable overrides that checkout's location,
+     * with the same default docker-compose.yml uses, and the run report records every one of them.
+     * Several loops may list the same checkout (same repo, same variable): the nightly pulls it
+     * once, and `verifyStacks()` refuses a variable that names different repos in different loops. */
+    checkouts: [{ repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' }],
     /* The mock's host-facing endpoint: its published port, the URL variable that overrides the
      * whole thing, and the name readiness logs call it. Readiness is `<baseUrl>/status`. One name
      * per mock: label, urlVariable and portVariable all derive from `<stack>-mock` (CLAUDE.md). */
@@ -50,15 +55,18 @@ const stacks = {
     /* idexx exposes IDEXX_*_POLLING_INTERVAL_MS, which the harness dials down to ~3s. */
     slowPoll: false,
   },
-  antech: {
+  'antech-v3': {
+    /* Classic Antech. dmi-api's id for the provider is the bare `antech` (it predates V6); the
+     * harness key carries the generation, see the header. The integration repo keeps its own
+     * name too — it is `dmi-engine-antech-integration` on GitHub. */
     providerId: 'antech',
-    scenario: 'scenarios/antech-full-stack.e2e.ts',
-    composeProfile: 'antech',
-    integration: { repo: 'dmi-engine-antech-integration', dirVariable: 'DMI_ANTECH_INTEGRATION_DIR' },
+    scenario: 'scenarios/antech-v3-full-stack.e2e.ts',
+    composeProfile: 'antech-v3',
+    checkouts: [{ repo: 'dmi-engine-antech-integration', dirVariable: 'DMI_ANTECH_V3_INTEGRATION_DIR' }],
     mock: {
-      label: 'antech-mock',
-      urlVariable: 'HARNESS_ANTECH_MOCK_URL',
-      portVariable: 'HARNESS_ANTECH_MOCK_PORT',
+      label: 'antech-v3-mock',
+      urlVariable: 'HARNESS_ANTECH_V3_MOCK_URL',
+      portVariable: 'HARNESS_ANTECH_V3_MOCK_PORT',
       defaultPort: 3013,
       pathPrefix: '',
     },
@@ -71,7 +79,7 @@ const stacks = {
     providerId: 'zoetis',
     scenario: 'scenarios/zoetis-full-stack.e2e.ts',
     composeProfile: 'zoetis',
-    integration: { repo: 'dmi-engine-zoetis-integration', dirVariable: 'DMI_ZOETIS_INTEGRATION_DIR' },
+    checkouts: [{ repo: 'dmi-engine-zoetis-integration', dirVariable: 'DMI_ZOETIS_INTEGRATION_DIR' }],
     mock: {
       label: 'zoetis-mock',
       urlVariable: 'HARNESS_ZOETIS_MOCK_URL',
@@ -79,17 +87,17 @@ const stacks = {
       defaultPort: 3014,
       pathPrefix: '',
     },
-    /* Hardcoded 30s poll, as antech. */
+    /* Hardcoded 30s poll, as antech-v3. */
     slowPoll: true,
   },
   demo: {
     providerId: 'demo',
     scenario: 'scenarios/full-stack-smoke.e2e.ts',
     composeProfile: 'full-stack',
-    integration: {
+    checkouts: [{
       repo: 'dmi-engine-demo-provider-integration',
       dirVariable: 'DMI_DEMO_INTEGRATION_DIR',
-    },
+    }],
     /* Not a mock but the demo provider itself (dmi-demo-provider-api), under its `/demo` global
      * prefix. The harness mints an API key from it during seeding, so it must be up first. */
     mock: {
@@ -156,8 +164,17 @@ function verifyStacks () {
     if (!declaredProfiles.has(entry.composeProfile)) {
       fail(key, 'composeProfile', `'${entry.composeProfile}' is declared by no service in docker-compose.yml (declared: ${[...declaredProfiles].sort().join(', ')})`)
     }
-    if (typeof entry.integration?.repo !== 'string' || entry.integration.repo === '') fail(key, 'integration.repo', 'missing')
-    if (!/^[A-Z][A-Z0-9_]*$/.test(entry.integration?.dirVariable ?? '')) fail(key, 'integration.dirVariable', 'must be an environment variable name')
+    if (!Array.isArray(entry.checkouts) || entry.checkouts.length === 0) {
+      fail(key, 'checkouts', 'must list at least one sibling checkout')
+    } else {
+      const variables = new Set()
+      entry.checkouts.forEach((checkout, i) => {
+        if (typeof checkout?.repo !== 'string' || checkout.repo === '') fail(key, `checkouts[${i}].repo`, 'missing')
+        if (!/^[A-Z][A-Z0-9_]*$/.test(checkout?.dirVariable ?? '')) fail(key, `checkouts[${i}].dirVariable`, 'must be an environment variable name')
+        if (variables.has(checkout?.dirVariable)) fail(key, 'checkouts', `${checkout.dirVariable} is listed twice`)
+        variables.add(checkout?.dirVariable)
+      })
+    }
     for (const field of ['label', 'urlVariable', 'portVariable']) {
       if (typeof entry.mock?.[field] !== 'string' || entry.mock[field] === '') fail(key, `mock.${field}`, 'missing')
     }
@@ -178,6 +195,26 @@ function verifyStacks () {
     }
   }
 
+  /* Across loops. A checkout shared by several loops is ONE checkout: a variable must always name
+   * the same repo, or two loops would pull and record different things under one location. And
+   * since every workflow's `paths:` glob is `scenarios/<key>*.e2e.ts`, a key that is a prefix of
+   * another key's would fire its workflow on the other loop's scenario edits too — the reason the
+   * classic Antech loop is `antech-v3` and not `antech` beside `antech-v6`. */
+  const repoOf = new Map()
+  const keys = Object.keys(stacks)
+  for (const key of keys) {
+    for (const { repo, dirVariable } of Array.isArray(stacks[key].checkouts) ? stacks[key].checkouts : []) {
+      const other = repoOf.get(dirVariable)
+      if (other != null && other.repo !== repo) fail(key, 'checkouts', `${dirVariable} names ${repo} here but ${other.repo} in ${other.key}`)
+      repoOf.set(dirVariable, { key, repo })
+    }
+    for (const otherKey of keys) {
+      if (otherKey !== key && otherKey.startsWith(key)) {
+        fail(key, 'key', `is a prefix of '${otherKey}' — the workflow glob 'scenarios/${key}*.e2e.ts' would match ${otherKey}'s scenario too`)
+      }
+    }
+  }
+
   /* The validator itself: a registry whose gate stopped throwing would pass everything above. */
   let refused = false
   try { resolveStack('no-such-stack') } catch { refused = true }
@@ -192,21 +229,22 @@ module.exports = { stacks, defaultStack, resolveStack, suiteName, verifyStacks }
 
 /* CLI for shell callers (scripts/nightly.sh), so no script re-derives what the registry knows:
  *   node src/stacks.js list                → one key per line
- *   node src/stacks.js integration <key>   → "<repo> <dirVariable>" — exit 1 naming the key if unknown
+ *   node src/stacks.js checkouts <key>     → one "<repo> <dirVariable>" line per checkout the loop
+ *                                            is built from — exit 1 naming the key if unknown
  *   node src/stacks.js check               → verifyStacks(), exit 1 with the problems if any */
 if (require.main === module) {
   const [command, key] = process.argv.slice(2)
   try {
     if (command === 'list') {
       console.log(Object.keys(stacks).join('\n'))
-    } else if (command === 'integration') {
-      const { integration } = stacks[resolveStack(key)]
-      console.log(`${integration.repo} ${integration.dirVariable}`)
+    } else if (command === 'checkouts') {
+      const { checkouts } = stacks[resolveStack(key)]
+      console.log(checkouts.map(({ repo, dirVariable }) => `${repo} ${dirVariable}`).join('\n'))
     } else if (command === 'check') {
       verifyStacks()
       console.log(`stack registry ok: ${Object.keys(stacks).join(', ')}`)
     } else {
-      throw new Error('usage: node src/stacks.js list | integration <key> | check')
+      throw new Error('usage: node src/stacks.js list | checkouts <key> | check')
     }
   } catch (error) {
     console.error(error.message)

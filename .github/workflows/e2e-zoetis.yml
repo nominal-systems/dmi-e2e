@@ -3,12 +3,12 @@ name: e2e-zoetis
 # Full-system zoetis suite (HARNESS_FULL_STACK=1, HARNESS_STACK=zoetis): dmi-api + mosquitto + redis +
 # the Zoetis mock (built from this repo) + the REAL dmi-engine-zoetis-integration container. It boots
 # ~7 containers and builds the integration image, so it is scoped exactly like e2e-idexx.yml and
-# e2e-antech.yml:
+# e2e-antech-v3.yml:
 #
 #   - push to main   ALWAYS. Cheap insurance that main never silently breaks, and push events carry
 #                    secrets so there is no fork problem.
 #   - pull_request   Only when the harness, the Zoetis mock, compose or the zoetis scenario actually
-#                    changes — a docs tweak or an antech-only edit shouldn't pay for it. This is why
+#                    changes — a docs tweak or an antech-v3-only edit shouldn't pay for it. This is why
 #                    each loop gets its own workflow rather than another job in e2e.yml.
 #   - dispatch       On demand.
 #
@@ -18,7 +18,7 @@ name: e2e-zoetis
 # mock, whose data is synthetic, and the mock builds even the URLs the integration POSTs back to
 # (the order-status `link href`s) from the request's own Host header.
 #
-# Note this suite is slower than the idexx one, for the same reason the antech one is: the zoetis
+# Note this suite is slower than the idexx one, for the same reason the antech-v3 one is: the zoetis
 # integration hardcodes both its Bull poll intervals to 30s with no env knob (unlike idexx's
 # IDEXX_*_POLLING_INTERVAL_MS), so the loop waits whole intervals rather than the ~3s the idexx run
 # is dialled down to.

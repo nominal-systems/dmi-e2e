@@ -165,6 +165,11 @@ export interface OrderPayloadOverrides extends Record<string, unknown> {
    * wrong for every provider but the one it was written for. This used to default to `SA`, an
    * invented code that no IDEXX catalogue contains — and each new provider loop inherited it. */
   testCodes: Array<{ code: string }>
+  /* Provider-specific requisition parameters, forwarded as the order's `labRequisitionInfo` and
+   * checked by dmi-api against the parameters the provider declares (a required one missing is a
+   * 400 before the engine is involved). No current loop needs one; a provider whose orders carry a
+   * kit or requisition code (wisdom-panel's `KitCode`) supplies it here. */
+  labRequisitionInfo?: Record<string, unknown>
 }
 
 export function orderPayload (

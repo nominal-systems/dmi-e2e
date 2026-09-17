@@ -5,9 +5,10 @@ import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
-/* Phase 1 full-system gate for Antech (HARNESS_FULL_STACK=1, HARNESS_STACK=antech): dmi-api under a
- * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine-antech-integration`
- * container (the classic antech provider, id `antech`) and an Antech mock provider (src/antech-mock).
+/* Phase 1 full-system gate for classic Antech, V3 (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3):
+ * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
+ * `dmi-engine-antech-integration` container (dmi-api provider id `antech` — it predates V6; the
+ * harness key carries the generation) and the antech-v3 mock provider (src/antech-v3-mock).
  * It drives the whole loop as an integrator would — configure the antech provider pointed at the
  * mock, create an integration, start it, place an order over HTTP, let the mock produce a result,
  * and watch the order->result->report loop close — with every hop real except the provider, which is
@@ -24,7 +25,7 @@ import { closePool } from '../src/sql'
  *
  * How this differs from the idexx loop, all verified against the integration's source:
  *   - Results are XML, not JSON. The mock synthesises a <LabReport> document that the integration's
- *     AntechResultMapper parses (see src/antech-mock/server.js for the shape constraints).
+ *     AntechResultMapper parses (see src/antech-v3-mock/server.js for the shape constraints).
  *   - Auth is a token in a ?accessToken= query param, not Basic + X-Pims-* headers. The integration
  *     logs in again before every single request. The mock accepts any credential VALUES (they are
  *     dummy by design) but requires them to be PRESENT.
@@ -77,7 +78,7 @@ const EXPECTED_ANTECH_SEX = 'CM'
 const BREED_REF_NAME = 'Labrador Retriever'
 const EXPECTED_ANTECH_BREED = 130
 
-describe('antech full-stack (Antech mock)', () => {
+describe('antech-v3 full-stack (classic Antech mock)', () => {
   let org: SeededOrg
   let admin: ApiClient
   let orderId: string
@@ -98,7 +99,7 @@ describe('antech full-stack (Antech mock)', () => {
   let sexRefCode: string
   let breedRefCode: string
   /* Client for the mock's host-facing control plane (/__control__/*, /status). */
-  const mock = ApiClient.create(env.antech.mockBaseUrl)
+  const mock = ApiClient.create(env.antechV3.mockBaseUrl)
 
   beforeAll(async () => {
     /* A fresh container starts clean; reset is only load-bearing for warm reruns (HARNESS_KEEP_UP),
@@ -119,18 +120,18 @@ describe('antech full-stack (Antech mock)', () => {
      * UserName/Password/ClinicID as strings and LabId as an integer — a stringified LabId is
      * rejected). uiBaseUrl is only ever string-built into submission/manifest URIs by the
      * integration, never fetched, but it still points at the mock rather than a live Antech host. */
-    org = await seedOrganization(root, 'antech', {
+    org = await seedOrganization(root, 'antech-v3', {
       providerId: 'antech',
       configuration: {
-        baseUrl: env.antech.baseUrl,
-        uiBaseUrl: env.antech.uiBaseUrl,
-        PimsIdentifier: env.antech.pimsIdentifier,
+        baseUrl: env.antechV3.baseUrl,
+        uiBaseUrl: env.antechV3.uiBaseUrl,
+        PimsIdentifier: env.antechV3.pimsIdentifier,
       },
       integrationOptions: {
-        UserName: env.antech.username,
-        Password: env.antech.password,
-        ClinicID: env.antech.clinicId,
-        LabId: env.antech.labId,
+        UserName: env.antechV3.username,
+        Password: env.antechV3.password,
+        ClinicID: env.antechV3.clinicId,
+        LabId: env.antechV3.labId,
       },
     })
 
@@ -148,7 +149,7 @@ describe('antech full-stack (Antech mock)', () => {
     admin = await adminLogin(root)
     const startResponse = await admin.post(`/admin/integrations/${org.integrationId}/start`)
     console.log(
-      `[antech-scenario] integration start -> HTTP ${startResponse.status}: ${startResponse.text.slice(0, 200)}`,
+      `[antech-v3-scenario] integration start -> HTTP ${startResponse.status}: ${startResponse.text.slice(0, 200)}`,
     )
   }, 120_000)
 
@@ -176,12 +177,12 @@ describe('antech full-stack (Antech mock)', () => {
       })
     })
 
-    it('the Antech mock is reachable', async () => {
+    it('the antech-v3 mock is reachable', async () => {
       const response = await mock.get('/status')
 
       expect(response.status).toBe(200)
       expect(response.body.status).toBe('ok')
-      expect(response.body.service).toBe('antech-mock')
+      expect(response.body.service).toBe('antech-v3-mock')
     })
 
     it('the quickstart bootstrap completed (org, antech provider config, integration)', () => {
@@ -456,7 +457,7 @@ describe('antech full-stack (Antech mock)', () => {
 
       const response = await org.api.post('/orders', payload)
       console.log(
-        `[antech-scenario] rejected-order response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+        `[antech-v3-scenario] rejected-order response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
       )
 
       expect(response.ok).toBe(false)
