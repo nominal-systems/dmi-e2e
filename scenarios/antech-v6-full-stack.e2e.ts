@@ -4,7 +4,7 @@ import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
-import { closePool } from '../src/sql'
+import { closePool, query } from '../src/sql'
 
 /* Full-system gate for Antech V6 (HARNESS_FULL_STACK=1, HARNESS_STACK=antech-v6): dmi-api under a
  * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine` container — which is
@@ -183,6 +183,17 @@ interface ReportBody {
   testResultsSet?: TestResultSet[]
 }
 
+/* dmi-api's ref types, as the `ref`/`provider_ref` tables spell them: SINGULAR. The public
+ * `GET /refs/<kind>` routes use the plural; the admin ones take a `:type` they pass straight into
+ * the query, so they need the singular. */
+type RefType = 'species' | 'breed' | 'sex'
+
+interface ProviderRefItem {
+  code: string
+  name: string
+  species?: string
+}
+
 interface CatalogueEntry {
   code: string
   name: string
@@ -233,6 +244,15 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   let catalogue: CatalogueEntry[] = []
   let pocCodes: string[] = []
   let referenceLabCode = ''
+
+  /* The provider's own reference data, read through the engine at setup (see beforeAll). */
+  let liveSpecies: ProviderRefItem[] = []
+  let liveBreeds: ProviderRefItem[] = []
+  let liveSexes: ProviderRefItem[] = []
+  /* What the admin ref sync did, recorded rather than asserted — the tripwire reports it. */
+  let syncResponse: { status: number, ok: boolean, text: string } = { status: 0, ok: false, text: '' }
+  let speciesRefsAfterSync = -1
+  let providerRefsWereSeededDirectly = false
 
   /* Canonical dmi ref codes (opaque UUIDs), resolved by name at setup. */
   let speciesRefCode = ''
@@ -301,9 +321,19 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
   /* Admin helpers for the ref sync + mapping. dmi ref ids are numeric row ids (the CODES are the
    * UUIDs), so both halves of a mapping have to be looked up rather than known. */
-  async function canonicalRefId (type: 'species' | 'breeds' | 'sexes', name: string): Promise<number> {
+  /* NOTE the explicit `page`: both admin listings declare their query as an INTERSECTION TYPE
+   * (`PaginationDto & { search?: string }`) rather than a DTO class, so Nest's ValidationPipe never
+   * instantiates PaginationDto and its `page = 1` default never applies — a caller that omits it
+   * gets a 500 ("Provided \"skip\" value is not a number"). Supplying it is the workaround, not a
+   * preference. */
+  async function canonicalRefId (type: RefType, name: string): Promise<number> {
+    /* SINGULAR, and that is not a typo. `GET /admin/refs/:type` declares its parameter as
+     * 'species' | 'breeds' | 'sexes' but uses it verbatim as `ref.type = :type`, and the column
+     * holds the singular ('species', 'breed', 'sex') — so the two plural values the signature
+     * advertises match no rows at all and the route answers an empty page. `species` works only
+     * because it is spelled the same either way. */
     const listing = expectOk<{ data: Array<{ id: number, name: string, code: string }> }>(
-      await admin.get(`/admin/refs/${type}`, { search: name, limit: 200 }),
+      await admin.get(`/admin/refs/${type}`, { search: name, page: 1, limit: 200 }),
       `list dmi ${type} refs matching '${name}'`,
     )
     const matches = listing.data.filter((ref) => ref.name === name)
@@ -316,26 +346,37 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     return matches[0].id
   }
 
-  async function providerRefs (type: 'species' | 'breed' | 'sex'): Promise<Array<{ id: number, code: string, name: string }>> {
+  async function providerRefs (type: RefType): Promise<Array<{ id: number, code: string, name: string }>> {
     const listing = expectOk<{ data: Array<{ id: number, code: string, name: string }> }>(
-      await admin.get(`/admin/providers/antech-v6/refs/${type}`, { limit: 500 }),
+      await admin.get(`/admin/providers/antech-v6/refs/${type}`, { page: 1, limit: 500 }),
       `list antech-v6 ${type} provider refs`,
     )
     return listing.data
   }
 
-  async function mapRef (
-    refType: 'species' | 'breeds' | 'sexes',
-    refName: string,
-    providerType: 'species' | 'breed' | 'sex',
-    providerCode: string,
+  /* Write provider_ref rows straight into MySQL. The one sanctioned crack in the black box (see
+   * src/sql.ts): no HTTP route creates a provider_ref, and the admin route that should is broken.
+   * The table is part of dmi-api's migration-defined schema, so a schema change breaks this loudly
+   * — which is the point of doing it in raw SQL rather than through an ORM. */
+  async function insertProviderRefs (
+    type: 'species' | 'breed' | 'sex',
+    items: ProviderRefItem[],
   ): Promise<void> {
-    const refId = await canonicalRefId(refType, refName)
-    const providerRef = (await providerRefs(providerType)).find((entry) => entry.code === providerCode)
+    for (const item of items) {
+      await query(
+        'INSERT INTO `provider_ref` (`code`, `name`, `species`, `type`, `provider`) VALUES (?, ?, ?, ?, ?)',
+        [item.code, item.name, item.species ?? null, type, 'antech-v6'],
+      )
+    }
+  }
+
+  async function mapRef (type: RefType, refName: string, providerCode: string): Promise<void> {
+    const refId = await canonicalRefId(type, refName)
+    const providerRef = (await providerRefs(type)).find((entry) => entry.code === providerCode)
     if (providerRef === undefined) {
       throw new Error(
-        `the antech-v6 ref sync produced no ${providerType} provider ref with code '${providerCode}' — ` +
-          'either the sync did not run or the mock catalogue changed',
+        `dmi-api holds no antech-v6 ${type} provider ref with code '${providerCode}' — ` +
+          'either the reference data never reached it or the mock catalogue changed',
       )
     }
     expectOk(
@@ -343,7 +384,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         providerId: 'antech-v6',
         providerRefId: providerRef.id,
       }),
-      `map dmi ${refType} '${refName}' to antech-v6 ${providerType} '${providerCode}'`,
+      `map dmi ${type} '${refName}' to antech-v6 ${type} '${providerCode}'`,
     )
   }
 
@@ -391,26 +432,63 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     )
     expectOk(startResponse, 'start integration')
 
-    /* The operator's real path, and the only way antech-v6 gets provider_ref rows at all: dmi-api
-     * asks the engine for the provider's species/breeds/sexes lists and upserts them. The species
-     * and breed lists come from the MOCK's GetSpeciesBreed; the sex list is the integration's own
-     * local enum and needs no endpoint. */
-    const syncResponse = await admin.post('/admin/refs/sync/antech-v6', undefined, {
+    /* Read the provider's reference data LIVE, through the engine. `GET /refs/<kind>/<providerId>`
+     * does the same RPC dmi-api's ref sync does and hands the answer straight back without storing
+     * it — so this is the round trip itself: dmi-api -> MQTT -> the engine -> the integration ->
+     * the mock's `Master/v6/GetSpeciesBreed` (species and breeds) or the integration's own local
+     * sex enum (sexes), and back. Everything downstream is derived from these three lists. */
+    liveSpecies = expectOk<{ items: ProviderRefItem[] }>(
+      await org.api.get('/refs/species/antech-v6', { integrationId: org.integrationId }),
+      'read the antech-v6 species list through the engine',
+    ).items
+    liveBreeds = expectOk<{ items: ProviderRefItem[] }>(
+      await org.api.get('/refs/breeds/antech-v6', { integrationId: org.integrationId }),
+      'read the antech-v6 breed list through the engine',
+    ).items
+    liveSexes = expectOk<{ items: ProviderRefItem[] }>(
+      await org.api.get('/refs/sexes/antech-v6', { integrationId: org.integrationId }),
+      'read the antech-v6 sex list through the engine',
+    ).items
+
+    /* The operator's real path: dmi-api asks the engine for those same lists and UPSERTS them as
+     * `provider_ref` rows, which is the only thing that makes a canonical ref mappable to a
+     * provider code. It is attempted here rather than asserted, because it does not work — see the
+     * tripwire below, which pins the correct behaviour. The outcome is recorded so that tripwire
+     * can report what actually happened rather than re-running it. */
+    syncResponse = await admin.post('/admin/refs/sync/antech-v6', undefined, {
       integrationId: org.integrationId,
     })
     console.log(
-      `[antech-v6-scenario] refs sync -> HTTP ${syncResponse.status}: ${syncResponse.text.slice(0, 200)}`,
+      `[antech-v6-scenario] refs sync -> HTTP ${syncResponse.status}: ${syncResponse.text.slice(0, 300)}`,
     )
-    expectOk(syncResponse, 'sync antech-v6 provider refs')
+    speciesRefsAfterSync = (await providerRefs('species')).length
+
+    if (speciesRefsAfterSync === 0) {
+      /* Fallback, so the ref-MAPPING coverage below is not lost to the sync defect. The rows are
+       * built from the three lists fetched above — i.e. from the provider's own catalogue, read
+       * over the wire this run — and not from literals in this file, so what dmi-api ends up
+       * holding is still the provider's data rather than the test's opinion of it. Inserted
+       * straight into MySQL because no other route creates a provider_ref; `POST /admin/refs/:id/
+       * mapping`, which does work, then joins them to the canonical refs over HTTP as an operator
+       * would. */
+      await insertProviderRefs('species', liveSpecies)
+      await insertProviderRefs('breed', liveBreeds)
+      await insertProviderRefs('sex', liveSexes)
+      providerRefsWereSeededDirectly = true
+      console.log(
+        '[antech-v6-scenario] the admin ref sync stored nothing; provider refs seeded directly from ' +
+          'the catalogue the engine returned (see the ref-sync tripwire)',
+      )
+    }
 
     speciesRefCode = await lookupRefCode(org.api, 'species', SPECIES_REF_NAME)
     breedRefCode = await lookupRefCode(org.api, 'breeds', BREED_REF_NAME)
     sexRefCode = await lookupRefCode(org.api, 'sexes', SEX_REF_NAME)
     unmappedSpeciesRefCode = await lookupRefCode(org.api, 'species', UNMAPPED_SPECIES_REF_NAME)
 
-    await mapRef('species', SPECIES_REF_NAME, 'species', String(EXPECTED_SPECIES_ID))
-    await mapRef('breeds', BREED_REF_NAME, 'breed', String(EXPECTED_BREED_ID))
-    await mapRef('sexes', SEX_REF_NAME, 'sex', EXPECTED_PET_SEX)
+    await mapRef('species', SPECIES_REF_NAME, String(EXPECTED_SPECIES_ID))
+    await mapRef('breed', BREED_REF_NAME, String(EXPECTED_BREED_ID))
+    await mapRef('sex', SEX_REF_NAME, EXPECTED_PET_SEX)
   }, 180_000)
 
   afterAll(async () => {
@@ -483,12 +561,39 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(catalogue.find((test) => test.code === referenceLabCode)?.pointOfCare).toBe(false)
     })
 
-    it('the ref sync created antech-v6 provider refs from the mock\'s own species/breed catalogue', async () => {
-      /* dmi-api ships no antech-v6 provider_ref rows, so everything here was produced by the sync
-       * this run performed: the engine called the mock's GetSpeciesBreed and dmi-api upserted what
-       * came back. Asserting the exact codes proves the sync read the provider rather than
-       * inventing anything — and species 49 with its single breed 648 is the pairing that makes the
-       * unmapped-patient refusal real (see the tripwire at the bottom). */
+    it('the engine reads Antech\'s species, breed and sex catalogue over the reference-data RPC', () => {
+      /* The round trip itself: dmi-api -> MQTT -> the engine -> the integration -> the mock's
+       * `Master/v6/GetSpeciesBreed`, and back, fetched at setup through `GET /refs/<kind>/antech-v6`
+       * (which does the RPC and returns the answer without storing it).
+       *
+       * The exact values matter. `getSpecies` maps each species to `{name, code: String(id)}` and
+       * `getBreeds` FLATTENS the tree, tagging each breed with `species: String(species.id)` — so
+       * this also pins that the flattening kept the parentage, which is the only thing that makes
+       * the 49 + 370 pairing detectable further down. */
+      expect(liveSpecies.map((item) => item.code).sort()).toEqual(['41', '42', '49'])
+      expect(liveSpecies.find((item) => item.code === '41')?.name).toBe('Canine')
+      expect(liveSpecies.find((item) => item.code === '49')?.name).toBe('Other species')
+
+      const labrador = liveBreeds.find((item) => item.code === String(EXPECTED_BREED_ID))
+      expect(labrador?.name).toBe(BREED_REF_NAME)
+      expect(labrador?.species).toBe(String(EXPECTED_SPECIES_ID))
+      /* The pairing the unmapped-patient tripwire rests on, read from the provider rather than
+       * asserted from memory: breed 370 belongs to species 41, and species 49's only breed is 648. */
+      expect(liveBreeds.find((item) => item.code === String(DEFAULT_PET_BREED))?.species).toBe('41')
+      expect(liveBreeds.filter((item) => item.species === String(DEFAULT_PET_SPECIES)).map((item) => item.code)).toEqual(['648'])
+
+      /* Sexes need no provider endpoint at all — the integration derives them from its own local
+       * enum, and this is the only place that is visible from outside. */
+      expect(liveSexes.map((item) => item.code).sort()).toEqual(['CM', 'F', 'M', 'SF', 'U'])
+      expect(liveSexes.find((item) => item.code === EXPECTED_PET_SEX)?.name).toBe('MALE_CASTRATED')
+    })
+
+    it('dmi-api holds antech-v6 provider refs matching that catalogue', async () => {
+      /* dmi-api ships no antech-v6 provider_ref rows: everything here was produced this run, from
+       * the lists the engine returned above. (By the admin sync when it works — see the tripwire —
+       * and otherwise by the setup's direct insert of those same lists.) A canonical ref can only
+       * be mapped to a provider code that exists as a row, so this is the precondition for every
+       * mapping assertion below. */
       const species = await providerRefs('species')
       const breeds = await providerRefs('breed')
       const sexes = await providerRefs('sex')
@@ -506,6 +611,12 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       /* Sexes come from the integration's local enum, not from any endpoint. */
       expect(sexes.map((ref) => ref.code).sort()).toEqual(['CM', 'F', 'M', 'SF', 'U'])
       expect(sexes.find((ref) => ref.code === EXPECTED_PET_SEX)?.name).toBe('MALE_CASTRATED')
+
+      /* And the rows really are this provider's, not another's read by accident: every provider in
+       * dmi-api has its own species/breed/sex rows, and antech (V3) uses the same numeric code
+       * space as antech-v6. */
+      expect(species.every((ref) => ref.code !== '')).toBe(true)
+      expect(breeds.length).toBe(liveBreeds.length)
     })
 
     it('the dmi refs the orders are placed with resolve, and are not already the Antech codes', () => {
@@ -808,6 +919,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
             await admin.get('/admin/external-requests', {
               providers: 'antech-v6',
               integrationId: org.integrationId,
+              page: 1,
               limit: 200,
             }),
             'read the antech-v6 audit trail',
@@ -1371,6 +1483,39 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
    *
    * All three are tracked privately; nothing here names an issue. */
   describe('tripwires: behaviours the loop should have and does not', () => {
+    it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
+      /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
+       * reference-data test above reads exactly those lists over the same RPC) and upserts them as
+       * provider_ref rows, which is the only way a canonical dmi ref becomes mappable to a provider
+       * code. ACTUAL: HTTP 400, and nothing is stored.
+       *
+       * Mechanically, in dmi-api: the admin route loads the Provider with
+       * `ProvidersService.findOneById`, which decorates the entity with two COMPUTED, non-column
+       * properties (`integrationOptions`, `configurationOptions`) partitioned out of its `options`
+       * relation. `RefsService.syncProviderRefs` then passes that whole decorated entity as a
+       * relation condition — `providerRefRepository.findOne({ where: { code, type, provider } })` —
+       * and TypeORM expands the object into a nested where over the Provider entity's own
+       * properties, hits the first computed one, and refuses the query:
+       * `Property "integrationOptions" was not found in "Provider"`.
+       *
+       * It is not specific to antech-v6: the same path runs for every provider and every ref type,
+       * including `POST /admin/refs/sync/:providerId/:type`. It is why this scenario seeds the
+       * provider_ref rows itself, from the catalogue the engine returned, rather than through the
+       * route that exists to do it. This test carries no fallback of its own: it reports what the
+       * setup observed. */
+      expect({
+        status: syncResponse.status,
+        speciesRefsStoredBySync: speciesRefsAfterSync,
+        neededTheDirectSeed: providerRefsWereSeededDirectly,
+        body: syncResponse.text.slice(0, 200),
+      }).toEqual({
+        status: 201,
+        speciesRefsStoredBySync: liveSpecies.length,
+        neededTheDirectSeed: false,
+        body: '',
+      })
+    })
+
     it.failing('the orders channel completes an order whose provider status has reached Final', async () => {
       /* EXPECTED: a polled order whose provider status is `Final` reaches dmi COMPLETED (or at the
        * very least leaves SUBMITTED). ACTUAL: it stays SUBMITTED.
@@ -1446,6 +1591,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         await admin.get('/admin/external-requests', {
           providers: 'antech-v6',
           integrationId: org.integrationId,
+          page: 1,
           limit: 200,
         }),
         'read the audit trail before injecting a status-poll failure',
@@ -1463,6 +1609,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
             await admin.get('/admin/external-requests', {
               providers: 'antech-v6',
               integrationId: org.integrationId,
+              page: 1,
               limit: 200,
             }),
             'read the audit trail after injecting a status-poll failure',
@@ -1515,9 +1662,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
       expect(response.ok).toBe(false)
       expect(response.text).toContain(`Invalid BreedId ${DEFAULT_PET_BREED}`)
-      /* Named rather than implied: the refusal came from the PRE-ORDER endpoint, because a
-       * refused-before-creation order never gets as far as the POC decision mattering. */
-      expect(response.text).toContain('/LabOrders/v6/PreOrderPlacement')
+      /* Named rather than implied, and worth pinning because the placement path is decided BEFORE
+       * the patient is: this order's code is point-of-care and auto-submit was asked for, so the
+       * integration went to the real ORDER endpoint and was refused there. The unknown-test-code
+       * refusal above names `/LabOrders/v6/PreOrderPlacement` instead — same envelope, different
+       * endpoint — because an unknown code is not in the POC set and so routes to the draft path.
+       * The pair is what shows the refusal is the provider's, at whichever endpoint it happened. */
+      expect(response.text).toContain('/LabOrders/v6/Order')
     }, 60_000)
   })
 })
