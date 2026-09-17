@@ -8,7 +8,7 @@ name: e2e-idexx
 #                    secrets so there is no fork problem.
 #   - pull_request   Only when the harness, the mock, compose or the idexx scenario actually changes
 #                    — a docs tweak or a tenant-isolation edit shouldn't pay ~4.5min for it. This
-#                    matters more as the antech/zoetis loops land and the fan-out multiplies.
+#                    matters more as the antech-v3/zoetis loops land and the fan-out multiplies.
 #   - dispatch       On demand.
 #
 # It lives in its own workflow rather than in e2e.yml because `paths:` filters are per-workflow, not

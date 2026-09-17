@@ -6,7 +6,7 @@
 # profile, so PATH, node (nvm) and the GitHub Packages token are all resolved here.
 #
 # Knobs (all optional):
-#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech zoetis)
+#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis)
 #   NIGHTLY_PULL          1 to fast-forward every checkout first, 0 to test what is there (default 1)
 #   NIGHTLY_BRANCH        branch this checkout must be on for an unattended run (default main): a
 #                         clean checkout on another branch is switched, a dirty one makes the run
@@ -27,7 +27,7 @@ set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOG_DIR=${NIGHTLY_LOG_DIR:-$HOME/Library/Logs/dmi-e2e}
-SUITES=${NIGHTLY_SUITES:-fast idexx antech zoetis}
+SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis}
 PULL=${NIGHTLY_PULL:-1}
 BRANCH=${NIGHTLY_BRANCH:-main}
 TOKEN_FILE=${NIGHTLY_TOKEN_FILE:-$HOME/.config/dmi-e2e/token}
@@ -168,17 +168,27 @@ if [ "$PULL" = 1 ]; then
     npm ci --no-audit --no-fund >/dev/null 2>&1 || log "npm ci failed (continuing)"
   fi
   pull "${DMI_API_DIR:-$ROOT/../dmi-api}"
+  pulled=''
   for s in $SUITES; do
     [ "$s" = fast ] && continue
-    # The registry (src/stacks.js, freshly pulled above) owns each loop's checkout: its repo name
-    # and the variable that overrides the location. A suite it does not know stops the run here,
-    # named, rather than pulling a guessed path — and nothing is derived from the key, so a key
-    # with a hyphen is fine.
-    if ! read -r repo var < <(node "$ROOT/src/stacks.js" integration "$s"); then
+    # The registry (src/stacks.js, freshly pulled above) owns each loop's checkouts: one line per
+    # checkout, its repo name and the variable that overrides the location. A loop hosted by a
+    # shared engine container lists several, and two loops may list the same one — it is pulled
+    # once. A suite the registry does not know stops the run here, named, rather than pulling a
+    # guessed path — and nothing is derived from the key, so a key with a hyphen is fine.
+    if ! checkouts=$(node "$ROOT/src/stacks.js" checkouts "$s"); then
       log "suite '$s' is not in src/stacks.js — not running"
       exit 1
     fi
-    pull "${!var:-$ROOT/../$repo}"
+    while read -r repo var; do
+      dir=${!var:-$ROOT/../$repo}
+      # Canonical, so two spellings of one directory (a symlink, a `..`) are one pull; a directory
+      # that does not exist keeps its spelling and pull() reports it.
+      dir=$(cd "$dir" 2>/dev/null && pwd -P || echo "$dir")
+      case " $pulled " in *" $dir "*) continue ;; esac
+      pulled="$pulled $dir"
+      pull "$dir"
+    done <<< "$checkouts"
   done
 fi
 

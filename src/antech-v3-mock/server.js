@@ -1,7 +1,8 @@
 'use strict'
 
-/* Antech (classic) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node HTTP
- * server that speaks Antech's dialect closely enough for the REAL `dmi-engine-antech-integration`
+/* The antech-v3 mock: classic Antech's (V3) mock provider for the dmi-e2e full-stack harness. A
+ * zero-dependency Node HTTP server that speaks Antech's /api/v1.1 dialect closely enough for the
+ * REAL `dmi-engine-antech-integration`
  * container to drive it: token login, order placement, the JSON status poll / acknowledge pair, the
  * results XML document and the PDF manifest. A separate control plane (`/__control__/*`) lets tests
  * seed results, inspect received orders and inject error scenarios so the order->result->report loop
@@ -27,7 +28,7 @@ const API = '/api/v1.1'
  * again before EVERY request (antech.service.ts makeGetRequest/makePostRequest both call login()
  * first — there is no token cache), so this endpoint is hit several times per poll. It is a dummy
  * value; the mock never verifies it. */
-const ACCESS_TOKEN = 'antech-mock-token'
+const ACCESS_TOKEN = 'antech-v3-mock-token'
 
 /* Monotonic lab accession id, seeded from process start so every seeded result gets a GLOBALLY
  * unique LabAccessionID — across control-plane resets and container restarts against a warm dmi-api
@@ -37,7 +38,7 @@ let nextLabAccession = Date.now()
 
 function log (message) {
   /* One-line, greppable, prefixed like the harness's other services. */
-  console.log(`[antech-mock] ${message}`)
+  console.log(`[antech-v3-mock] ${message}`)
 }
 
 /* Antech timestamps are local-ish strings, not ISO-8601. Two shapes appear in the dialect: the
@@ -373,7 +374,7 @@ function buildLabReportXml (orders) {
  * that look like a PDF. */
 function buildManifestPdf (clinicAccessionId) {
   return Buffer.from(
-    `%PDF-1.4\n% dmi-e2e antech mock manifest for ${clinicAccessionId}\n` +
+    `%PDF-1.4\n% dmi-e2e antech-v3 mock manifest for ${clinicAccessionId}\n` +
       '1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n',
     'utf8',
   )
@@ -719,7 +720,7 @@ function handleControlReset (req, res) {
  * groups in the RegExp become `params`. The accessToken query param every provider route carries is
  * deliberately not validated — the harness's credentials are dummy by design. */
 const routes = [
-  ['GET', /^\/status$/, (req, res) => sendJson(res, 200, { status: 'ok', service: 'antech-mock' })],
+  ['GET', /^\/status$/, (req, res) => sendJson(res, 200, { status: 'ok', service: 'antech-v3-mock' })],
   ['GET', /^\/health$/, (req, res) => sendJson(res, 200, { status: 'ok' })],
 
   ['POST', new RegExp(`^${API}/Users/login$`), handleLogin],

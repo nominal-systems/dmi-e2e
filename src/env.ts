@@ -65,10 +65,10 @@ export interface HarnessEnv {
   /* Short name of the jest suite this invocation runs — 'fast', or the stack name under
    * HARNESS_FULL_STACK=1. Names the run's report directory (reports/<suite>/). */
   suite: string
-  /* The real integration checkout the selected full-system loop builds its container from — the
-   * same DMI_<STACK>_INTEGRATION_DIR defaults docker-compose.yml uses. Only read to record what
-   * was under test in the run report. Undefined for the fast suite. */
-  integration: { name: string, dir: string } | undefined
+  /* The sibling checkouts the selected full-system loop builds its containers from — as the stack
+   * registry lists them, with the same DMI_*_DIR defaults docker-compose.yml uses. Only read to
+   * record what was under test in the run report. Empty for the fast suite. */
+  checkouts: Array<{ name: string, dir: string }>
   /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
    * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
    * suite that just ran into publishDir on teardown — the directory an nginx serves — and rebuilds
@@ -101,9 +101,10 @@ export interface HarnessEnv {
     password: string
     locale: string
   }
-  antech: {
-    /* Host-facing base URL of the Antech mock (published port). Tests drive the mock's control plane
-     * (/__control__/*) and readiness (/status) through this. */
+  /* Classic Antech (V3) — the `antech-v3` stack; dmi-api's provider id is the bare `antech`. */
+  antechV3: {
+    /* Host-facing base URL of the antech-v3 mock (published port). Tests drive the mock's control
+     * plane (/__control__/*) and readiness (/status) through this. */
     mockBaseUrl: string
     /* Compose-network base URL the antech integration container uses to reach the mock, stored
      * verbatim in the dmi-api provider configuration so it must resolve inside the compose network.
@@ -168,10 +169,12 @@ export function mockBaseUrlFor (stackName: StackName): string {
   return str(mock.urlVariable, `http://${host}:${int(mock.portVariable, mock.defaultPort)}${mock.pathPrefix}`)
 }
 
-function integrationCheckout (): { name: string, dir: string } | undefined {
-  if (!fullStack) return undefined
-  const { repo, dirVariable } = stacks[stack].integration
-  return { name: repo, dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))) }
+function checkoutsUnderTest (): Array<{ name: string, dir: string }> {
+  if (!fullStack) return []
+  return stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
+    name: repo,
+    dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))),
+  }))
 }
 
 export const env: HarnessEnv = {
@@ -205,7 +208,7 @@ export const env: HarnessEnv = {
   fullStack,
   stack,
   suite: suiteName(fullStack, stack),
-  integration: integrationCheckout(),
+  checkouts: checkoutsUnderTest(),
   report: {
     /* Mirrored in jest.config.js, which is loaded before ts-jest and cannot import this module. */
     dir: path.resolve(str('HARNESS_REPORT_DIR', path.join(harnessRoot, 'reports'))),
@@ -226,17 +229,17 @@ export const env: HarnessEnv = {
     password: str('HARNESS_IDEXX_PASSWORD', 'harness-pass'),
     locale: str('HARNESS_IDEXX_LOCALE', 'en'),
   },
-  antech: {
-    mockBaseUrl: mockBaseUrlFor('antech'),
-    baseUrl: str('HARNESS_ANTECH_BASE_URL', 'http://antech-mock:3000'),
-    uiBaseUrl: str('HARNESS_ANTECH_UI_BASE_URL', 'http://antech-mock:3000'),
+  antechV3: {
+    mockBaseUrl: mockBaseUrlFor('antech-v3'),
+    baseUrl: str('HARNESS_ANTECH_V3_BASE_URL', 'http://antech-v3-mock:3000'),
+    uiBaseUrl: str('HARNESS_ANTECH_V3_UI_BASE_URL', 'http://antech-v3-mock:3000'),
     /* Antech documents this as a 3-4 letter PIMS identifier; it only ever appears in a generated
      * requisition id, and the harness supplies its own requisitionId anyway. */
-    pimsIdentifier: str('HARNESS_ANTECH_PIMS_IDENTIFIER', 'HRN'),
-    username: str('HARNESS_ANTECH_USERNAME', 'harness-user'),
-    password: str('HARNESS_ANTECH_PASSWORD', 'harness-pass'),
-    clinicId: str('HARNESS_ANTECH_CLINIC_ID', '900001'),
-    labId: int('HARNESS_ANTECH_LAB_ID', 1),
+    pimsIdentifier: str('HARNESS_ANTECH_V3_PIMS_IDENTIFIER', 'HRN'),
+    username: str('HARNESS_ANTECH_V3_USERNAME', 'harness-user'),
+    password: str('HARNESS_ANTECH_V3_PASSWORD', 'harness-pass'),
+    clinicId: str('HARNESS_ANTECH_V3_CLINIC_ID', '900001'),
+    labId: int('HARNESS_ANTECH_V3_LAB_ID', 1),
   },
   zoetis: {
     mockBaseUrl: mockBaseUrlFor('zoetis'),

@@ -80,7 +80,7 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   stated only in a comment leaves the next author a silent poll timeout.
 - **A more faithful mock can WEAKEN an assertion that was sound against a cruder one.** Assertion
   strength does not transfer with the template — re-derive it per provider. Worked example: the idexx
-  and antech mocks drop an order from the orders feed permanently once acked, so the only route to a
+  and antech-v3 mocks drop an order from the orders feed permanently once acked, so the only route to a
   `COMPLETED` order is the results channel, and waiting on `COMPLETED` is a fair reconciliation proof
   there. The zoetis mock instead models the provider's re-notification on status change, which is more
   faithful — and that extra fidelity lets its orders poll reach `COMPLETED` on its own, so the same
@@ -102,9 +102,13 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   the wait for a hang.
 - Reuse the shared foundation (`HARNESS_STACK` selector, compose profiles, `src/seed.ts`,
   `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider. **A new
-  loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile,
-  integration checkout, mock endpoint, poll class) plus its compose profile, scenario and workflow —
-  never another `if (env.stack === …)`; everything that varies by stack reads the registry.
+  loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile, the
+  checkouts it is built from, mock endpoint, poll class) plus its compose profile, scenario and
+  workflow — never another `if (env.stack === …)`; everything that varies by stack reads the
+  registry. The key is the harness's name, not dmi-api's provider id: where a provider has several
+  API generations the key carries the generation (`antech-v3`, `antech-v6`; dmi-api's ids are
+  `antech` and `antech-v6`), and no key may be a prefix of another — the workflow `paths:` globs
+  are `scenarios/<key>*.e2e.ts`, so `antech` next to `antech-v6` would fire on both.
 - **One name per mock: `<stack>-mock`, in every position** — directory, compose service, log
   prefix, `/status` service name, readiness label, env prefix `HARNESS_<STACK>_MOCK_*`. The
   provider's product name (VetConnect Plus, VetSync) belongs in prose only; a mock that goes by
