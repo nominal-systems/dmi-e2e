@@ -55,7 +55,7 @@ export interface HarnessEnv {
   mongoUri: string
   activemq: { hostname: string, port: number }
   /* HARNESS_FULL_STACK=1 selects a full-system suite: dmi-api under a normal NODE_ENV against a real
-   * provider loop (redis + a vendor + its integration), instead of the default fast suite
+   * provider loop (redis + a provider mock + its integration), instead of the default fast suite
    * (NODE_ENV=seed, dmi-api alone). */
   fullStack: boolean
   /* Which full-system loop HARNESS_FULL_STACK=1 runs — a key of the stack registry in
@@ -79,7 +79,7 @@ export interface HarnessEnv {
     /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
      * demo-provider-api's `/demo` global prefix. */
     baseUrl: string
-    /* Compose-network base URL the integration container uses to reach the vendor. Stored verbatim
+    /* Compose-network base URL the integration container uses to reach the provider. Stored verbatim
      * in the dmi-api provider configuration, so it must resolve inside the compose network. */
     internalUrl: string
   }
@@ -218,8 +218,8 @@ export const env: HarnessEnv = {
   },
   idexx: {
     mockBaseUrl: mockBaseUrlFor('idexx'),
-    orderingBaseUrl: str('HARNESS_IDEXX_ORDERING_URL', 'http://vetconnect-mock:3000'),
-    resultBaseUrl: str('HARNESS_IDEXX_RESULT_URL', 'http://vetconnect-mock:3000'),
+    orderingBaseUrl: str('HARNESS_IDEXX_ORDERING_URL', 'http://idexx-mock:3000'),
+    resultBaseUrl: str('HARNESS_IDEXX_RESULT_URL', 'http://idexx-mock:3000'),
     pimsId: str('HARNESS_IDEXX_PIMS_ID', 'dmi-e2e-harness'),
     pimsVersion: str('HARNESS_IDEXX_PIMS_VERSION', '1.0.0'),
     username: str('HARNESS_IDEXX_USERNAME', 'harness-user'),

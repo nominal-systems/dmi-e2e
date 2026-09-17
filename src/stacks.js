@@ -16,7 +16,7 @@
  *
  * The stack key is the harness's name for a loop (the HARNESS_STACK value, the report suite, the
  * workflow) and is distinct from `providerId`, dmi-api's id for the provider. They coincide today,
- * but a vendor with several API generations gets one dmi-api id per generation (`antech`,
+ * but a provider with several API generations gets one dmi-api id per generation (`antech`,
  * `antech-v6`) while the harness may want a different key for the classic loop (`antech-v3`), and
  * two stacks may be served by one integration container. Keep both. `providerId` has no reader
  * yet: each scenario still carries its own literal (`providerId: 'idexx'` in the seed options),
@@ -38,11 +38,12 @@ const stacks = {
      * its version. */
     integration: { repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' },
     /* The mock's host-facing endpoint: its published port, the URL variable that overrides the
-     * whole thing, and the name readiness logs call it. Readiness is `<baseUrl>/status`. */
+     * whole thing, and the name readiness logs call it. Readiness is `<baseUrl>/status`. One name
+     * per mock: label, urlVariable and portVariable all derive from `<stack>-mock` (CLAUDE.md). */
     mock: {
-      label: 'vetconnect-mock',
-      urlVariable: 'HARNESS_VCP_MOCK_URL',
-      portVariable: 'HARNESS_VCP_MOCK_PORT',
+      label: 'idexx-mock',
+      urlVariable: 'HARNESS_IDEXX_MOCK_URL',
+      portVariable: 'HARNESS_IDEXX_MOCK_PORT',
       defaultPort: 3012,
       pathPrefix: '',
     },
@@ -89,7 +90,7 @@ const stacks = {
       repo: 'dmi-engine-demo-provider-integration',
       dirVariable: 'DMI_DEMO_INTEGRATION_DIR',
     },
-    /* Not a mock but the demo vendor itself (dmi-demo-provider-api), under its `/demo` global
+    /* Not a mock but the demo provider itself (dmi-demo-provider-api), under its `/demo` global
      * prefix. The harness mints an API key from it during seeding, so it must be up first. */
     mock: {
       label: 'demo-provider-api',

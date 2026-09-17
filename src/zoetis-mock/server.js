@@ -1,6 +1,6 @@
 'use strict'
 
-/* Zoetis (VetSync v1) mock vendor for the dmi-e2e full-stack harness. A zero-dependency Node HTTP
+/* Zoetis (VetSync v1) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node HTTP
  * server that speaks Zoetis's dialect closely enough for the REAL `dmi-engine-zoetis-integration`
  * container to drive it: Basic auth, single-POST order placement, the orders/results polls and BOTH
  * of its acknowledge channels, plus the reference-data endpoints. A separate control plane
@@ -9,7 +9,7 @@
  *
  * It NEVER talks to a live Zoetis host and never authenticates for real. All canned data is SYNTHETIC — invented values shaped like Zoetis responses, never
  * captured clinic/patient data. The service and analyte codes are genuine Zoetis catalogue
- * identifiers (vendor codes published to integrators, not clinic or patient data); every name,
+ * identifiers (provider codes published to integrators, not clinic or patient data); every name,
  * price, value and range attached to them here is invented.
  *
  * The contract mirrored here was read from the integration's own source (services/zoetis.service.ts,
@@ -17,7 +17,7 @@
  * interceptors/zoetis-api.interceptor.ts, providers/zoetis-*.processor.ts), not assumed. Details
  * that are load-bearing and easy to get wrong are called out at each handler.
  *
- * How Zoetis differs from the other two mocked vendors, since that is what shaped this file:
+ * How Zoetis differs from the other two mocked providers, since that is what shaped this file:
  *   - EVERYTHING is XML, in both directions, and the integration parses it with xmlbuilder2's
  *     `{ format: 'object' }`. Element MULTIPLICITY is therefore load-bearing in several places (see
  *     "the arity traps" below) — a lone child deserialises to an object, not a one-element array.
@@ -39,7 +39,7 @@
  *   - `<Section>` in the service catalogue: `DirectoryOfService.Section.map(...)`.
  *   - `<specie>` / `<gender>` / `<Device>`: `.map(...)` in getSpecies / getSexes / getDevices.
  *     (A device's `<Tests>` is the one deliberate exception to the >=2 rule — one of the served
- *     devices carries a single `<Test>`, because single-assay instruments are real at this vendor;
+ *     devices carries a single `<Test>`, because single-assay instruments are real at this provider;
  *     see the DEVICES note.)
  * `<LabReport>` and `<LabResult>` need no such care — those two go through the mapper's
  * `objectOrArray` and read the same either way.
@@ -53,11 +53,11 @@ const http = require('http')
 
 const PORT = Number(process.env.PORT || 3000)
 
-/* Every vendor route lives under this prefix — the integration builds each URL as
+/* Every provider route lives under this prefix — the integration builds each URL as
  * `${baseUrl}/vetsync/v1/...` (zoetis.service.ts). */
 const API = '/vetsync/v1'
 
-/* Monotonic vendor-side order id, seeded from process start so every order gets a globally unique
+/* Monotonic provider-side order id, seeded from process start so every order gets a globally unique
  * `@id` across control-plane resets and container restarts. Lives outside the resettable state on
  * purpose: /__control__/reset must not rewind it. */
 let nextOrderId = Date.now()
@@ -69,7 +69,7 @@ function log (message) {
 
 /* ---- Zoetis order statuses ----
  *
- * Every order is born WAITING-FOR-SAMPLE — verified against the live Zoetis sandbox. The vendor
+ * Every order is born WAITING-FOR-SAMPLE — verified against the live Zoetis sandbox. The provider
  * never emits a SUBMITTED status; that word exists only on the dmi side of the fence. An order
  * moves to COMPLETED when a final result exists and to PARTIAL-RESULTS when a pending one does
  * (see handleControlSeedResult).
@@ -142,7 +142,7 @@ function sendJson (res, status, body) {
   res.end(payload)
 }
 
-/* A status-only response with an EMPTY body — what the vendor's acknowledge endpoints answer
+/* A status-only response with an EMPTY body — what the provider's acknowledge endpoints answer
  * (verified against the live Zoetis sandbox). The integration treats any 2xx as success and
  * discards acknowledge response bodies (makePostRequest returns data both ack call sites ignore),
  * so nothing downstream reads what is deliberately not there. */
@@ -151,15 +151,15 @@ function sendEmpty (res, status) {
   res.end()
 }
 
-/* The vendor's error dialect: an <error> root whose <message> carries the failure context as an
+/* The provider's error dialect: an <error> root whose <message> carries the failure context as an
  * ATTRIBUTE and the human-readable reason as element text, served as application/xml. Verified
  * against the live Zoetis sandbox for a duplicate-acknowledge 409 and a 404. One builder for every
  * error the mock serves, so no two handlers can drift onto different shapes. */
-function vendorErrorXml (context, message) {
+function providerErrorXml (context, message) {
   return `<error><message context="${escapeXml(context)}">${escapeXml(message)}</message></error>`
 }
 
-/* Vendor ERRORS are XML like every success — the vendorErrorXml dialect above, served as
+/* Provider ERRORS are XML like every success — the providerErrorXml dialect above, served as
  * application/xml. Verified against the live Zoetis sandbox for a duplicate-acknowledge 409 and a
  * 404; a validation 400's exact body was not separately captured, so the mock's rejections
  * extrapolate the same form.
@@ -167,21 +167,21 @@ function vendorErrorXml (context, message) {
  * What this dialect means for the integration's error surface, mechanically: providerErrorMapper
  * reads `error.response.data.error.context` / `.message`, properties that only exist when axios
  * parsed a JSON body into an object. An XML error body keeps `error.response.data` a string, so the
- * mapper's structured branch never runs and every vendor error surfaces through its generic
+ * mapper's structured branch never runs and every provider error surfaces through its generic
  * "A request to <path> failed with <status> status code." branch — which the rejection scenario
- * pins as the vendor-real surface. (An earlier revision of this mock answered errors in JSON
+ * pins as the provider-real surface. (An earlier revision of this mock answered errors in JSON
  * precisely to reach the structured branch; that exercised more mapper code at the price of a wire
- * shape the vendor never produces.)
+ * shape the provider never produces.)
  *
  * `context` names the offending field where one exists, using the request document's own element
  * path (`AnimalDetails/Species`) — the only naming the integration and this mock can agree on. */
-function sendVendorError (res, status, context, message) {
+function sendProviderError (res, status, context, message) {
   log(`rejected: ${context} — ${message}`)
-  sendXml(res, status, vendorErrorXml(context, message))
+  sendXml(res, status, providerErrorXml(context, message))
 }
 
-/* Short-circuit an injected failure scenario. The default body is the vendor's XML error dialect —
- * an injected 500 must look like a real vendor 500, or the retry paths it exists to exercise would
+/* Short-circuit an injected failure scenario. The default body is the provider's XML error dialect —
+ * an injected 500 must look like a real provider 500, or the retry paths it exists to exercise would
  * be retrying against a fiction. A custom `body` is a control-plane escape hatch and goes out as
  * JSON, exactly as given. */
 function sendScenario (res, scenario, context, message) {
@@ -189,7 +189,7 @@ function sendScenario (res, scenario, context, message) {
     sendJson(res, scenario.status, scenario.body)
     return
   }
-  sendVendorError(res, scenario.status, context, message)
+  sendProviderError(res, scenario.status, context, message)
 }
 
 function readRaw (req) {
@@ -318,11 +318,11 @@ function textAt (node, path) {
 
 /* The service catalogue: what `GET /vetsync/v1/services` advertises AND what order placement
  * enforces, so the two cannot drift apart. Serving one list and accepting another is how a scenario
- * ends up ordering a code the real vendor would refuse.
+ * ends up ordering a code the real provider would refuse.
  *
- * `CDP`, `HEM` and `T4` are genuine Zoetis catalogue codes (vendor test identifiers), and the section
+ * `CDP`, `HEM` and `T4` are genuine Zoetis catalogue codes (provider test identifiers), and the section
  * names, the test names for those three, and the fixed `Replicate` / `ValidFrom` / `Currency` /
- * `NonDiscountable` fields follow the vendor's own catalogue shape. The `Includes` lists, the
+ * `NonDiscountable` fields follow the provider's own catalogue shape. The `Includes` lists, the
  * `sampleType`s and the fourth entry (`TSH`) are invented. None of it is clinic or patient data.
  *
  * Three sections, not one: `mapTestArrays` calls `DirectoryOfService.Section.map(...)`, so a single
@@ -367,7 +367,7 @@ const DEFAULT_SERVICE_CODE = 'CDP'
 /* Reference data. Both are consumed by the integration's ref-sync (getSpecies / getSexes) and both
  * must carry >= 2 children — those two map over the array without normalising.
  *
- * SPECIES are the vendor's own uppercase codes and go into `<Species>` verbatim: getSpecies maps
+ * SPECIES are the provider's own uppercase codes and go into `<Species>` verbatim: getSpecies maps
  * each to `{ code: specie }`, and dmi-api's zoetis provider_ref rows carry exactly these codes
  * (DOG, CAT), so this is the vocabulary an order's mapped species arrives in.
  *
@@ -394,12 +394,12 @@ const GENDER_CODES = new Set(GENDERS.map((gender) => gender.toUpperCase().replac
  * to inactive (ZoetisDeviceStatus has exactly Online/Offline), so one of each is served. All values
  * synthetic; the test codes are the catalogue's own.
  *
- * The single-Test device is deliberate and real: the vendor's fleet includes single-assay
+ * The single-Test device is deliberate and real: the provider's fleet includes single-assay
  * instruments (verified against the live Zoetis sandbox). Note what that does to the XML dialect:
  * ONE <Test> child deserialises to a bare string rather than a one-element array — the standard
  * arity behaviour described in the file header — and ZoetisDeviceMapper.map's
  * `device.Tests.Test.map(...)` does not normalise that. Nothing in this suite syncs devices today,
- * so no scenario asserts either way; the shape is here so the mock tells the truth about the vendor
+ * so no scenario asserts either way; the shape is here so the mock tells the truth about the provider
  * rather than about the parser. */
 const DEVICES = [
   {
@@ -442,7 +442,7 @@ const DEVICES = [
  *   - GLU_HIST_IMG64 / GLU_HIST_DATA: the two suffixes ZoetisMapper.mapLabResult FILTERS OUT. They
  *          are seeded on purpose so the scenario can assert they do NOT reach the report — that is
  *          the only way that filter is covered, and without them a broken filter would be invisible.
- *          Their ResultText stands in for the base64 image payload the real vendor sends.
+ *          Their ResultText stands in for the base64 image payload the real provider sends.
  *
  * None of these values contain an XML-special character, and that is deliberate rather than
  * incidental. xmlbuilder2 2.4.1 (the version the integration resolves) DOUBLE-escapes text nodes in
@@ -513,7 +513,7 @@ function defaultAnalytes () {
  *   COMPLETED          -> self, poll, acknowledged, results    (no `cancel`)
  *
  * `results` appears only once results exist, and `cancel` only while the order is still editable —
- * so ZoetisMapper.getEditable (cancel present <-> editable) now tracks the vendor's actual state
+ * so ZoetisMapper.getEditable (cancel present <-> editable) now tracks the provider's actual state
  * machine rather than a constant. The other two states were NOT captured live; their sets are
  * assumptions, stated as such:
  *
@@ -527,7 +527,7 @@ function defaultAnalytes () {
  *
  * A single source of truth on purpose: buildOrderElement emits exactly these rels, and the control
  * plane exposes them (publicOrder.linkRels), so a scenario asserting the set can never drift from
- * what the vendor dialect actually serves. */
+ * what the provider dialect actually serves. */
 function linkRelsFor (status) {
   const rels = ['self', 'poll', 'acknowledged']
   if (status === STATUS_COMPLETED || status === STATUS_PARTIAL) rels.push('results')
@@ -768,7 +768,7 @@ function buildDevicesXml () {
 function requireBasicAuth (req, res) {
   const header = req.headers.authorization ?? ''
   if (!header.startsWith('Basic ')) {
-    sendVendorError(res, 401, 'Authorization', 'missing HTTP Basic credentials')
+    sendProviderError(res, 401, 'Authorization', 'missing HTTP Basic credentials')
     return null
   }
 
@@ -778,13 +778,13 @@ function requireBasicAuth (req, res) {
   const password = separator === -1 ? '' : decoded.slice(separator + 1)
 
   if (username === '' || password === '') {
-    sendVendorError(res, 401, 'Authorization', 'HTTP Basic credentials must carry a username and a password')
+    sendProviderError(res, 401, 'Authorization', 'HTTP Basic credentials must carry a username and a password')
     return null
   }
   /* One literal backslash, `<partnerId>\<clientId>`. */
   const parts = username.split('\\')
   if (parts.length !== 2 || parts[0] === '' || parts[1] === '') {
-    sendVendorError(
+    sendProviderError(
       res,
       401,
       'Authorization',
@@ -796,7 +796,7 @@ function requireBasicAuth (req, res) {
   return { partnerId: parts[0], clientId: parts[1] }
 }
 
-/* ---- vendor handlers ---- */
+/* ---- provider handlers ---- */
 
 /* testAuth pings the API root. Any 2xx is success (the integration only checks that it did not
  * throw), but the auth check above still runs, so a credential-less integration fails its own
@@ -819,18 +819,18 @@ async function handleCreateOrder (req, res) {
   const raw = await readRaw(req)
   const document = parseXml(raw)
   if (document == null || document.name !== 'LabReport') {
-    sendVendorError(res, 400, 'LabReport', 'body must be a <LabReport> document')
+    sendProviderError(res, 400, 'LabReport', 'body must be a <LabReport> document')
     return
   }
 
-  /* Validate rather than default — but validate what the VENDOR requires, not everything the
-   * harness happens to send. Every field below is one the real vendor refuses an order without, and
+  /* Validate rather than default — but validate what the PROVIDER requires, not everything the
+   * harness happens to send. Every field below is one the real provider refuses an order without, and
    * the scenario later asserts on, so substituting a fallback here would make the mock AGREE with an
    * integration that had stopped sending it — the order-forwarding assertions would then pass
    * against the mock's own invented values and could never fail. The converse discipline is why
    * AnimalDetails/Breed is NOT in the list: an order without a Breed element is accepted (verified
    * against the live Zoetis sandbox), so requiring it would gold-plate the contract and reject
-   * orders the real vendor takes. It is still echoed verbatim when present, and the scenario still
+   * orders the real provider takes. It is still echoed verbatim when present, and the scenario still
    * pins that forwarding.
    *
    * The species/gender checks matter most of all, and for a reason specific to this loop: those two
@@ -838,7 +838,7 @@ async function handleCreateOrder (req, res) {
    * here (zoetis has provider_ref rows for species and sex, and none with a code for breed). If the
    * mock accepted anything, a mapping that silently stopped resolving would still produce a
    * well-formed order, this endpoint would answer 200, and the gate would stay green while the
-   * vendor received a code it had never heard of. */
+   * provider received a code it had never heard of. */
   const identification = childNamed(document, 'Identification')
   const animal = childNamed(document, 'AnimalDetails')
   const required = [
@@ -858,7 +858,7 @@ async function handleCreateOrder (req, res) {
   ]
   const missing = required.filter(([, value]) => value === '')
   if (missing.length > 0) {
-    sendVendorError(
+    sendProviderError(
       res,
       400,
       missing[0][0],
@@ -869,15 +869,15 @@ async function handleCreateOrder (req, res) {
 
   const practiceRef = textAt(document, 'Identification/PracticeRef')
   if (state.orders.has(practiceRef)) {
-    /* PracticeRef is the practice's own unique reference; the vendor refuses a duplicate rather than
+    /* PracticeRef is the practice's own unique reference; the provider refuses a duplicate rather than
      * silently overwriting an order that already has results. */
-    sendVendorError(res, 409, 'Identification/PracticeRef', `order '${practiceRef}' already exists`)
+    sendProviderError(res, 409, 'Identification/PracticeRef', `order '${practiceRef}' already exists`)
     return
   }
 
   const species = textAt(document, 'AnimalDetails/Species')
   if (!SPECIES_CODES.has(species)) {
-    sendVendorError(
+    sendProviderError(
       res,
       400,
       'AnimalDetails/Species',
@@ -888,7 +888,7 @@ async function handleCreateOrder (req, res) {
 
   const gender = textAt(document, 'AnimalDetails/Gender')
   if (!GENDER_CODES.has(gender)) {
-    sendVendorError(
+    sendProviderError(
       res,
       400,
       'AnimalDetails/Gender',
@@ -901,14 +901,14 @@ async function handleCreateOrder (req, res) {
     .map((request) => textAt(request, 'TestCode'))
     .filter((code) => code !== '')
   if (testCodes.length === 0) {
-    sendVendorError(res, 400, 'LabRequests/LabRequest', 'an order must request at least one test')
+    sendProviderError(res, 400, 'LabRequests/LabRequest', 'an order must request at least one test')
     return
   }
-  /* The vendor only accepts codes from its own catalogue. Rejecting an unknown one is what stops the
+  /* The provider only accepts codes from its own catalogue. Rejecting an unknown one is what stops the
    * harness drifting onto a plausible-looking code real Zoetis would refuse. */
   const unknown = testCodes.filter((code) => !SERVICES.some((service) => service.code === code))
   if (unknown.length > 0) {
-    sendVendorError(
+    sendProviderError(
       res,
       400,
       'LabRequests/LabRequest/TestCode',
@@ -949,7 +949,7 @@ async function handleCreateOrder (req, res) {
      * values dmi-api's mapping produced. */
     species,
     gender,
-    /* Optional at the vendor (see the required-list note): stored verbatim when present, null when
+    /* Optional at the provider (see the required-list note): stored verbatim when present, null when
      * the order carried no Breed element. */
     breed: textAt(animal, 'Breed') || null,
     dateOfBirth: textAt(animal, 'DateOfBirth') || null,
@@ -995,7 +995,7 @@ function handleOrderStatus (req, res, params) {
 
   const order = state.orders.get(params.practiceRef)
   if (order == null) {
-    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
   sendXml(res, 200, buildOrderStatusXml(req, order))
@@ -1009,7 +1009,7 @@ function handleOrderResults (req, res, params) {
 
   const order = state.orders.get(params.practiceRef)
   if (order == null) {
-    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
   sendXml(
@@ -1038,16 +1038,16 @@ function handleBatchResults (req, res) {
 
 /* Batch acknowledge, the RESULTS channel. Body is `<orders><order client_order_id="..."/></orders>`
  * (zoetis.service.ts acknowledgeBatchOrdersOrResults). Acknowledging an id the mock never issued is
- * answered 200 rather than 4xx — ack is idempotent-by-nature at the vendor and a retried batch must
+ * answered 200 rather than 4xx — ack is idempotent-by-nature at the provider and a retried batch must
  * not fail — but it IS logged, so an integration acking phantom ids is visible in the container logs
  * rather than silently absorbed. */
 async function handleBatchAcknowledge (req, res) {
   if (requireBasicAuth(req, res) == null) return
 
   /* Injectable, and this is the one endpoint where that matters most: a FAILING acknowledge is the
-   * entire reason the vendor's at-least-once model exists. The integration emits results to dmi-api
+   * entire reason the provider's at-least-once model exists. The integration emits results to dmi-api
    * BEFORE acking them (ZoetisResultsProcessor), so an ack that fails leaves the batch unacked at
-   * the vendor and it is re-served on the next tick — dmi-api therefore receives the same result
+   * the provider and it is re-served on the next tick — dmi-api therefore receives the same result
    * twice, and must merge rather than duplicate. Without a way to stage the failure that path is
    * unreachable from the harness. Honours `once: true`, so a test can stage exactly one miss. */
   const scenario = takeScenario('batchAcknowledge')
@@ -1085,22 +1085,22 @@ function handleOrderAcknowledge (req, res, params) {
 
   const order = state.orders.get(params.practiceRef)
   if (order == null) {
-    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
-  /* Re-acknowledging a status that is already acknowledged is a 409 at the real vendor, in its XML
+  /* Re-acknowledging a status that is already acknowledged is a 409 at the real provider, in its XML
    * error dialect — context and message shape observed live (an OrderAlreadyAcknowledgedException
    * naming the client_order_id, context "POLL LIST"). The integration cannot reach this branch from
    * the harness today: the orders feed only re-lists an order once its status has CHANGED since the
    * last acknowledgement, so the normal flow never double-acks (and acknowledgeOrders carries a
-   * TODO for 409 support). The branch exists so the mock refuses a duplicate the way the vendor
+   * TODO for 409 support). The branch exists so the mock refuses a duplicate the way the provider
    * would, instead of silently absorbing one. */
   if (order.acknowledgedStatus === params.status) {
     log(`refused duplicate acknowledge of order ${order.practiceRef} at status ${params.status}`)
     sendXml(
       res,
       409,
-      vendorErrorXml('POLL LIST', `OrderAlreadyAcknowledgedException - Order ${order.practiceRef} already acknowledged`),
+      providerErrorXml('POLL LIST', `OrderAlreadyAcknowledgedException - Order ${order.practiceRef} already acknowledged`),
     )
     return
   }
@@ -1116,7 +1116,7 @@ function handleCancelOrder (req, res, params) {
 
   const order = state.orders.get(params.practiceRef)
   if (order == null) {
-    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
   order.status = STATUS_CANCELLED
@@ -1139,14 +1139,14 @@ function handleCancelOrderTest (req, res, params) {
 
   const order = state.orders.get(params.practiceRef)
   if (order == null) {
-    sendVendorError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
+    sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
   /* Validate rather than absorb: cancelling a test the order never requested is an error at a real
    * lab, not a no-op. (The status and body shape for this case were not captured live; the 404 and
-   * the field-path context extrapolate the vendor's error dialect.) */
+   * the field-path context extrapolate the provider's error dialect.) */
   if (!order.testCodes.includes(params.testCode)) {
-    sendVendorError(
+    sendProviderError(
       res,
       404,
       'LabRequests/LabRequest/TestCode',
@@ -1189,9 +1189,9 @@ async function handleControlSeedResult (req, res, params) {
    * author to seed a one-analyte result would get a silent 120s timeout and nothing in the harness
    * output to explain it. Refusing here turns that into an immediate, legible 400.
    *
-   * This is the control plane, not the vendor dialect: a real Zoetis lab would happily return a
+   * This is the control plane, not the provider dialect: a real Zoetis lab would happily return a
    * one-analyte panel. The guard documents an integration constraint the harness cannot exercise,
-   * which is why it says so rather than pretending to be vendor validation. */
+   * which is why it says so rather than pretending to be provider validation. */
   if (analytes.length < 2) {
     sendJson(res, 400, {
       message:
@@ -1240,7 +1240,7 @@ function publicOrder (order) {
     id: order.id,
     status: order.status,
     /* The link rels the order-status document advertises in this state — the same linkRelsFor that
-     * builds the document, so an asserting scenario and the vendor dialect cannot drift apart. */
+     * builds the document, so an asserting scenario and the provider dialect cannot drift apart. */
     linkRels: linkRelsFor(order.status),
     acknowledgedStatus: order.acknowledgedStatus,
     resultAcknowledged: order.resultAcknowledged,
@@ -1323,9 +1323,9 @@ const routes = [
 
   /* Reference data. The harness never triggers a ref sync, but the integration exposes all of these
    * and a mock that 404s on them would be a trap for the next scenario. `services` is the same
-   * catalogue order placement enforces, so what the vendor advertises and what it accepts cannot
+   * catalogue order placement enforces, so what the provider advertises and what it accepts cannot
    * drift apart. Note there is deliberately no `/breeds`: the integration's getBreeds is a no-op
-   * that returns an empty list without calling the vendor, so an endpoint here would be fiction. */
+   * that returns an empty list without calling the provider, so an endpoint here would be fiction. */
   [
     'GET',
     new RegExp(`^${API}/services$`),

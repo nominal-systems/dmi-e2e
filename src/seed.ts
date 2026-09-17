@@ -44,12 +44,12 @@ function unique (label: string): string {
   return `${label}-${randomUUID().slice(0, 8)}`
 }
 
-/* Mint an X-Api-Key from the demo vendor (GET /demo/keys). Full-stack mode hands this to the
- * integration as its credential so it authenticates to the vendor as itself; the fast suite never
- * calls this (its vendor URL is unreachable by design). */
+/* Mint an X-Api-Key from the demo provider (GET /demo/keys). Full-stack mode hands this to the
+ * integration as its credential so it authenticates to the provider as itself; the fast suite never
+ * calls this (its provider URL is unreachable by design). */
 export async function mintDemoKey (): Promise<string> {
   const demo = ApiClient.create(env.demoProvider.baseUrl)
-  const created = expectOk<{ key: string }>(await demo.get('/keys'), 'mint demo vendor API key')
+  const created = expectOk<{ key: string }>(await demo.get('/keys'), 'mint demo provider API key')
   return created.key
 }
 
@@ -77,10 +77,10 @@ export interface SeedOrgOptions {
    * `{ orderingBaseUrl, resultBaseUrl, 'X-Pims-Id', 'X-Pims-Version' }`. */
   configuration?: Record<string, unknown>
   /* Convenience for the default demo `{ url }` configuration. Ignored when `configuration` is given.
-   * Default is an unreachable .invalid host — fast mode never contacts the vendor. */
+   * Default is an unreachable .invalid host — fast mode never contacts the provider. */
   providerUrl?: string
   /* integrationOptions merged into the create-integration body. Default is a dummy apiKey; full-stack
-   * modes pass real credentials (a demo vendor key, or idexx username/password/locale). */
+   * modes pass real credentials (a demo provider key, or idexx username/password/locale). */
   integrationOptions?: Record<string, unknown>
 }
 
@@ -160,7 +160,7 @@ export async function seed (): Promise<SeededContext> {
 }
 
 export interface OrderPayloadOverrides extends Record<string, unknown> {
-  /* Required, and deliberately not defaulted. There is no provider-agnostic test code: every vendor
+  /* Required, and deliberately not defaulted. There is no provider-agnostic test code: every provider
    * has its own catalogue and rejects anything outside it, so a shared default is a code that is
    * wrong for every provider but the one it was written for. This used to default to `SA`, an
    * invented code that no IDEXX catalogue contains — and each new provider loop inherited it. */

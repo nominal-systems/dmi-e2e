@@ -6,12 +6,12 @@ import { closePool, getOrderStatusByRequisitionId } from '../src/sql'
 
 /* Phase 0 full-system gate (HARNESS_FULL_STACK=1): dmi-api under a NORMAL NODE_ENV, wired over real
  * MQTT/Bull/HTTP to the demo provider stack (redis + demo-provider-api + demo integration). The
- * intent (see #3) is: place an order, let the vendor auto-complete, and watch the result flow back
+ * intent (see #3) is: place an order, let the provider auto-complete, and watch the result flow back
  * through the engine into a report — end to end.
  *
  * BLOCKED UPSTREAM. The demo integration on `main` is not wire-compatible with the current dmi-api,
  * so the create RPC dmi-api sends to the engine is never answered and the order->result->report loop
- * cannot close. The dmi-api handlers, the vendor sim and this harness's plumbing are all sound — the
+ * cannot close. The dmi-api handlers, the provider sim and this harness's plumbing are all sound — the
  * gap is entirely in the demo integration, and its fix is tracked privately (routed upstream), not in
  * this repo. So this file does two things:
  *   1. ACTIVE tests — prove the full topology boots and is wired in normal mode, and CONFIRM the
@@ -20,9 +20,9 @@ import { closePool, getOrderStatusByRequisitionId } from '../src/sql'
  *   2. A skipped completion suite — the intended end-to-end assertions, ready to un-skip once the
  *      demo integration is fixed. */
 
-/* `orderPayload` takes no default test code — every vendor rejects codes outside its own catalogue,
+/* `orderPayload` takes no default test code — every provider rejects codes outside its own catalogue,
  * so a shared default is wrong for all but one provider. The demo loop is blocked upstream (the
- * create RPC is never answered), so nothing here reaches the demo vendor's catalogue; revisit this
+ * create RPC is never answered), so nothing here reaches the demo provider's catalogue; revisit this
  * value when the completion suite below is un-skipped. */
 const DEMO_TEST_CODE = [{ code: 'HARNESS-DEMO' }]
 
@@ -32,8 +32,8 @@ describe('full-stack smoke (demo provider)', () => {
 
   beforeAll(async () => {
     const root = ApiClient.create()
-    /* Quickstart bootstrap: mint a real vendor key, then org -> demo provider config pointing at the
-     * vendor's compose-network URL -> integration carrying that key. POST /integrations returns 201
+    /* Quickstart bootstrap: mint a real provider key, then org -> demo provider config pointing at the
+     * provider's compose-network URL -> integration carrying that key. POST /integrations returns 201
      * without any engine RPC (dmi-api's create() only persists; status starts NEW), so bootstrap
      * does not touch the blocked MQTT path. */
     demoKey = await mintDemoKey()
@@ -60,7 +60,7 @@ describe('full-stack smoke (demo provider)', () => {
       })
     })
 
-    it('the demo vendor is reachable and minted a real API key', async () => {
+    it('the demo provider is reachable and minted a real API key', async () => {
       const response = await ApiClient.create(env.demoProvider.baseUrl).get('/status')
 
       expect(response.status).toBe(200)
@@ -111,11 +111,11 @@ describe('full-stack smoke (demo provider)', () => {
         'place demo order',
       )
       orderId = created.id
-      /* The engine reply lands: a provider-accepted status plus the vendor's externalId. */
+      /* The engine reply lands: a provider-accepted status plus the provider's externalId. */
       expect(created.externalId).toBeTruthy()
     })
 
-    it('the order reaches COMPLETED after vendor auto-complete + poll', async () => {
+    it('the order reaches COMPLETED after provider auto-complete + poll', async () => {
       const response = await pollUntil(
         async () => await org.api.get(`/orders/${orderId}`),
         (r) => r.body?.status === 'COMPLETED',

@@ -3,7 +3,7 @@
  *
  *   - fast (default):      smoke + tenant-isolation, dmi-api alone under NODE_ENV=seed.
  *   - full-stack:          a real provider loop, dmi-api under a normal NODE_ENV against the real
- *                          engine/vendor stack. Selected by HARNESS_FULL_STACK=1; HARNESS_STACK then
+ *                          engine/provider stack. Selected by HARNESS_FULL_STACK=1; HARNESS_STACK then
  *                          picks WHICH loop, by its key in the stack registry (src/stacks.js), which
  *                          is also where each loop's scenario file is named.
  *
@@ -81,7 +81,7 @@ module.exports = {
     }],
     ['<rootDir>/src/report/summary-reporter.js', { outputDir: reportDir }],
   ],
-  /* Fast scenarios are quick; the full loop is ~6s vendor auto-complete + up to 10s poll + boot
+  /* Fast scenarios are quick; the full loop is ~6s provider auto-complete + up to 10s poll + boot
    * slack. Individual full-stack tests set tighter per-test timeouts where they wait on the engine.
    * A loop whose integration hardcodes its poll interval (the registry's `slowPoll`) can leave a
    * result waiting a full tick, so its default budget absorbs a missed one. */

@@ -7,10 +7,10 @@ import { closePool } from '../src/sql'
 
 /* Phase 1 full-system gate for Antech (HARNESS_FULL_STACK=1, HARNESS_STACK=antech): dmi-api under a
  * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine-antech-integration`
- * container (the classic antech provider, id `antech`) and an Antech mock vendor (src/antech-mock).
+ * container (the classic antech provider, id `antech`) and an Antech mock provider (src/antech-mock).
  * It drives the whole loop as an integrator would — configure the antech provider pointed at the
  * mock, create an integration, start it, place an order over HTTP, let the mock produce a result,
- * and watch the order->result->report loop close — with every hop real except the vendor, which is
+ * and watch the order->result->report loop close — with every hop real except the provider, which is
  * the mock so the run is deterministic and never touches a live Antech host.
  *
  * The order flows: POST /orders -> dmi-api RPCs `antech/orders/create` to the integration -> the
@@ -51,7 +51,7 @@ const GLUCOSE = '1001'
 const CREATININE = '1002'
 const HEMOLYSIS_INDEX = '1003'
 
-/* The three patient fields dmi-api ref-maps on the way to the vendor, as (canonical dmi ref name ->
+/* The three patient fields dmi-api ref-maps on the way to the provider, as (canonical dmi ref name ->
  * the antech code it must arrive as). Unlike zoetis, antech maps ALL THREE: species and sex, and
  * breed to a numeric BreedID.
  *
@@ -60,10 +60,10 @@ const HEMOLYSIS_INDEX = '1003'
  * pinned as literals here. Input and expected output are deliberately different values: if the
  * antech provider_ref rows stopped resolving, mapPatientRefs falls back to forwarding the raw code,
  * the mock — which echoes species/breed/sex and does not validate them — stores the raw code, and
- * the value assertion below goes red naming it, instead of a well-formed order the real vendor
+ * the value assertion below goes red naming it, instead of a well-formed order the real provider
  * would reject.
  *
- * Which rows exist is a property of dmi-api's migrations, not of anything synced from the vendor —
+ * Which rows exist is a property of dmi-api's migrations, not of anything synced from the provider —
  * the harness never runs the ref sync. They seed antech species (Canine 41, Feline 42, Bovine 45 and
  * the exotic species), sex codes (Male Sterilized -> CM, Female Sterilized -> SF, ...), and ~1,100
  * dog-breed mappings from Antech's own breed catalogue. Every dmi breed ref carries an opaque UUID
@@ -272,7 +272,7 @@ describe('antech full-stack (Antech mock)', () => {
       /* The patient/client the mock echoes back on results is what dmi-api reconciles against. */
       expect(received.petName).toBe('Rex')
       expect(received.clientLastName).toBe('Doe')
-      /* The vendor-assigned accession that keys the results XML and the acknowledge call. */
+      /* The provider-assigned accession that keys the results XML and the acknowledge call. */
       expect(received.labAccessionId).toBeTruthy()
     })
 
@@ -283,10 +283,10 @@ describe('antech full-stack (Antech mock)', () => {
       )
 
       /* THE POINT OF THIS TEST. species, breed and sex are the only order fields dmi-api transforms
-       * on the way to the vendor, and they must arrive in ANTECH's vocabulary. Asserting the exact
+       * on the way to the provider, and they must arrive in ANTECH's vocabulary. Asserting the exact
        * mapped values — types included: numeric ids arrive as numbers — is what makes a silently
        * broken ref mapping fail here, naming the raw code that got through, instead of producing a
-       * well-formed order the real vendor would reject. The mock echoes these and never validates
+       * well-formed order the real provider would reject. The mock echoes these and never validates
        * them, so this assertion is the only thing between a mapping regression and a green run. */
       expect(received.speciesId).toBe(EXPECTED_ANTECH_SPECIES)
       expect(received.breedId).toBe(EXPECTED_ANTECH_BREED)
@@ -440,7 +440,7 @@ describe('antech full-stack (Antech mock)', () => {
       )
     })
 
-    it('a rejected order surfaces the vendor field error, not a generic fallback', async () => {
+    it('a rejected order surfaces the provider field error, not a generic fallback', async () => {
       /* Exercises the integration's error path, which the happy path never touches — the antech
        * mirror of the idexx review's finding (a mock error envelope the mapper can't read leaves
        * rejections red but the mapper's real branch unexercised). The mock rejects a code outside its

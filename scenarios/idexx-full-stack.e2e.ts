@@ -7,10 +7,10 @@ import { closePool } from '../src/sql'
 
 /* Phase 0 full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
- * `dmi-engine-idexx-integration` container and a VetConnect Plus mock vendor (src/idexx-mock). It
+ * `dmi-engine-idexx-integration` container and a VetConnect Plus mock provider (src/idexx-mock). It
  * drives the whole loop as an integrator would — configure the idexx provider pointed at the mock,
  * create an integration, start it, place an order over HTTP, let the mock produce a result, and
- * watch the order->result->report loop close — with every hop real except the vendor, which is the
+ * watch the order->result->report loop close — with every hop real except the provider, which is the
  * mock so the run is deterministic and never touches live IDEXX.
  *
  * The order flows: POST /orders -> dmi-api RPCs `idexx/orders/create` to the integration -> the
@@ -180,7 +180,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
       expect(response.status).toBe(200)
       expect(response.body.status).toBe('ok')
-      expect(response.body.service).toBe('vcp-mock')
+      expect(response.body.service).toBe('idexx-mock')
     })
 
     it('the quickstart bootstrap completed (org, idexx provider config, integration)', () => {
@@ -251,7 +251,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       /* The ordered test survived the mapping into IDEXX's dialect. The mock rejects an order whose
        * codes are outside its catalogue, so this also pins that the integration forwards them. */
       expect(received.tests).toEqual([serviceCode])
-      /* The device dmi-api was given is the device the vendor received: the integration's include
+      /* The device dmi-api was given is the device the provider received: the integration's include
        * branch kept it and mapped the serial into IDEXX's `ivls` shape. A dropped or renamed device is
        * already a 400 at placement (the mock refuses a device-less in-house order); this pins the
        * value that got through. */
