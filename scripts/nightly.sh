@@ -182,6 +182,9 @@ if [ "$PULL" = 1 ]; then
     fi
     while read -r repo var; do
       dir=${!var:-$ROOT/../$repo}
+      # Canonical, so two spellings of one directory (a symlink, a `..`) are one pull; a directory
+      # that does not exist keeps its spelling and pull() reports it.
+      dir=$(cd "$dir" 2>/dev/null && pwd -P || echo "$dir")
       case " $pulled " in *" $dir "*) continue ;; esac
       pulled="$pulled $dir"
       pull "$dir"

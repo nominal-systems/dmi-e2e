@@ -135,6 +135,14 @@ old.
   job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
   nginx directory. `scripts/nightly-install.sh` renders the template for this checkout, writes it to
   `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that.
+- **When a loop's key changes** — as `antech` → `antech-v3` did — two things need a hand. The run
+  index lists every suite directory it finds, so the old key's row (`reports/<old>/` here,
+  `<HARNESS_REPORT_PUBLISH_DIR>/<old>/` on the mini) sits beside the new one until someone deletes
+  it; and the first unattended run after the merge refuses to run, because `nightly.sh` is parsed
+  in full before it pulls, so the *old* script's suite list and registry CLI meet the *new*
+  `src/stacks.js` and stop, named, before any suite starts. Delete the two directories once, run
+  `scripts/nightly.sh` by hand once, and move any `HARNESS_<OLD>_*` / `DMI_<OLD>_INTEGRATION_DIR` /
+  `NIGHTLY_SUITES` overrides in a profile or plist to the new names.
 
 ```bash
 scripts/nightly-install.sh                                  # install / reinstall

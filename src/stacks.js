@@ -169,10 +169,17 @@ function verifyStacks () {
     } else {
       const variables = new Set()
       entry.checkouts.forEach((checkout, i) => {
+        const variable = checkout?.dirVariable ?? ''
         if (typeof checkout?.repo !== 'string' || checkout.repo === '') fail(key, `checkouts[${i}].repo`, 'missing')
-        if (!/^[A-Z][A-Z0-9_]*$/.test(checkout?.dirVariable ?? '')) fail(key, `checkouts[${i}].dirVariable`, 'must be an environment variable name')
-        if (variables.has(checkout?.dirVariable)) fail(key, 'checkouts', `${checkout.dirVariable} is listed twice`)
-        variables.add(checkout?.dirVariable)
+        if (!/^[A-Z][A-Z0-9_]*$/.test(variable)) {
+          fail(key, `checkouts[${i}].dirVariable`, 'must be an environment variable name')
+        } else if (!compose.includes(`\${${variable}`)) {
+          /* A checkout the run report records must be an input to some image build, or its
+           * "under test" row is decorative — a version nothing ran. */
+          fail(key, `checkouts[${i}].dirVariable`, `${variable} is referenced by no build context in docker-compose.yml — the run report would record a checkout nothing is built from`)
+        }
+        if (variables.has(variable)) fail(key, 'checkouts', `${variable} is listed twice`)
+        variables.add(variable)
       })
     }
     for (const field of ['label', 'urlVariable', 'portVariable']) {
@@ -187,10 +194,17 @@ function verifyStacks () {
      * key. A loop without a workflow (demo, dispatch-only) is exempt. */
     const workflow = path.join(root, '.github', 'workflows', `e2e-${key}.yml`)
     if (fs.existsSync(workflow)) {
+      const text = fs.readFileSync(workflow, 'utf8')
       const glob = `scenarios/${key}*.e2e.ts`
-      if (!fs.readFileSync(workflow, 'utf8').includes(`'${glob}'`)) fail(key, 'workflow', `e2e-${key}.yml does not filter on '${glob}'`)
+      if (!text.includes(`'${glob}'`)) fail(key, 'workflow', `e2e-${key}.yml does not filter on '${glob}'`)
       if (!(entry.scenario.startsWith(`scenarios/${key}`) && entry.scenario.endsWith('.e2e.ts'))) {
         fail(key, 'scenario', `${entry.scenario} is outside the workflow glob '${glob}'`)
+      }
+      /* CI must point every checkout variable at the checkout it made. Compose's `../<repo>`
+       * defaults happen to coincide with the runner's workspace layout, so a variable the workflow
+       * forgot would keep CI green while testing whatever the default resolves to. */
+      for (const { dirVariable } of Array.isArray(entry.checkouts) ? entry.checkouts : []) {
+        if (typeof dirVariable === 'string' && !text.includes(`${dirVariable}:`)) fail(key, 'workflow', `e2e-${key}.yml does not set ${dirVariable}`)
       }
     }
   }
@@ -201,12 +215,22 @@ function verifyStacks () {
    * another key's would fire its workflow on the other loop's scenario edits too — the reason the
    * classic Antech loop is `antech-v3` and not `antech` beside `antech-v6`. */
   const repoOf = new Map()
+  const mockNameOwner = new Map()
   const keys = Object.keys(stacks)
   for (const key of keys) {
     for (const { repo, dirVariable } of Array.isArray(stacks[key].checkouts) ? stacks[key].checkouts : []) {
       const other = repoOf.get(dirVariable)
       if (other != null && other.repo !== repo) fail(key, 'checkouts', `${dirVariable} names ${repo} here but ${other.repo} in ${other.key}`)
       repoOf.set(dirVariable, { key, repo })
+    }
+    /* One name per mock (CLAUDE.md) also means one mock per name: two loops sharing a label or a
+     * variable would read each other's endpoint. */
+    for (const field of ['label', 'urlVariable', 'portVariable']) {
+      const value = stacks[key].mock?.[field]
+      if (typeof value !== 'string') continue
+      const owner = mockNameOwner.get(`${field}=${value}`)
+      if (owner != null && owner !== key) fail(key, `mock.${field}`, `'${value}' is also ${owner}'s`)
+      mockNameOwner.set(`${field}=${value}`, key)
     }
     for (const otherKey of keys) {
       if (otherKey !== key && otherKey.startsWith(key)) {

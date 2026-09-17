@@ -1,5 +1,6 @@
 # Files that are COPYied into Linux containers must keep LF line endings regardless of the platform
 # the repo is checked out on (core.autocrlf=true on Windows would otherwise rewrite them to CRLF,
-# which breaks a mosquitto.conf parsed on Linux).
+# which breaks a mosquitto.conf parsed on Linux). Every mock's server.js is COPYied the same way,
+# so the pattern covers the loops to come, not just the one that first hit it.
 src/mqtt/mosquitto.conf text eol=lf
-src/idexx-mock/server.js text eol=lf
+src/*-mock/server.js text eol=lf
