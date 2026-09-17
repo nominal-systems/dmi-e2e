@@ -320,18 +320,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   }
 
   /* Admin helpers for the ref sync + mapping. dmi ref ids are numeric row ids (the CODES are the
-   * UUIDs), so both halves of a mapping have to be looked up rather than known. */
-  /* NOTE the explicit `page`: both admin listings declare their query as an INTERSECTION TYPE
-   * (`PaginationDto & { search?: string }`) rather than a DTO class, so Nest's ValidationPipe never
-   * instantiates PaginationDto and its `page = 1` default never applies — a caller that omits it
-   * gets a 500 ("Provided \"skip\" value is not a number"). Supplying it is the workaround, not a
-   * preference. */
+   * UUIDs), so both halves of a mapping have to be looked up rather than known.
+   *
+   * Two behaviours of the admin listings, observed and worked around here (their causes are
+   * tracked privately): both need an explicit `page` (omitting it is a 500, not a default), and
+   * `GET /admin/refs/:type` matches rows only for the SINGULAR type names ('species', 'breed',
+   * 'sex') — the plural spellings answer an empty page. */
   async function canonicalRefId (type: RefType, name: string): Promise<number> {
-    /* SINGULAR, and that is not a typo. `GET /admin/refs/:type` declares its parameter as
-     * 'species' | 'breeds' | 'sexes' but uses it verbatim as `ref.type = :type`, and the column
-     * holds the singular ('species', 'breed', 'sex') — so the two plural values the signature
-     * advertises match no rows at all and the route answers an empty page. `species` works only
-     * because it is spelled the same either way. */
     const listing = expectOk<{ data: Array<{ id: number, name: string, code: string }> }>(
       await admin.get(`/admin/refs/${type}`, { search: name, page: 1, limit: 200 }),
       `list dmi ${type} refs matching '${name}'`,
@@ -1487,22 +1482,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
        * reference-data test above reads exactly those lists over the same RPC) and upserts them as
        * provider_ref rows, which is the only way a canonical dmi ref becomes mappable to a provider
-       * code. ACTUAL: HTTP 400, and nothing is stored.
+       * code. ACTUAL: HTTP 400 from the route's own database query, and nothing is stored — for
+       * every provider and every ref type, the per-type route included. The cause is in dmi-api
+       * and is tracked privately.
        *
-       * Mechanically, in dmi-api: the admin route loads the Provider with
-       * `ProvidersService.findOneById`, which decorates the entity with two COMPUTED, non-column
-       * properties (`integrationOptions`, `configurationOptions`) partitioned out of its `options`
-       * relation. `RefsService.syncProviderRefs` then passes that whole decorated entity as a
-       * relation condition — `providerRefRepository.findOne({ where: { code, type, provider } })` —
-       * and TypeORM expands the object into a nested where over the Provider entity's own
-       * properties, hits the first computed one, and refuses the query:
-       * `Property "integrationOptions" was not found in "Provider"`.
-       *
-       * It is not specific to antech-v6: the same path runs for every provider and every ref type,
-       * including `POST /admin/refs/sync/:providerId/:type`. It is why this scenario seeds the
-       * provider_ref rows itself, from the catalogue the engine returned, rather than through the
-       * route that exists to do it. This test carries no fallback of its own: it reports what the
-       * setup observed. */
+       * It is why this scenario seeds the provider_ref rows itself, from the catalogue the engine
+       * returned, rather than through the route that exists to do it. This test carries no
+       * fallback of its own: it reports what the setup observed. */
       expect({
         status: syncResponse.status,
         speciesRefsStoredBySync: speciesRefsAfterSync,
