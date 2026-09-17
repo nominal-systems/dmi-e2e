@@ -317,11 +317,19 @@ services:
   #
   # Env, from dmi-engine/src/config/configuration.ts and src/app.module.ts. REDIS_PORT must stay
   # 6379 (the compose-network port; the harness publishes Redis on 6380 for the host only): the
-  # engine derives REDIS_TLS_ENABLED from the port. The wisdom-panel module is part of the image but
-  # disabled on this profile; the poll interval is the engine's own env knob, dialled down.
+  # engine derives REDIS_TLS_ENABLED from the port. The wisdom-panel module is part of the image AND
+  # loaded (`WISDOM_PANEL_DISABLED` deliberately unset): production runs both modules in one
+  # process, so a boot-time incompatibility between them is exactly what this profile should catch;
+  # with no wisdom-panel integration its queues register and sit idle. The poll interval is the
+  # engine's own env knob, dialled down.
+  #
+  # `restart: on-failure` because the engine refuses to start if a queue cannot reach Redis within
+  # 30s, and compose's `depends_on` orders starts without waiting for readiness — on a slow runner
+  # a first attempt can lose that race.
   dmi-engine-api:
     profiles: ['antech-v6']
     image: dmi-e2e-dmi-engine
+    restart: on-failure
     build:
       context: ${DMI_ENGINE_DIR:-../dmi-engine}
       additional_contexts:
@@ -367,7 +375,6 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: '6379'
       ANTECH_V6_POLLING_INTERVAL_MS: '${HARNESS_ANTECH_V6_POLL_MS:-3000}'
-      WISDOM_PANEL_DISABLED: 'true'
       STATSIG_ENABLED: 'false'
       # dmi-engine-common logs every outbound provider request; the only diagnostic when a poll
       # fails silently.
@@ -377,9 +384,14 @@ services:
       - redis
       - antech-v6-mock
 
+  # `image:` only, no `build:`: it runs the image the api service built. Compose builds every
+  # buildable service before starting any container, so under the harness's `up --build` the image
+  # always exists by the time this starts; a bare `docker compose up` on a host that never built it
+  # would try to pull it and fail — build the profile first.
   dmi-engine-worker:
     profiles: ['antech-v6']
     image: dmi-e2e-dmi-engine
+    restart: on-failure
     environment:
       <<: *dmi-engine-env
       ENGINE_ROLE: worker

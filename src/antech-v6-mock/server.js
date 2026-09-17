@@ -1,7 +1,7 @@
 'use strict'
 
 /* Antech V6 mock provider for the dmi-e2e full-stack harness. A zero-dependency Node HTTP server
- * that speaks Antech's V6 ("Marga") JSON dialect closely enough for the REAL
+ * that speaks Antech's V6 JSON dialect closely enough for the REAL
  * `dmi-engine-antech-v6-integration` — hosted, as production hosts it, inside the `dmi-engine`
  * container — to drive it unmodified: per-request login, the two status feeds, the results feed,
  * both acknowledge channels, the species/breed and test-guide reference endpoints, the TRF

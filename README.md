@@ -177,7 +177,8 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   **real `dmi-engine`** — the process that hosts it in production — **twice, as prod runs it**: an
   `api` process (MQTT handlers) and a `worker` process (Bull polling), from one image built from the
   sibling `dmi-engine` checkout with the antech-v6 **and** wisdom-panel modules injected from their
-  own sibling checkouts (the engine's Dockerfile would install the published packages instead).
+  own sibling checkouts (the engine's Dockerfile would install the published packages instead) and
+  both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
   `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
 - **`demo`** — the pre-existing demo loop (ActiveMQ, Redis, `dmi-demo-provider-api` + its MySQL, and
@@ -432,7 +433,7 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
-| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech-v3` (real classic-Antech integration + antech-v3 mock; dmi-api's provider id is the bare `antech`), `zoetis` (real zoetis integration + Zoetis mock) or `demo` (upstream-blocked demo loop). Anything else is refused — including the old `antech`. |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech-v3` (real classic-Antech integration + antech-v3 mock; dmi-api's provider id is the bare `antech`), `zoetis` (real zoetis integration + Zoetis mock), `antech-v6` (the real dmi-engine as api + worker + antech-v6 mock) or `demo` (upstream-blocked demo loop). Anything else is refused — including the old `antech`. |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |

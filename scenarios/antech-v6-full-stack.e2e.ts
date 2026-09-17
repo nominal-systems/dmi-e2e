@@ -1467,6 +1467,37 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     }, 60_000)
   })
 
+  describe('cancel: the integration has no cancel path, and dmi-api leaves the order as it was', () => {
+    it('DELETE /orders/:id is refused with the integration\'s own message, and the order stays SUBMITTED', async () => {
+      /* The integration's `cancelOrder` throws a 501 ("does not support cancelling orders") before
+       * any HTTP call — there is no cancel endpoint in its dialect, so the mock has nothing to
+       * refuse and this pin is about dmi-api's side of the RPC: `cancelOrder` only marks the local
+       * order CANCELLED after the engine RPC RESOLVES, so a rejected RPC must leave the order
+       * exactly as it was, at the provider and in dmi. Whether Antech's API has a cancel surface
+       * the integration could use is unverified (a related observation is tracked privately), so
+       * there is no tripwire here yet — only the pin that the refusal is loud and lossless. */
+      const payload = payloadFor([KIDNEY_PANEL_CODE])
+      const requisitionId = payload.requisitionId as string
+      const created = expectOk<{ id: string, status: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place an order to attempt cancelling',
+      )
+      expect(created.status).toBe('SUBMITTED')
+
+      const response = await org.api.delete(`/orders/${created.id}`)
+      console.log(
+        `[antech-v6-scenario] cancel response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+      expect(response.ok).toBe(false)
+      expect(response.text).toContain('does not support cancelling orders')
+
+      const order = await org.api.get(`/orders/${created.id}`)
+      expect(order.body.status).toBe('SUBMITTED')
+      const received = await mockOrder(requisitionId)
+      expect(received.orderStatus).toBe('Submitted')
+    }, 60_000)
+  })
+
   /* ---- tripwires ----
    *
    * Each asserts the CORRECT behaviour and is marked `failing` while the integration does not have

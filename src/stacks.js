@@ -94,8 +94,8 @@ const stacks = {
     /* Antech's newer API generation — a different provider in dmi-api (`antech-v6`, next to the
      * classic `antech`), and a different KIND of loop: the integration is an npm module hosted by
      * the `dmi-engine` container, so the loop is built from three checkouts — the host engine and
-     * the two provider modules it imports (the Wisdom Panel one is disabled on this profile but is
-     * part of the image, so its version is recorded too). The engine runs as prod does, split into
+     * the two provider modules it imports (the Wisdom Panel one is loaded too, as in production,
+     * so its version is recorded as well). The engine runs as prod does, split into
      * an `api` process (MQTT handlers) and a `worker` process (Bull polling), from one image. */
     providerId: 'antech-v6',
     scenario: 'scenarios/antech-v6-full-stack.e2e.ts',
