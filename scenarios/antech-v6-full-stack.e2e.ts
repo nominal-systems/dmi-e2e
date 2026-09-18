@@ -30,7 +30,8 @@ import { closePool, query } from '../src/sql'
  *    scenario picks its test codes BY FLAG (from the mock's control plane) and never by position.
  *
  * 3. ONLY THE RESULTS CHANNEL CAN COMPLETE AN ORDER TODAY, and that is not a property of this
- *    harness — it is a defect in the integration, tracked privately. `OrderStatus` is a STRING on
+ *    harness — it is a defect in the integration, pinned by a tripwire at the bottom of this file
+ *    and not yet filed upstream. `OrderStatus` is a STRING on
  *    the wire (`"Submitted"`, `"Received"`, `"Final"`, …) while the integration's status enum is a
  *    bare numeric one, so its `mapOrderStatus` switch never matches a wire value and every polled
  *    status falls to its default, dmi SUBMITTED. The orders channel can therefore move an order
@@ -322,10 +323,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   /* Admin helpers for the ref sync + mapping. dmi ref ids are numeric row ids (the CODES are the
    * UUIDs), so both halves of a mapping have to be looked up rather than known.
    *
-   * Two behaviours of the admin listings, observed and worked around here (their causes are
-   * tracked privately): both need an explicit `page` (omitting it is a 500, not a default), and
-   * `GET /admin/refs/:type` matches rows only for the SINGULAR type names ('species', 'breed',
-   * 'sex') — the plural spellings answer an empty page. */
+   * Two behaviours of the admin listings, worked around here and not yet filed upstream: both need
+   * an explicit `page` — their query is typed as an intersection (`PaginationDto & {...}`) rather
+   * than a DTO class, so the validation pipe never instantiates the DTO and its `page = 1` default
+   * never applies; omitting it is a 500 ("Provided \"skip\" value is not a number") — and
+   * `GET /admin/refs/:type` uses the path value verbatim as `ref.type = :type`, where the column
+   * holds the SINGULAR ('species', 'breed', 'sex'), so the advertised `breeds` / `sexes` answer an
+   * empty page and only `species` works, being spelled the same either way. */
   async function canonicalRefId (type: RefType, name: string): Promise<number> {
     const listing = expectOk<{ data: Array<{ id: number, name: string, code: string }> }>(
       await admin.get(`/admin/refs/${type}`, { search: name, page: 1, limit: 200 }),
@@ -1474,8 +1478,10 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * refuse and this pin is about dmi-api's side of the RPC: `cancelOrder` only marks the local
        * order CANCELLED after the engine RPC RESOLVES, so a rejected RPC must leave the order
        * exactly as it was, at the provider and in dmi. Whether Antech's API has a cancel surface
-       * the integration could use is unverified (a related observation is tracked privately), so
-       * there is no tripwire here yet — only the pin that the refusal is loud and lossless. */
+       * the integration could use is unverified — though both placement endpoints DO return the
+       * provider's own numeric order id, which the integration discards, and that is the identifier
+       * such a surface would most likely want — so there is no tripwire here yet, only the pin that
+       * the refusal is loud and lossless. */
       const payload = payloadFor([KIDNEY_PANEL_CODE])
       const requisitionId = payload.requisitionId as string
       const created = expectOk<{ id: string, status: string }>(
@@ -1507,15 +1513,22 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
    * passed even though it was supposed to fail", and the only correct response is to delete the
    * marker, not to relax the assertion.
    *
-   * All three are tracked privately; nothing here names an issue. */
+   * None of the four is filed upstream yet (as of 2026-09-18); each comment states the mechanism so
+   * a fix can be matched to its tripwire. */
   describe('tripwires: behaviours the loop should have and does not', () => {
     it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
        * reference-data test above reads exactly those lists over the same RPC) and upserts them as
        * provider_ref rows, which is the only way a canonical dmi ref becomes mappable to a provider
        * code. ACTUAL: HTTP 400 from the route's own database query, and nothing is stored — for
-       * every provider and every ref type, the per-type route included. The cause is in dmi-api
-       * and is tracked privately.
+       * every provider and every ref type, the per-type route included. The RPC to the engine
+       * runs and the data comes back; the upsert then fails because the route loads the Provider
+       * with `ProvidersService.findOneById`, which decorates the entity with two computed,
+       * non-column properties (`integrationOptions`, `configurationOptions`), and
+       * `RefsService.syncProviderRefs` passes that whole entity as a relation condition —
+       * `findOne({ where: { code, type, provider } })` — which TypeORM expands over the entity's
+       * properties and refuses at the first computed one:
+       * `Property "integrationOptions" was not found in "Provider"`. Not yet filed upstream.
        *
        * It is why this scenario seeds the provider_ref rows itself, from the catalogue the engine
        * returned, rather than through the route that exists to do it. This test carries no

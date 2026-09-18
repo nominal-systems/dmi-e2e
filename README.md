@@ -732,7 +732,9 @@ the irregular `labAccessionsIds` key) → dmi-api writes the report. 30 tests, f
   admin sync uses) and maps three canonical refs over the admin API, then asserts `41` / `130` /
   `CM` arrived at the mock. The admin sync route itself answers 400 and stores nothing, for every
   provider, so the rows are inserted from what the engine returned; a fourth tripwire pins the
-  route. Tracked privately.
+  route. The cause: the route's upsert passes the loaded Provider entity — decorated with two
+  computed properties — as a TypeORM relation condition, and TypeORM refuses the query
+  (`Property "integrationOptions" was not found in "Provider"`). Not yet filed upstream.
 - **A pre-order is a draft the engine cannot see** — it is in none of the status views and has no
   requisition form (a 500, as live) — so the mock's control plane models the clinic completing it,
   and the promoted order is the one place the orders channel moves a dmi order (to SUBMITTED).
