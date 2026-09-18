@@ -6,7 +6,7 @@
 # profile, so PATH, node (nvm) and the GitHub Packages token are all resolved here.
 #
 # Knobs (all optional):
-#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis)
+#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis antech-v6)
 #   NIGHTLY_PULL          1 to fast-forward every checkout first, 0 to test what is there (default 1)
 #   NIGHTLY_BRANCH        branch this checkout must be on for an unattended run (default main): a
 #                         clean checkout on another branch is switched, a dirty one makes the run
@@ -27,7 +27,7 @@ set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOG_DIR=${NIGHTLY_LOG_DIR:-$HOME/Library/Logs/dmi-e2e}
-SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis}
+SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis antech-v6}
 PULL=${NIGHTLY_PULL:-1}
 BRANCH=${NIGHTLY_BRANCH:-main}
 TOKEN_FILE=${NIGHTLY_TOKEN_FILE:-$HOME/.config/dmi-e2e/token}

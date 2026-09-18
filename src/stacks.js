@@ -90,6 +90,31 @@ const stacks = {
     /* Hardcoded 30s poll, as antech-v3. */
     slowPoll: true,
   },
+  'antech-v6': {
+    /* Antech's newer API generation — a different provider in dmi-api (`antech-v6`, next to the
+     * classic `antech`), and a different KIND of loop: the integration is an npm module hosted by
+     * the `dmi-engine` container, so the loop is built from three checkouts — the host engine and
+     * the two provider modules it imports (the Wisdom Panel one is loaded too, as in production,
+     * so its version is recorded as well). The engine runs as prod does, split into
+     * an `api` process (MQTT handlers) and a `worker` process (Bull polling), from one image. */
+    providerId: 'antech-v6',
+    scenario: 'scenarios/antech-v6-full-stack.e2e.ts',
+    composeProfile: 'antech-v6',
+    checkouts: [
+      { repo: 'dmi-engine', dirVariable: 'DMI_ENGINE_DIR' },
+      { repo: 'dmi-engine-antech-v6-integration', dirVariable: 'DMI_ANTECH_V6_INTEGRATION_DIR' },
+      { repo: 'dmi-engine-wisdom-panel-integration', dirVariable: 'DMI_WISDOM_PANEL_INTEGRATION_DIR' },
+    ],
+    mock: {
+      label: 'antech-v6-mock',
+      urlVariable: 'HARNESS_ANTECH_V6_MOCK_URL',
+      portVariable: 'HARNESS_ANTECH_V6_MOCK_PORT',
+      defaultPort: 3015,
+      pathPrefix: '',
+    },
+    /* ANTECH_V6_POLLING_INTERVAL_MS is env-configurable; the compose profile dials it to ~3s. */
+    slowPoll: false,
+  },
   demo: {
     providerId: 'demo',
     scenario: 'scenarios/full-stack-smoke.e2e.ts',
