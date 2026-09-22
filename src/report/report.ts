@@ -549,8 +549,10 @@ ${reports.map(testsBlock).join('\n')}`
   .chg { display: inline-block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .7rem; font-weight: 700; color: var(--warn); background: var(--warn-bg); border-radius: .3rem; padding: 0 .35rem; margin-left: .25rem; vertical-align: middle; }
   .counts, .took, .links, td > time { white-space: nowrap; }
   .took .wall { font-size: .8rem; }
-  .history .dots { display: flex; gap: 2px; flex-wrap: wrap; }
-  .dot { display: inline-block; width: .8rem; height: 1.1rem; border-radius: 2px; background: var(--muted); cursor: default; }
+  /* One line, always: the strip's width is the column's minimum, so the table widens the column
+   * rather than wrapping the dots (a wrapped strip reads as two runs of history). */
+  .history .dots { display: flex; gap: 2px; flex-wrap: nowrap; }
+  .dot { display: inline-block; flex: none; width: .8rem; height: 1.1rem; border-radius: 2px; background: var(--muted); cursor: default; }
   .dot.passed { background: var(--ok); } .dot.failed { background: var(--bad); } .dot.incomplete { background: var(--muted); opacity: .5; }
   .history .note { font-size: .8rem; margin-top: .2rem; white-space: nowrap; }
   details { margin-top: 1.5rem; }
