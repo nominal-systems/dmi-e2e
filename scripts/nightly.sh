@@ -7,11 +7,14 @@
 #
 # Knobs (all optional):
 #   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis antech-v6)
-#   NIGHTLY_PULL          1 to fast-forward every checkout first, 0 to test what is there (default 1)
-#   NIGHTLY_BRANCH        branch this checkout must be on for an unattended run (default main): a
-#                         clean checkout on another branch is switched, a dirty one makes the run
-#                         refuse — a stray topic branch must never run unattended. Ignored when
+#   NIGHTLY_PULL          1 to force every clone in the nightly tree to origin/<branch> first (cloning
+#                         any the tree lacks), 0 to test whatever is checked out where this script
+#                         lives (default 1)
+#   NIGHTLY_BRANCH        the branch every clone is reset to (default main). Ignored when
 #                         NIGHTLY_PULL=0 (that is the "test what is here" mode).
+#   NIGHTLY_GIT_URL       prefix a missing clone is fetched from, `<prefix><repo>.git`
+#                         (default git@github.com:nominal-systems/ — ssh, because launchd has no
+#                         credential source for https)
 #   NIGHTLY_TOKEN_FILE    file holding the GitHub Packages token (default ~/.config/dmi-e2e/token),
 #                         so the job can run on a token scoped to read:packages alone
 #   NIGHTLY_SUITE_TIMEOUT seconds before a suite is killed  (default 2400)
@@ -21,7 +24,7 @@
 #   GHP_TOKEN             when unset: NIGHTLY_TOKEN_FILE if present, else `gh auth token`
 #
 # The whole body is one brace group so bash parses it completely before running a line of it —
-# the pull below may rewrite this very file mid-run.
+# the sync below may rewrite this very file mid-run.
 {
 set -u
 
@@ -30,6 +33,7 @@ LOG_DIR=${NIGHTLY_LOG_DIR:-$HOME/Library/Logs/dmi-e2e}
 SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis antech-v6}
 PULL=${NIGHTLY_PULL:-1}
 BRANCH=${NIGHTLY_BRANCH:-main}
+GIT_URL=${NIGHTLY_GIT_URL:-git@github.com:nominal-systems/}
 TOKEN_FILE=${NIGHTLY_TOKEN_FILE:-$HOME/.config/dmi-e2e/token}
 SUITE_TIMEOUT=${NIGHTLY_SUITE_TIMEOUT:-2400}
 KEEP_DAYS=${NIGHTLY_LOG_KEEP_DAYS:-14}
@@ -102,7 +106,7 @@ docker_config_without_credstore() {
 }
 docker_config_without_credstore || log "could not prepare DOCKER_CONFIG — using ~/.docker as is"
 
-log "start — root=$ROOT suites=[$SUITES] pull=$PULL publish=$HARNESS_PUBLISH_REPORT log=$LOG"
+log "start — root=$ROOT suites=[$SUITES] pull=$PULL branch=$BRANCH publish=$HARNESS_PUBLISH_REPORT log=$LOG"
 log "node $(node -v 2>&1) at $(command -v node || echo MISSING); docker $(command -v docker || echo MISSING) config=${DOCKER_CONFIG:-~/.docker}; token $([ -n "${GHP_TOKEN:-}" ] && echo "from $token_source" || echo MISSING)"
 
 cd "$ROOT" || exit 1
@@ -121,73 +125,104 @@ if ! docker info >/dev/null 2>&1; then
   fi
 fi
 
-# --- fast-forward every checkout under test -----------------------------------------------------
-# ff-only and never fatal: a checkout that cannot fast-forward (diverged, or a local edit the pull
-# would overwrite — dmi-api carries one on the mac mini) is tested as it stands, and the report's
-# "under test" column records the describe, `-dirty` included.
-pull() {
-  local dir=$1
-  if [ ! -d "$dir/.git" ]; then log "pull: no checkout at $dir (skipped)"; return; fi
-  local before after
-  before=$(git -C "$dir" rev-parse HEAD)
-  if git -C "$dir" pull --ff-only --quiet 2>&1; then
-    after=$(git -C "$dir" rev-parse HEAD)
-    if [ "$before" = "$after" ]; then
-      log "pull: $dir already at $(git -C "$dir" describe --always --dirty) on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
-    else
-      log "pull: $dir ${before:0:8} -> ${after:0:8} on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+# --- the nightly tree: dedicated clones, each forced to origin/<branch> --------------------------
+# An unattended run executes whatever it checks out, as this user, on this machine — so it must
+# never test a developer's working tree. It runs from its own tree of clones, created by
+# scripts/nightly-install.sh: this checkout's parent directory, one clone per repo under the repo's
+# own name (that is what docker-compose.yml's `../<repo>` defaults and the harness's DMI_API_DIR
+# default resolve to), marked by a `.dmi-e2e-nightly` file. Every night each clone is forced to
+# `origin/$BRANCH` — fetch, discard local changes, reset the branch — so nothing a person does in
+# the usual sibling checkouts can reach the run, and nothing left behind in the tree survives it.
+# (Seven nights of red in 2026-09 came from the shared dmi-api checkout sitting, clean and in sync
+# with its remote, on a topic branch that predated the fix the suite asserted.) A clone the tree
+# lacks — a loop's new checkout, after a registry change — is cloned on the spot.
+#
+# The marker is the safety. A hard reset in somebody's working checkout would destroy their work,
+# so a tree without the marker refuses to run, and so does a checkout override (DMI_*_DIR): the
+# harness must resolve every checkout inside the tree this run synced. NIGHTLY_PULL=0 skips all of
+# this and tests whatever is checked out, wherever this script lives.
+TREE=$(dirname "$ROOT")
+MARKER=$TREE/.dmi-e2e-nightly
+
+describe() { git -C "$1" describe --always --dirty 2>/dev/null; }
+
+# sync <repo>: the clone at $TREE/<repo>, forced to origin/$BRANCH. Fatal only when a clone is
+# missing and cannot be made; past that, a fetch or checkout that fails leaves the clone as it was,
+# logged, and the report's "under test" column records what actually ran.
+sync() {
+  local repo=$1 dir=$TREE/$1 before after
+  if [ ! -d "$dir/.git" ]; then
+    log "sync: cloning $GIT_URL$repo.git into $dir"
+    if ! git clone --quiet "$GIT_URL$repo.git" "$dir" 2>&1; then
+      log "sync: clone of $repo failed — not running"
+      return 1
     fi
+  fi
+  before=$(git -C "$dir" rev-parse HEAD)
+  if ! git -C "$dir" fetch --quiet origin "$BRANCH" 2>&1; then
+    log "sync: $repo could not fetch origin/$BRANCH — testing what is checked out ($(describe "$dir") on $(git -C "$dir" rev-parse --abbrev-ref HEAD))"
+    return 0
+  fi
+  # Discard anything local, then point the branch at what was fetched and check it out. Ignored
+  # files (node_modules, dist) survive, so an unchanged lockfile costs no reinstall.
+  git -C "$dir" reset --quiet --hard 2>&1 || true
+  if ! git -C "$dir" checkout --quiet -B "$BRANCH" "origin/$BRANCH" 2>&1; then
+    log "sync: $repo could not check out origin/$BRANCH — testing what is checked out ($(describe "$dir"))"
+    return 0
+  fi
+  after=$(git -C "$dir" rev-parse HEAD)
+  if [ "$before" = "$after" ]; then
+    log "sync: $repo already at $(describe "$dir") on $BRANCH"
   else
-    log "pull: $dir could not fast-forward — testing what is checked out ($(git -C "$dir" describe --always --dirty))"
+    log "sync: $repo ${before:0:8} -> ${after:0:8} on $BRANCH"
   fi
 }
 
-# An unattended run executes whatever it pulls, as this user, on this machine. Pin it to one branch
-# so a topic branch left checked out here never runs at 03:00.
-ensure_branch() {
-  local current
-  current=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)
-  [ "$current" = "$BRANCH" ] && return 0
-  if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
-    log "checkout is on '$current' with local changes — refusing to switch to '$BRANCH'; not running"
-    return 1
+# install_if_needed <repo> <lockfile shasum before the sync>: `npm ci` in a clone the harness runs
+# from source (this repo, dmi-api) when it has no node_modules yet or its lockfile moved. The loops'
+# integration checkouts are built into images by compose and need nothing here.
+install_if_needed() {
+  local repo=$1 dir=$TREE/$1 lock_before=$2
+  if [ ! -d "$dir/node_modules" ] || [ "$(shasum "$dir/package-lock.json" 2>/dev/null)" != "$lock_before" ]; then
+    log "install: npm ci in $repo"
+    (cd "$dir" && npm ci --no-audit --no-fund >/dev/null 2>&1) || log "install: npm ci failed in $repo (continuing)"
   fi
-  if ! git -C "$ROOT" switch --quiet "$BRANCH" 2>&1; then
-    log "could not switch from '$current' to '$BRANCH' — not running"
-    return 1
-  fi
-  log "switched checkout from '$current' to '$BRANCH'"
 }
 
 if [ "$PULL" = 1 ]; then
-  ensure_branch || exit 1
-  lock_before=$(shasum package-lock.json 2>/dev/null)
-  pull "$ROOT"
-  if [ "$(shasum package-lock.json 2>/dev/null)" != "$lock_before" ]; then
-    log "package-lock.json changed — npm ci"
-    npm ci --no-audit --no-fund >/dev/null 2>&1 || log "npm ci failed (continuing)"
+  if [ ! -f "$MARKER" ] || [ "$ROOT" != "$TREE/dmi-e2e" ]; then
+    log "$ROOT is not the dmi-e2e clone of a nightly tree (expected $TREE/.dmi-e2e-nightly beside it) — refusing to reset checkouts that may be somebody's. Run scripts/nightly-install.sh to create the tree, or NIGHTLY_PULL=0 to test what is here."
+    exit 1
   fi
-  pull "${DMI_API_DIR:-$ROOT/../dmi-api}"
-  pulled=''
+  overrides=$(env | grep -E '^DMI_[A-Z0-9_]*_DIR=' || true)
+  if [ -n "$overrides" ]; then
+    log "checkout overrides are set ($(echo "$overrides" | cut -d= -f1 | tr '\n' ' ')) — a nightly tests only the clones it synced; unset them, or NIGHTLY_PULL=0"
+    exit 1
+  fi
+
+  lock_before=$(shasum "$ROOT/package-lock.json" 2>/dev/null)
+  sync dmi-e2e || exit 1
+  install_if_needed dmi-e2e "$lock_before"
+
+  lock_before=$(shasum "$TREE/dmi-api/package-lock.json" 2>/dev/null)
+  sync dmi-api || exit 1
+  install_if_needed dmi-api "$lock_before"
+
+  synced=''
   for s in $SUITES; do
     [ "$s" = fast ] && continue
-    # The registry (src/stacks.js, freshly pulled above) owns each loop's checkouts: one line per
+    # The registry (src/stacks.js, freshly synced above) owns each loop's checkouts: one line per
     # checkout, its repo name and the variable that overrides the location. A loop hosted by a
-    # shared engine container lists several, and two loops may list the same one — it is pulled
-    # once. A suite the registry does not know stops the run here, named, rather than pulling a
-    # guessed path — and nothing is derived from the key, so a key with a hyphen is fine.
+    # shared engine container lists several, and two loops may list the same one — it is synced
+    # once. A suite the registry does not know stops the run here, named, rather than guessing.
     if ! checkouts=$(node "$ROOT/src/stacks.js" checkouts "$s"); then
       log "suite '$s' is not in src/stacks.js — not running"
       exit 1
     fi
-    while read -r repo var; do
-      dir=${!var:-$ROOT/../$repo}
-      # Canonical, so two spellings of one directory (a symlink, a `..`) are one pull; a directory
-      # that does not exist keeps its spelling and pull() reports it.
-      dir=$(cd "$dir" 2>/dev/null && pwd -P || echo "$dir")
-      case " $pulled " in *" $dir "*) continue ;; esac
-      pulled="$pulled $dir"
-      pull "$dir"
+    while read -r repo _; do
+      case " $synced " in *" $repo "*) continue ;; esac
+      synced="$synced $repo"
+      sync "$repo" || exit 1
     done <<< "$checkouts"
   done
 fi
