@@ -121,8 +121,12 @@ old.
   (`NIGHTLY_GIT_URL`), because launchd has no credential source for https. A fetch that fails leaves
   that clone as it was, logged, and the report's "under test" column records what actually ran. The
   marker is the safety: the hard reset refuses to run in a directory without it, and a directory
-  that already holds checkouts is never marked. `dmi-e2e` and `dmi-api` get `npm ci` when a clone
-  is new or its lockfile moved. Then it makes sure Docker Desktop is up and runs `fast`, `idexx`,
+  that already holds checkouts is never marked. A machine-local hook, `<tree>/patches/<repo>.sh`,
+  runs inside a clone after every sync (never in git — it is for a toolchain workaround the machine
+  needs and the repo does not carry; the mac mini's `dmi-api.sh` bumps argon2, whose pinned version
+  has no darwin-arm64 binary and does not build against Node 24's headers on Apple clang — and the
+  clone then honestly reads `-dirty` in the report). `dmi-e2e` and `dmi-api` get `npm ci` when a
+  clone is new or its lockfile moved. Then it makes sure Docker Desktop is up and runs `fast`, `idexx`,
   `antech-v3`, `zoetis` and `antech-v6` in turn with `HARNESS_PUBLISH_REPORT=1`. A red suite does
   not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed and its
   containers removed. A lock keeps runs from overlapping. Each run writes a dated log under

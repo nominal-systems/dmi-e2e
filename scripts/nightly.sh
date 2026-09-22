@@ -178,6 +178,22 @@ sync() {
   fi
 }
 
+# prepare <repo>: a machine-local patch applied to a clone after every sync — the place for a
+# toolchain workaround this machine needs and the repo does not carry. `$TREE/patches/<repo>.sh`,
+# run inside the clone, lives in the tree and never in git; the clone reads `-dirty` in the
+# report's "under test" column afterwards, which is the truth. (The mac mini's dmi-api needs a
+# newer argon2 than the repo pins: the pinned one has no darwin-arm64 binary and its source does
+# not build against Node 24's C++20 headers on Apple clang.) A hook that changes package.json must
+# also refresh the lockfile (`npm install --package-lock-only`), because the install below is
+# `npm ci`.
+prepare() {
+  local repo=$1 hook=$TREE/patches/$1.sh
+  [ -f "$hook" ] || return 0
+  log "prepare: $repo — applying $hook"
+  (cd "$TREE/$repo" && bash "$hook" > "$LOG_DIR/prepare-$repo.log" 2>&1) \
+    || log "prepare: $hook failed — see $LOG_DIR/prepare-$repo.log (continuing)"
+}
+
 # install_if_needed <repo> <lockfile shasum before the sync>: `npm ci` in a clone the harness runs
 # from source (this repo, dmi-api) when it has no node_modules yet or its lockfile moved. The loops'
 # integration checkouts are built into images by compose and need nothing here.
@@ -205,10 +221,12 @@ if [ "$PULL" = 1 ]; then
 
   lock_before=$(shasum "$ROOT/package-lock.json" 2>/dev/null)
   sync dmi-e2e || exit 1
+  prepare dmi-e2e
   install_if_needed dmi-e2e "$lock_before"
 
   lock_before=$(shasum "$TREE/dmi-api/package-lock.json" 2>/dev/null)
   sync dmi-api || exit 1
+  prepare dmi-api
   install_if_needed dmi-api "$lock_before"
 
   synced=''
@@ -226,6 +244,7 @@ if [ "$PULL" = 1 ]; then
       case " $synced " in *" $repo "*) continue ;; esac
       synced="$synced $repo"
       sync "$repo" || exit 1
+      prepare "$repo"
     done <<< "$checkouts"
   done
 fi
