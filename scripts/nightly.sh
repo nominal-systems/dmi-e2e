@@ -185,7 +185,10 @@ install_if_needed() {
   local repo=$1 dir=$TREE/$1 lock_before=$2
   if [ ! -d "$dir/node_modules" ] || [ "$(shasum "$dir/package-lock.json" 2>/dev/null)" != "$lock_before" ]; then
     log "install: npm ci in $repo"
-    (cd "$dir" && npm ci --no-audit --no-fund >/dev/null 2>&1) || log "install: npm ci failed in $repo (continuing)"
+    # Output kept beside the run logs: a native module that stops building (argon2 has, on Apple
+    # clang) would otherwise surface only as the harness's "no node_modules" one step later.
+    (cd "$dir" && npm ci --no-audit --no-fund > "$LOG_DIR/npm-ci-$repo.log" 2>&1) \
+      || log "install: npm ci failed in $repo — see $LOG_DIR/npm-ci-$repo.log (continuing)"
   fi
 }
 
