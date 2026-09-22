@@ -110,43 +110,59 @@ drift, but a cloud run leaves no report anywhere you can open. The mac mini ther
 five suites itself each night and publishes each one, so the served index is never more than a day
 old.
 
-- [scripts/nightly.sh](scripts/nightly.sh) is the run. It fast-forwards this checkout, the dmi-api
-  checkout and every checkout the registry lists for the suites it runs, each once however many
-  suites share it (ff-only; a checkout that cannot fast-forward is
-  tested as it stands, and the report's "under test" column says so — and they need **ssh
-  remotes**, because launchd has no credential source for https), makes sure Docker Desktop is
-  up, then runs `fast`, `idexx`, `antech-v3`, `zoetis` and `antech-v6` in turn with
-  `HARNESS_PUBLISH_REPORT=1` (the last needs the `dmi-engine` and both module clones as siblings). A
-  red suite does not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed
-  and its containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
+- [scripts/nightly.sh](scripts/nightly.sh) is the run, and it runs from **its own tree of clones**,
+  never from a checkout a person works in. The tree (`../nightly` beside this checkout by default;
+  `scripts/nightly-install.sh` creates it and marks it with a `.dmi-e2e-nightly` file) holds one
+  clone per repo under the repo's own name — `dmi-e2e`, `dmi-api` and every checkout the registry
+  lists for the suites it runs — which is exactly the `../<repo>` layout the compose file and the
+  harness default to, so no `DMI_*_DIR` is set (an override is refused: the run tests only what it
+  synced). Every night each clone is **forced to `origin/main`** (`NIGHTLY_BRANCH`): fetch, discard
+  local changes, reset the branch. A clone the tree lacks is made on the spot, over **ssh**
+  (`NIGHTLY_GIT_URL`), because launchd has no credential source for https. A fetch that fails leaves
+  that clone as it was, logged, and the report's "under test" column records what actually ran. The
+  marker is the safety: the hard reset refuses to run in a directory without it, and a directory
+  that already holds checkouts is never marked. A machine-local hook, `<tree>/patches/<repo>.sh`,
+  runs inside a clone after every sync (never in git — it is for a toolchain workaround the machine
+  needs and the repo does not carry; the mac mini's `dmi-api.sh` bumps argon2, whose pinned version
+  has no darwin-arm64 binary and does not build against Node 24's headers on Apple clang — and the
+  clone then honestly reads `-dirty` in the report). `dmi-e2e` and `dmi-api` get `npm ci` when a
+  clone is new or its lockfile moved. Then it makes sure Docker Desktop is up and runs `fast`, `idexx`,
+  `antech-v3`, `zoetis` and `antech-v6` in turn with `HARNESS_PUBLISH_REPORT=1`. A red suite does
+  not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed and its
+  containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
   `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
-  pruned. An unattended run executes whatever it pulls, so it is pinned to `main`
-  (`NIGHTLY_BRANCH`): a clean checkout on another branch is switched there first, a dirty one makes
-  the run refuse. The GitHub Packages token is read from `~/.config/dmi-e2e/token`
-  (`NIGHTLY_TOKEN_FILE`) when that file exists — a token scoped to `read:packages` alone is all the
-  job needs, since the checkouts are pulled over ssh — and from `gh auth token` otherwise. It assumes nothing about the caller's environment (launchd sources no profile): PATH, nvm
-  and `GHP_TOKEN` (from `gh auth token`) are resolved inside. It also runs the docker CLI from a
+  pruned. `NIGHTLY_PULL=0` is the "test what is here" mode: no tree, no reset, whatever is checked
+  out where the script lives. (Why the tree: for seven nights in 2026-09 the shared dmi-api checkout
+  sat, clean and in sync with its remote, on a topic branch that predated a fix the fast suite
+  asserted, and the ff-only pull of the day kept it there.) The GitHub Packages token is read from
+  `~/.config/dmi-e2e/token` (`NIGHTLY_TOKEN_FILE`) when that file exists — a token scoped to
+  `read:packages` alone is all the job needs — and from `gh auth token` otherwise. It assumes
+  nothing about the caller's environment (launchd sources no profile): PATH, nvm and `GHP_TOKEN`
+  are resolved inside. It also runs the docker CLI from a
   `DOCKER_CONFIG` that mirrors `~/.docker` minus the credential store: under launchd, Docker
   Desktop's `docker-credential-desktop` blocks forever when a non-Apple binary (node, python3) is
   among its ancestors, and every image build then fails resolving its base image with
   `DeadlineExceeded`. Nothing here needs registry credentials, so the helper is simply never
-  consulted. Runnable by hand, e.g. `NIGHTLY_SUITES=fast scripts/nightly.sh`.
+  consulted. Runnable by hand: from the tree's clone
+  (`NIGHTLY_SUITES=fast ../nightly/dmi-e2e/scripts/nightly.sh`) it is the nightly; from this
+  checkout it needs `NIGHTLY_PULL=0`.
 - [docs/launchd/com.nominal.dmi-e2e.nightly.plist](docs/launchd/com.nominal.dmi-e2e.nightly.plist)
   schedules it at 03:00 local time as a **user LaunchAgent** — not a daemon, not cron — because the
   job needs what only the login session has: Docker Desktop, the `gh` token and write access to the
-  nginx directory. `scripts/nightly-install.sh` renders the template for this checkout, writes it to
-  `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses that.
+  nginx directory. `scripts/nightly-install.sh` creates the tree (or takes its directory as an
+  argument), clones `dmi-e2e` into it, renders the template to run **that clone's** script, writes
+  it to `~/Library/LaunchAgents/` and loads it; `--uninstall` reverses the job and leaves the tree.
 - **When a loop's key changes** — as `antech` → `antech-v3` did — two things need a hand. The run
   index lists every suite directory it finds, so the old key's row (`reports/<old>/` here,
   `<HARNESS_REPORT_PUBLISH_DIR>/<old>/` on the mini) sits beside the new one until someone deletes
   it; and the first unattended run after the merge refuses to run, because `nightly.sh` is parsed
-  in full before it pulls, so the *old* script's suite list and registry CLI meet the *new*
+  in full before it syncs, so the *old* script's suite list and registry CLI meet the *new*
   `src/stacks.js` and stop, named, before any suite starts. Delete the two directories once, run
-  `scripts/nightly.sh` by hand once, and move any `HARNESS_<OLD>_*` / `DMI_<OLD>_INTEGRATION_DIR` /
-  `NIGHTLY_SUITES` overrides in a profile or plist to the new names.
+  the tree's `scripts/nightly.sh` by hand once, and move any `HARNESS_<OLD>_*` / `NIGHTLY_SUITES`
+  overrides in a profile or plist to the new names.
 
 ```bash
-scripts/nightly-install.sh                                  # install / reinstall
+scripts/nightly-install.sh                                  # create ../nightly, install / reinstall
 launchctl print gui/$UID/com.nominal.dmi-e2e.nightly        # state, last exit, next run
 launchctl kickstart gui/$UID/com.nominal.dmi-e2e.nightly    # run it now
 tail -f ~/Library/Logs/dmi-e2e/nightly-*.log                # follow
@@ -529,8 +545,9 @@ src/
 docs/nginx/dmi-e2e.conf       the nginx location block that serves the published reports
 docs/launchd/*.plist          the nightly LaunchAgent for the mac mini (template; scripts/nightly-install.sh renders it)
 scripts/
-  nightly.sh                  every suite in turn, each report published — what the LaunchAgent runs
-  nightly-install.sh          render + load (or --uninstall) the LaunchAgent on this machine
+  nightly.sh                  every suite in turn from the nightly tree's clones, forced to origin/main,
+                              each report published — what the LaunchAgent runs
+  nightly-install.sh          create the nightly tree, render + load (or --uninstall) the LaunchAgent
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite
