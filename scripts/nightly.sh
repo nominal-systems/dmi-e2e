@@ -181,11 +181,10 @@ sync() {
 # prepare <repo>: a machine-local patch applied to a clone after every sync — the place for a
 # toolchain workaround this machine needs and the repo does not carry. `$TREE/patches/<repo>.sh`,
 # run inside the clone, lives in the tree and never in git; the clone reads `-dirty` in the
-# report's "under test" column afterwards, which is the truth. (The mac mini's dmi-api needs a
-# newer argon2 than the repo pins: the pinned one has no darwin-arm64 binary and its source does
-# not build against Node 24's C++20 headers on Apple clang.) A hook that changes package.json must
-# also refresh the lockfile (`npm install --package-lock-only`), because the install below is
-# `npm ci`.
+# report's "under test" column afterwards, which is the truth. (The mac mini carried one for
+# dmi-api until nominal-systems/dmi-api#368: its pinned argon2 had no darwin-arm64 binary and did
+# not build against Node 24's headers on Apple clang.) A hook that changes package.json must also
+# refresh the lockfile (`npm install --package-lock-only`), because the install below is `npm ci`.
 prepare() {
   local repo=$1 hook=$TREE/patches/$1.sh
   [ -f "$hook" ] || return 0
