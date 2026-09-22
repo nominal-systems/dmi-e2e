@@ -100,6 +100,16 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 - **Poll intervals differ.** Some integrations expose an env knob the harness dials down (~3s);
   others hardcode ~30s. Budget scenario timeouts for at least one full poll tick and don't mistake
   the wait for a hang.
+- **A loop can be hosted by a shared engine container, built from several checkouts.** The Antech
+  V6 and Wisdom Panel integrations are npm modules imported by `dmi-engine`; their loops stand up
+  the real engine, as prod runs it (an `api` process for the MQTT handlers, a `worker` for the
+  polling jobs), from one image that packs each module from its sibling checkout and installs it
+  over the engine's published dependency. Test the working trees, not what `npm install` would
+  fetch; list every checkout in the registry entry so the run report records them all; the engine
+  has no health endpoint, so readiness is the mock's `/status` and the scenario's first poll wait
+  absorbs the engine's start. Ref data for such a provider is seeded the operator's way — read it
+  through the engine (`GET /refs/<kind>/<providerId>`), map it over the admin API — never from
+  literals in the test.
 - Reuse the shared foundation (`HARNESS_STACK` selector, compose profiles, `src/seed.ts`,
   `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider. **A new
   loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile, the

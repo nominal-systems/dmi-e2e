@@ -124,6 +124,30 @@ export interface HarnessEnv {
      * which rejects a string — so this stays a number all the way to POST /integrations. */
     labId: number
   }
+  /* Antech V6 — the `antech-v6` stack and dmi-api provider id; a library module hosted by the
+   * `dmi-engine` container, not a container of its own. */
+  antechV6: {
+    /* Host-facing base URL of the antech-v6 mock (published port). Tests drive the mock's control
+     * plane (/__control__/*) and readiness (/status) through this. */
+    mockBaseUrl: string
+    /* Compose-network base URL the engine uses to reach the mock, stored verbatim in the dmi-api
+     * provider configuration so it must resolve inside the compose network. The integration appends
+     * /Users/v6/Login, /LabResults/v6/<endpoint> etc. to it. */
+    baseUrl: string
+    /* Antech's web host, only ever string-built into a pre-order's submissionUri (never fetched by
+     * the integration); a required provider-configuration option, so it points at the mock too. */
+    uiBaseUrl: string
+    /* Provider-configuration PIMS identifier: the integration requires 3-4 characters and builds it
+     * into generated ClinicAccessionIDs. */
+    pimsIdentifier: string
+    /* Integration options, all DUMMY — the mock never authenticates for real. Never point these (or
+     * the base URLs) at a live Antech host. `labId` is declared `string` by dmi-api's migration
+     * (unlike classic antech's integer `LabId`); the integration parseInts it. */
+    username: string
+    password: string
+    clinicId: string
+    labId: string
+  }
   zoetis: {
     /* Host-facing base URL of the Zoetis mock (published port). Tests drive the mock's control plane
      * (/__control__/*) and readiness (/status) through this. */
@@ -240,6 +264,16 @@ export const env: HarnessEnv = {
     password: str('HARNESS_ANTECH_V3_PASSWORD', 'harness-pass'),
     clinicId: str('HARNESS_ANTECH_V3_CLINIC_ID', '900001'),
     labId: int('HARNESS_ANTECH_V3_LAB_ID', 1),
+  },
+  antechV6: {
+    mockBaseUrl: mockBaseUrlFor('antech-v6'),
+    baseUrl: str('HARNESS_ANTECH_V6_BASE_URL', 'http://antech-v6-mock:3000'),
+    uiBaseUrl: str('HARNESS_ANTECH_V6_UI_BASE_URL', 'http://antech-v6-mock:3000'),
+    pimsIdentifier: str('HARNESS_ANTECH_V6_PIMS_IDENTIFIER', 'HRN'),
+    username: str('HARNESS_ANTECH_V6_USERNAME', 'harness-user'),
+    password: str('HARNESS_ANTECH_V6_PASSWORD', 'harness-pass'),
+    clinicId: str('HARNESS_ANTECH_V6_CLINIC_ID', '900001'),
+    labId: str('HARNESS_ANTECH_V6_LAB_ID', '1'),
   },
   zoetis: {
     mockBaseUrl: mockBaseUrlFor('zoetis'),
