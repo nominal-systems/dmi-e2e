@@ -115,6 +115,33 @@ const stacks = {
     /* ANTECH_V6_POLLING_INTERVAL_MS is env-configurable; the compose profile dials it to ~3s. */
     slowPoll: false,
   },
+  'wisdom-panel': {
+    /* Wisdom Panel (Mars pet DNA; dmi-api provider id `wisdom-panel`) — the second loop hosted by
+     * the `dmi-engine` container, and the same KIND of loop as antech-v6: the integration is an
+     * npm module the engine imports, so the loop is built from the SAME three checkouts (the host
+     * engine and both provider modules) and runs the same two engine services under its own
+     * compose profile, against its own mock. Listing the shared checkouts again is deliberate:
+     * the run report records what this loop was built from, and `verifyStacks()` requires a
+     * shared variable to name the same repo everywhere. */
+    providerId: 'wisdom-panel',
+    scenario: 'scenarios/wisdom-panel-full-stack.e2e.ts',
+    composeProfile: 'wisdom-panel',
+    checkouts: [
+      { repo: 'dmi-engine', dirVariable: 'DMI_ENGINE_DIR' },
+      { repo: 'dmi-engine-antech-v6-integration', dirVariable: 'DMI_ANTECH_V6_INTEGRATION_DIR' },
+      { repo: 'dmi-engine-wisdom-panel-integration', dirVariable: 'DMI_WISDOM_PANEL_INTEGRATION_DIR' },
+    ],
+    mock: {
+      label: 'wisdom-panel-mock',
+      urlVariable: 'HARNESS_WISDOM_PANEL_MOCK_URL',
+      portVariable: 'HARNESS_WISDOM_PANEL_MOCK_PORT',
+      defaultPort: 3016,
+      pathPrefix: '',
+    },
+    /* WISDOM_PANEL_POLLING_INTERVAL_MS is env-configurable (the engine's default is 10 minutes);
+     * the compose profile dials it to ~3s. */
+    slowPoll: false,
+  },
   demo: {
     providerId: 'demo',
     scenario: 'scenarios/full-stack-smoke.e2e.ts',

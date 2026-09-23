@@ -6,7 +6,7 @@
 # profile, so PATH, node (nvm) and the GitHub Packages token are all resolved here.
 #
 # Knobs (all optional):
-#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis antech-v6)
+#   NIGHTLY_SUITES        suites to run, in order          (default: fast idexx antech-v3 zoetis antech-v6 wisdom-panel)
 #   NIGHTLY_PULL          1 to force every clone in the nightly tree to origin/<branch> first (cloning
 #                         any the tree lacks), 0 to test whatever is checked out where this script
 #                         lives (default 1)
@@ -30,7 +30,7 @@ set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOG_DIR=${NIGHTLY_LOG_DIR:-$HOME/Library/Logs/dmi-e2e}
-SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis antech-v6}
+SUITES=${NIGHTLY_SUITES:-fast idexx antech-v3 zoetis antech-v6 wisdom-panel}
 PULL=${NIGHTLY_PULL:-1}
 BRANCH=${NIGHTLY_BRANCH:-main}
 GIT_URL=${NIGHTLY_GIT_URL:-git@github.com:nominal-systems/}

@@ -148,6 +148,30 @@ export interface HarnessEnv {
     clinicId: string
     labId: string
   }
+  /* Wisdom Panel — the `wisdom-panel` stack and dmi-api provider id; like antech-v6, a library
+   * module hosted by the `dmi-engine` container. Note the inverted config split: the credentials
+   * are PROVIDER CONFIGURATION (org-level) here, and the integration options carry only the
+   * hospital's identity — the opposite of every other provider. */
+  wisdomPanel: {
+    /* Host-facing base URL of the wisdom-panel mock (published port). Tests drive the mock's control
+     * plane (/__control__/*) and readiness (/status) through this. */
+    mockBaseUrl: string
+    /* Compose-network base URL the engine uses to reach the mock, stored verbatim in the dmi-api
+     * provider configuration so it must resolve inside the compose network. The integration appends
+     * /oauth/token, /api/v1/kits, /api/voyager/pet etc. to it. Never point at a live Wisdom Panel
+     * host. */
+    baseUrl: string
+    /* Provider-configuration credentials (OAuth2 password grant) and the organization unit every
+     * activation is filed under. All DUMMY — the mock never authenticates for real. */
+    username: string
+    password: string
+    organizationUnitId: string
+    /* Integration options: the clinic's identity as Wisdom Panel knows it. `hospitalNumber` is the
+     * filter key of BOTH polls (the mock scopes its feeds by it) and is sent on every activation. */
+    hospitalName: string
+    hospitalNumber: string
+    hospitalPhone: string
+  }
   zoetis: {
     /* Host-facing base URL of the Zoetis mock (published port). Tests drive the mock's control plane
      * (/__control__/*) and readiness (/status) through this. */
@@ -274,6 +298,16 @@ export const env: HarnessEnv = {
     password: str('HARNESS_ANTECH_V6_PASSWORD', 'harness-pass'),
     clinicId: str('HARNESS_ANTECH_V6_CLINIC_ID', '900001'),
     labId: str('HARNESS_ANTECH_V6_LAB_ID', '1'),
+  },
+  wisdomPanel: {
+    mockBaseUrl: mockBaseUrlFor('wisdom-panel'),
+    baseUrl: str('HARNESS_WISDOM_PANEL_BASE_URL', 'http://wisdom-panel-mock:3000'),
+    username: str('HARNESS_WISDOM_PANEL_USERNAME', 'harness-user'),
+    password: str('HARNESS_WISDOM_PANEL_PASSWORD', 'harness-pass'),
+    organizationUnitId: str('HARNESS_WISDOM_PANEL_ORGANIZATION_UNIT_ID', 'harness-org-unit'),
+    hospitalName: str('HARNESS_WISDOM_PANEL_HOSPITAL_NAME', 'Harness Animal Hospital'),
+    hospitalNumber: str('HARNESS_WISDOM_PANEL_HOSPITAL_NUMBER', '700001'),
+    hospitalPhone: str('HARNESS_WISDOM_PANEL_HOSPITAL_PHONE', '555-0100'),
   },
   zoetis: {
     mockBaseUrl: mockBaseUrlFor('zoetis'),
