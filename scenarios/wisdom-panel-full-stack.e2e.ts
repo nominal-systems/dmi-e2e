@@ -151,8 +151,8 @@ const BREEDS = [
   { percentage: 8, slug: 'harness-bobtail', name: 'Harness Bobtail', internalName: 'HarnessBobtail' },
 ]
 const IDEAL_WEIGHT = { min: 3.4, max: 5.9, pred: 4.6 }
-/* The STRING form of the health findings, which 40 of the 51 live result sets carry. Written here
- * rather than copied: the vendor's own sentence names a patient. */
+/* The STRING form of the health findings, which most live result sets carry. Written here rather
+ * than copied: the vendor's own sentence names a patient. */
 const NOTABLE_NONE = 'No notable or at-risk health test results were found for this patient.'
 
 /* The ARRAY form, which the live data also carries. Two entries, so the mapper's per-entry
@@ -1076,7 +1076,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * asserting. */
       expect(weight.map((observation) => observation.notes ?? null)).toEqual([null, null, null])
 
-      /* The STRING form of the health findings — 40 of the 51 live result sets carry it — becomes
+      /* The STRING form of the health findings — the one most live result sets carry — becomes
        * ONE item whose code is the raw key and whose value is the sentence verbatim. */
       const findings = panels[2].observations ?? []
       expect(findings).toHaveLength(1)
@@ -1200,9 +1200,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     }, COMPLETION_WAIT_MS + 60_000)
 
     it('a result whose ideal-weight and findings sections are empty still completes, and the findings panel is dropped', async () => {
-      /* The THIRD observed shape of the simplified body, and not a rare one: 10 of the 51 live
-       * result sets carry `"ideal_weight_result": {}` — an empty OBJECT, not a missing key —
-       * together with `"notable_and_at_risk_health_test_results": []`. A fifth of the account.
+      /* The THIRD observed shape of the simplified body, and not a rare one: a sizeable minority of
+       * the live result sets carry `"ideal_weight_result": {}` — an empty OBJECT, not a missing key
+       * — together with `"notable_and_at_risk_health_test_results": []`.
        *
        * The two halves are handled very differently by the mapper, which is why this shape earns
        * its own test: the empty findings ARRAY is skipped correctly (`extractTestResults` skips the
@@ -1669,9 +1669,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     })
 
     it.failing('a result whose ideal-weight section is empty yields no ideal-weight items', async () => {
-      /* EXPECTED: `"ideal_weight_result": {}` — a fifth of the live account's result sets carry it
-       * — carries no ideal weight, so the report should carry no ideal-weight panel (or an empty
-       * one). ACTUAL: three DONE observations with no value at all.
+      /* EXPECTED: `"ideal_weight_result": {}` — a body a sizeable minority of the provider's live
+       * result sets carry — carries no ideal weight, so the report should carry no ideal-weight
+       * panel (or an empty one). ACTUAL: three DONE observations with no value at all.
        *
        * `extractTestResults` skips a section only when its `.length === 0`, and that test is
        * hard-coded to the `notable_and_at_risk_health_test_results` key — so the empty findings
@@ -1775,8 +1775,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * `getBatchResults` loops the unacknowledged result sets and makes TWO calls per set inside
        * ONE `try`: the simplified results and the PDF. `getReportPdfBase64` rethrows on any
        * non-2xx, the throw escapes the `for`, and the outer catch replaces the whole return value.
-       * This is not a hypothetical shape: the provider's PDF generator answered 500 for 10 of 52
-       * live result sets, in two different bodies, and the first failure sat at position 4 of 52.
+       * This is not a hypothetical shape: the provider's PDF generator answered 500 for a sizeable
+       * minority of live result sets, in two different bodies, with the first failure a few
+       * positions into the feed.
        *
        * A is placed first so it is first in the feed, and its report is what the assertion waits
        * for — if the batch survived B, A would complete. The positive twin follows: clearing B's

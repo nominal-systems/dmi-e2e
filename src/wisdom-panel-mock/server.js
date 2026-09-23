@@ -93,17 +93,17 @@
  *    on. Getting either wrong is silent: the mapper reads what it reads.
  *
  * 8. THE SIMPLIFIED RESULT COMES IN THREE SHAPES, ALL OBSERVED, and the mapper treats them very
- *    differently. Across a key-only scan of all 51 unacknowledged result sets on the dev endpoint:
- *      - 40 carried `notable_and_at_risk_health_test_results` as a plain STRING;
- *      -  1 carried it as an ARRAY with a finding entry;
- *      - 10 carried it as an EMPTY ARRAY **together with** `"ideal_weight_result": {}` — an empty
- *        object, not a missing key. A fifth of the account.
+ *    differently. A key-only scan of the development endpoint's unacknowledged result sets found:
+ *      - most carrying `notable_and_at_risk_health_test_results` as a plain STRING;
+ *      - one carrying it as an ARRAY with a finding entry;
+ *      - a sizeable minority carrying it as an EMPTY ARRAY **together with**
+ *        `"ideal_weight_result": {}` — an empty object, not a missing key.
  *    The mapper skips the notable key only when its `.length === 0`, so the empty array is handled;
  *    the empty `ideal_weight_result` is NOT, because the skip is keyed on that one property name.
  *    `mapIdealWeightResult({})` reads `min_size`/`max_size`/`pred_size` off an empty object and
  *    emits three DONE items with an undefined quantity. The mock therefore has to be able to serve
- *    that body exactly (`emptyIdealWeight` / `emptyNotable` on the control plane), or a fifth of
- *    the live account's results would be outside what the harness can reproduce.
+ *    that body exactly (`emptyIdealWeight` / `emptyNotable` on the control plane), or a real share
+ *    of the provider's results would be outside what the harness can reproduce.
  *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL, because the vendor's behaviour is unverified
@@ -171,9 +171,9 @@ const KIT_FAILURES = [null, 'sample-failed']
 const PET_SPECIES = ['dog', 'cat']
 const PET_SEXES = ['male', 'female']
 
-/* How the PDF generator can fail. BOTH bodies were OBSERVED live, on 10 of 52 real result sets —
- * the same endpoint answering two different 500s — which is why the control plane picks between
- * them rather than the mock choosing one. */
+/* How the PDF generator can fail. BOTH bodies were OBSERVED live, on a sizeable minority of the
+ * development endpoint's result sets — the same endpoint answering two different 500s — which is
+ * why the control plane picks between them rather than the mock choosing one. */
 const PDF_FAILURE_MODES = [null, 'text', 'json']
 
 /* The clinic's unactivated kit inventory: the physical kits it holds and has not used. This is the
@@ -811,7 +811,7 @@ function handleSimplifiedResults (req, res, params) {
  *   - a real kit with a report: 200, `application/pdf`, a `%PDF-1.7` document;
  *   - an unknown kit: **404** with a `text/html` body of exactly `Kit not found.` (14 bytes) —
  *     NOT a 200 carrying an error page, so the "HTML base64'd as a PDF" trap does not apply here;
- *   - a failure: **500**, on 10 of 52 real result sets, in TWO different bodies — a bare
+ *   - a failure: **500**, on a sizeable minority of real result sets, in TWO different bodies — a bare
  *     `An unknown error occurred.` and a JSON `{"error": "Internal Server Error"}`. Which one a
  *     given kit gets is a control-plane flag, because the live endpoint produced both and nothing
  *     was found that predicts which.
@@ -1229,9 +1229,9 @@ async function handleControlSetPdfFailure (req, res, params) {
  * distinct. A seed with two equal percentages would let a mapper that mixed up two breeds pass.
  *
  * `emptyIdealWeight` and `emptyNotable` select the OBSERVED third shape (load-bearing detail 8):
- * `ideal_weight_result: {}` alongside `notable_and_at_risk_health_test_results: []`, which a fifth
- * of the live account's result sets carry. They were only ever seen together, so the control plane
- * accepts them separately but the scenario uses the pair. */
+ * `ideal_weight_result: {}` alongside `notable_and_at_risk_health_test_results: []`, which a
+ * sizeable minority of the live result sets carry. They were only ever seen together, so the
+ * control plane accepts them separately but the scenario uses the pair. */
 async function handleControlSeedResultSet (req, res, params) {
   const kit = findKit(params.key)
   if (kit === undefined) return controlError(res, `no kit '${params.key}'`)
@@ -1260,8 +1260,8 @@ async function handleControlSeedResultSet (req, res, params) {
     return controlError(res, 'breed percentages must sum to 100, as the vendor\'s do')
   }
 
-  /* OBSERVED on 10 of 51 live result sets: `ideal_weight_result` is an empty OBJECT, not a missing
-   * key. Served verbatim, because that is the body whose handling the scenario pins. */
+  /* OBSERVED on a sizeable minority of live result sets: `ideal_weight_result` is an empty OBJECT,
+   * not a missing key. Served verbatim, because that is the body whose handling the scenario pins. */
   let idealWeightBody
   if (body.emptyIdealWeight === true) {
     idealWeightBody = {}
