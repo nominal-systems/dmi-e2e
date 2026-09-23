@@ -109,7 +109,11 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   has no health endpoint, so readiness is the mock's `/status` and the scenario's first poll wait
   absorbs the engine's start. Ref data for such a provider is seeded the operator's way — read it
   through the engine (`GET /refs/<kind>/<providerId>`), map it over the admin API — never from
-  literals in the test.
+  literals in the test. The two engine services carry BOTH loops' compose profiles, and depend on
+  no mock: compose refuses a project in which a service enabled by two profiles depends on a
+  service enabled by only one ("depends on undefined service" under the other), and the ordering
+  would buy nothing — the engine first reaches a mock after the harness has waited on that mock's
+  `/status` and the scenario has created an integration.
 - Reuse the shared foundation (`HARNESS_STACK` selector, compose profiles, `src/seed.ts`,
   `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider. **A new
   loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile, the

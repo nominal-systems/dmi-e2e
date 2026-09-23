@@ -126,7 +126,7 @@ old.
   needs and the repo does not carry, and the clone then honestly reads `-dirty` in the report; the
   mac mini needed one for dmi-api's argon2 pin until dmi-api#368). `dmi-e2e` and `dmi-api` get `npm ci` when a
   clone is new or its lockfile moved. Then it makes sure Docker Desktop is up and runs `fast`, `idexx`,
-  `antech-v3`, `zoetis` and `antech-v6` in turn with `HARNESS_PUBLISH_REPORT=1`. A red suite does
+  `antech-v3`, `zoetis`, `antech-v6` and `wisdom-panel` in turn with `HARNESS_PUBLISH_REPORT=1`. A red suite does
   not stop the loop; a suite that overruns `NIGHTLY_SUITE_TIMEOUT` (40 min) is killed and its
   containers removed. A lock keeps runs from overlapping. Each run writes a dated log under
   `~/Library/Logs/dmi-e2e/` ending in a one-line-per-suite summary; logs older than 14 days are
@@ -196,6 +196,16 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
   `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
+- **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
+  "order" activates a physical kit the clinic already holds, there is no test catalogue and no
+  cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
+  PDF. The same kind of loop as `antech-v6` — the integration (`dmi-engine-wisdom-panel-integration`)
+  is the other npm module `dmi-engine` hosts — so it boots the **same two engine containers, from the
+  same three checkouts**, under its own compose profile, against the **wisdom-panel mock**
+  (`src/wisdom-panel-mock`: the OAuth2 password grant, the two JSON:API polling feeds with an
+  `included` that is omitted rather than empty, kit activation, both acknowledge channels, the
+  simplified genetic result, a binary vet report). Plus dmi-api + ActiveMQ + Redis, behind the
+  `wisdom-panel` compose profile. Runs `scenarios/wisdom-panel-full-stack.e2e.ts`.
 - **`demo`** — the pre-existing demo loop (ActiveMQ, Redis, `dmi-demo-provider-api` + its MySQL, and
   `dmi-engine-demo-provider-integration`), behind the `full-stack` profile. Runs
   `scenarios/full-stack-smoke.e2e.ts`. **Blocked upstream** (see below).
@@ -214,6 +224,9 @@ GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis npm run tes
 # antech-v6: the antech-v6 mock + the real dmi-engine (api + worker), built from three sibling checkouts.
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6 npm run test:harness
 
+# wisdom-panel: the wisdom-panel mock + the same real dmi-engine (api + worker), same three checkouts.
+GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel npm run test:harness
+
 # demo (the upstream-blocked loop):
 GHP_TOKEN=$(gh auth token) HARNESS_FULL_STACK=1 HARNESS_STACK=demo npm run test:harness
 ```
@@ -226,13 +239,14 @@ registry in `src/stacks.js` lists each loop's checkouts and the variable for eac
 token — a `gh auth token` works) must be exported for the Docker build. All four mocks are
 zero-dependency Node servers built inline, so they need no token. The fast suite needs no token.
 
-The `antech-v6` loop builds from **three** checkouts — `../dmi-engine`,
+The `antech-v6` and `wisdom-panel` loops build from the same **three** checkouts — `../dmi-engine`,
 `../dmi-engine-antech-v6-integration` and `../dmi-engine-wisdom-panel-integration` (override with
 `DMI_ENGINE_DIR` / `DMI_ANTECH_V6_INTEGRATION_DIR` / `DMI_WISDOM_PANEL_INTEGRATION_DIR`). The two
 modules are packed from their checkouts and installed into the engine before it is built, so all
-three working trees are what runs, and the run report records all three. Needs compose ≥ 2.17
-(`additional_contexts`) and the same `GHP_TOKEN` (three npm installs resolve
-`@nominal-systems/dmi-engine-common`).
+three working trees are what runs, and the run report records all three for either loop. The two
+engine services carry both compose profiles (one image, built once, cached for the other loop);
+each profile adds its own mock. Needs compose ≥ 2.17 (`additional_contexts`) and the same
+`GHP_TOKEN` (three npm installs resolve `@nominal-systems/dmi-engine-common`).
 
 **The idexx loop closes end to end.** An order placed over real HTTP round-trips through the real
 idexx integration and the mock provider: `POST /orders?autoSubmitOrder=true` → the integration creates
@@ -435,6 +449,7 @@ Full-system services (behind a compose profile — only the selected loop's port
 | antech-v3 mock     | 3013    | `antech-v3` | the simulated classic-Antech provider; tests drive its `/__control__` plane |
 | Zoetis mock        | 3014    | `zoetis`    | the simulated Zoetis provider; tests drive its `/__control__` plane |
 | antech-v6 mock     | 3015    | `antech-v6` | the simulated Antech V6 provider; tests drive its `/__control__` plane. The two `dmi-engine` containers publish no port |
+| wisdom-panel mock  | 3016    | `wisdom-panel` | the simulated Wisdom Panel provider; tests drive its `/__control__` plane. Same two `dmi-engine` containers, no port |
 | Redis              | 6380    | all         | the integration's Bull queues |
 | demo-provider-api  | 3011    | `full-stack`| the simulated demo provider; harness mints keys here |
 | demo-provider MySQL| 3308    | `full-stack`| the demo provider's own database |
@@ -448,7 +463,7 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
-| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech-v3` (real classic-Antech integration + antech-v3 mock; dmi-api's provider id is the bare `antech`), `zoetis` (real zoetis integration + Zoetis mock), `antech-v6` (the real dmi-engine as api + worker + antech-v6 mock) or `demo` (upstream-blocked demo loop). Anything else is refused — including the old `antech`. |
+| `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech-v3` (real classic-Antech integration + antech-v3 mock; dmi-api's provider id is the bare `antech`), `zoetis` (real zoetis integration + Zoetis mock), `antech-v6` (the real dmi-engine as api + worker + antech-v6 mock), `wisdom-panel` (the same dmi-engine + wisdom-panel mock) or `demo` (upstream-blocked demo loop). Anything else is refused — including the old `antech`. |
 | `HARNESS_BASE_URL` | `http://127.0.0.1:3010` | dmi-api under test. Setting it implies `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_APP_PORT` | `3010` | Port the harness starts dmi-api on. |
 | `HARNESS_ADMIN_USERNAME` / `_PASSWORD` | `admin` / `admin` | Basic-auth admin, for `POST /users`. |
@@ -476,6 +491,12 @@ Every variable has a working default; the table exists so CI and debugging are n
 | `HARNESS_ANTECH_V6_PIMS_IDENTIFIER` | `HRN` | antech-v6 only. The 3–4 character PIMS identifier the integration requires and builds into generated accession ids. |
 | `HARNESS_ANTECH_V6_USERNAME` / `_PASSWORD` / `_CLINIC_ID` / `_LAB_ID` | `harness-user` / `harness-pass` / `900001` / `1` | antech-v6 only. Dummy integration options; the mock never authenticates for real, but it refuses a clinic it is not provisioned for (`ANTECH_V6_MOCK_CLINIC_ID` on the mock side, same default). `labId` is a **string** here — dmi-api declares it so, unlike classic antech's integer `LabId`. |
 | `HARNESS_ANTECH_V6_POLL_MS` | `3000` | antech-v6 only. The engine's `ANTECH_V6_POLLING_INTERVAL_MS` (60 s by default), dialled down so the loop closes quickly. |
+| `HARNESS_WISDOM_PANEL_MOCK_PORT` | `3016` | wisdom-panel only. Host port for the wisdom-panel mock (its `/__control__` plane and `/status`). |
+| `HARNESS_WISDOM_PANEL_MOCK_URL` | `http://$HARNESS_HOST:3016` | wisdom-panel only. Host-facing mock base URL the scenario drives. |
+| `HARNESS_WISDOM_PANEL_BASE_URL` | `http://wisdom-panel-mock:3000` | wisdom-panel only. Compose-network base URL stored in the provider config: the integration appends `/oauth/token`, `/api/v1/kits`, `/api/voyager/pet` etc. Never point at a live Wisdom Panel host. |
+| `HARNESS_WISDOM_PANEL_USERNAME` / `_PASSWORD` / `_ORGANIZATION_UNIT_ID` | `harness-user` / `harness-pass` / `harness-org-unit` | wisdom-panel only. Dummy **provider-configuration** values (this provider keeps its credentials on the org-level configuration, the inverse of the others); the mock never authenticates for real but refuses any other username/password (an RFC 6749 `invalid_grant`) or organization unit. Passed through to the mock as `WISDOM_PANEL_MOCK_*`. |
+| `HARNESS_WISDOM_PANEL_HOSPITAL_NAME` / `_HOSPITAL_NUMBER` / `_HOSPITAL_PHONE` | `Harness Animal Hospital` / `700001` / `555-0100` | wisdom-panel only. Dummy integration options — the clinic's identity as the provider knows it. The hospital number is the filter key of both polls and is sent on every activation; the mock scopes its feeds by it. |
+| `HARNESS_WISDOM_PANEL_POLL_MS` | `3000` | wisdom-panel only. The engine's `WISDOM_PANEL_POLLING_INTERVAL_MS` (10 min by default), dialled down so the loop closes quickly. |
 | `HARNESS_ZOETIS_MOCK_PORT` | `3014` | zoetis only. Host port for the Zoetis mock (its `/__control__` plane and `/status`). |
 | `HARNESS_ZOETIS_MOCK_URL` | `http://$HARNESS_HOST:3014` | zoetis only. Host-facing mock base URL the scenario drives. |
 | `HARNESS_ZOETIS_BASE_URL` | `http://zoetis-mock:3000` | zoetis only. Compose-network base URL stored in the provider config; the integration appends `/vetsync/v1/<endpoint>` to it. Never point at a live Zoetis host. |
@@ -520,7 +541,8 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               (redis + the antech-v3 mock + the antech integration), a `zoetis` profile
                               (redis + the Zoetis mock + the zoetis integration), an `antech-v6` profile
                               (redis + the antech-v6 mock + the real dmi-engine as api + worker, built
-                              from three checkouts) and a `full-stack`
+                              from three checkouts), a `wisdom-panel` profile (redis + the wisdom-panel
+                              mock + the same two dmi-engine services) and a `full-stack`
                               profile (redis + the demo provider + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
@@ -535,6 +557,7 @@ src/
   antech-v3-mock/server.js    the antech-v3 mock provider, classic Antech (zero-dependency Node HTTP server)
   zoetis-mock/server.js       the Zoetis mock provider (zero-dependency Node HTTP server)
   antech-v6-mock/server.js    the antech-v6 mock provider (zero-dependency Node HTTP server)
+  wisdom-panel-mock/server.js the wisdom-panel mock provider (zero-dependency Node HTTP server)
   poll.ts                     pollUntil, shared by the full-system scenarios
   report/summary-reporter.js  jest reporter: writes reports/<suite>/summary.json when the run ends
   report/report.ts            run.json at setup, the run index, publishing to the nginx directory
@@ -554,6 +577,7 @@ scenarios/
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end, four tripwires red by design
+  wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes end to end, five tripwires red by design
   full-stack-smoke.e2e.ts     the demo loop (HARNESS_FULL_STACK=1 HARNESS_STACK=demo); blocked upstream
 ```
 
@@ -759,10 +783,51 @@ the irregular `labAccessionsIds` key) → dmi-api writes the report. 30 tests, f
   harness cannot make deterministic (it dials the poll to 3 s); and re-notification on status
   change, observed *not* to happen.
 
+**The wisdom-panel loop closes too — through the same engine, under a second profile.**
+`POST /orders` (a `labRequisitionInfo.KitCode`, the one requisition parameter dmi-api declares
+for this provider) → dmi-api RPCs `wisdom-panel/orders/create` to the `api` engine process → the
+integration takes an OAuth2 token and ACTIVATES the kit at `/api/voyager/pet` (the order's
+`requisitionId` comes back overwritten by the kit code, its `externalId` is the kit's id, its
+manifest the requisition form) → the `worker` process polls two JSON:API feeds scoped by hospital
+number: kits (acknowledged by kit id) and result-sets (each resolved to its kit from `included`,
+then the simplified genetic result and the vet-report PDF fetched per set, emitted, acknowledged
+by result-set id) → dmi-api writes the report. 35 tests, five of them `it.failing` tripwires.
+What the fifth provider taught us:
+
+- **An `included` that is omitted, not empty, is the whole orders channel.** JSON:API leaves the
+  key out when nothing in the page carries the relationship — an empty page, and a page of
+  shipped-but-unused kits, which have no pet. The integration dereferences it unguarded, so the
+  second page is a `TypeError`; the mock omits the key exactly as the live server does, and an
+  active test pins that page shape. (It is not a tripwire: any kit that would become an order has
+  a pet, and its presence restores `included`, so the crash cannot be shown through dmi-api.)
+- **One vendor, three error dialects, and a strict content negotiator.** JSON:API `errors[]` on
+  the feeds, `{message}` on the voyager endpoints, RFC 6749 on the token grant; and a bare
+  `Accept: application/json` is a 406 — the integration passes only because axios's default
+  contains `*/*`. The mock enforces all of it, so a tidy-up is a red build here rather than an
+  outage.
+- **Acknowledge is a filter, not a delete; both channels answer 201; a duplicate is an idempotent
+  201.** Copying the zoetis mock's 409 would have been fiction — assertion strength does not
+  transfer between loops.
+- **The ideal-weight section can be an empty object**, on a sizeable minority of real kits, and the
+  mapper turns it into three DONE observations with no value. Tripwire.
+- **A single failed PDF discards the whole results batch**, and since nothing is acknowledged the
+  same batch fails every tick — the provider's PDF generator does fail on a sizeable minority of
+  real kits. Tripwire, with its positive twin (clear the failure, both complete).
+- **The token is cached for ten days and never refreshed on a 401**, so a rotated credential fails
+  every call for up to ten days. Tripwire — measured at the grant endpoint, because the results
+  path throws a plain `Error` that never reaches dmi-api as a provider error.
+- **Ref mapping is the only transformation on the way out, and the integration defaults silently**
+  (`dog` / `male` for anything it does not recognise). Every order is therefore a cat and a female,
+  placed with canonical codes; a broken mapping goes red naming `dog` or `male`. There are no
+  breeds at all.
+- **The provider's "services" are its unactivated kits**, so the mock enforces its inventory as a
+  catalogue and depletes it on activation — and, uniquely, every kit code is invented, because a
+  kit code names one physical kit rather than an assay.
+
 ## Known gaps
 
 - **The full-stack CI jobs are scoped, not universal.** Each provider loop lives in its own workflow
-  (`.github/workflows/e2e-idexx.yml`, `e2e-antech-v3.yml`, `e2e-zoetis.yml`, `e2e-antech-v6.yml`) because each needs a
+  (`.github/workflows/e2e-idexx.yml`, `e2e-antech-v3.yml`, `e2e-zoetis.yml`, `e2e-antech-v6.yml`, `e2e-wisdom-panel.yml`) because each needs a
   `paths:` filter and those are per-workflow, not per-job. They run: on **push to `main`** always; on a **pull request** only
   when the harness, the mock, compose or that loop's scenario changes (a docs or tenant-isolation edit
   shouldn't pay for ~7 containers per provider — this matters more as the fan-out grows); and on
