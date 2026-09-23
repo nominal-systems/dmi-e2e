@@ -104,6 +104,14 @@
  *    emits three DONE items with an undefined quantity. The mock therefore has to be able to serve
  *    that body exactly (`emptyIdealWeight` / `emptyNotable` on the control plane), or a real share
  *    of the provider's results would be outside what the harness can reproduce.
+ *    A contradiction worth recording so nobody "corrects" this file: the NON-empty
+ *    `ideal_weight_result` served here carries the bare `min_size` / `max_size` / `pred_size` the
+ *    mapper reads, because that is what the live endpoint returned on EVERY non-empty body in the
+ *    same scan (OBSERVED). The integration's own `test/examples/` fixtures carry sex/neuter-
+ *    qualified keys instead (`female_min_size`, `neutered_pred_size`, …) and no bare ones — an
+ *    older shape of the same endpoint, which the current API does not send. Serving the fixtures'
+ *    shape would not be fidelity; the scenario's prove-red for it shows what the mapper does with
+ *    that shape (three valueless items — the same outcome as the empty object).
  *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL, because the vendor's behaviour is unverified
@@ -1274,6 +1282,9 @@ async function handleControlSeedResultSet (req, res, params) {
     if (new Set([weight.min, weight.max, weight.pred]).size !== 3) {
       return controlError(res, 'idealWeight.min/max/pred must be three distinct numbers, or the three mapped items are indistinguishable')
     }
+    /* The bare keys, as the live endpoint serves them on every non-empty body — NOT the
+     * sex-qualified keys of the integration's own example fixtures, which are an older shape (see
+     * load-bearing detail 8 in the header before changing these). */
     idealWeightBody = {
       min_size: weight.min,
       max_size: weight.max,

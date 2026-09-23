@@ -1065,6 +1065,11 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         'Maximum Ideal Weight Result',
         'Predicted Ideal Weight Result',
       ])
+      /* These three numbers arrive only because the mock serves the bare `min_size` / `max_size`
+       * / `pred_size` the mapper reads — the keys the live endpoint returns on every non-empty
+       * body. The integration's own example fixtures carry sex-qualified keys instead (an older
+       * shape); against those the mapper emits three valueless items, which is one of this
+       * scenario's recorded prove-reds, not a shape the mock should serve. */
       expect(weight.map((observation) => observation.valueQuantity?.value)).toEqual([
         IDEAL_WEIGHT.min,
         IDEAL_WEIGHT.max,
@@ -1683,9 +1688,17 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * numbers in them.
        *
        * The positive twin is the test that seeded this result set: the report reached FINAL and its
-       * breed percentages are exact, so the batch itself is demonstrably healthy. */
-      const panels = await panelsFor(emptySectionsOrderId)
-      expect(panels.map((panel) => panel.code)).toEqual(['breed_percentages'])
+       * breed percentages are exact, so the batch itself is demonstrably healthy — and it is the
+       * precondition guard for this test, since `it.failing` cannot tell "the ideal-weight panel is
+       * still there" from "no report arrived at all". The two are separated below so that the
+       * message names which one it is when this is run as a plain `it`. */
+      const codes = (await panelsFor(emptySectionsOrderId)).map((panel) => panel.code)
+      if (!codes.includes('breed_percentages')) {
+        throw new Error(
+          `precondition: the report carries no breed panel (${JSON.stringify(codes)}) — the results channel did not deliver, so this tripwire says nothing; see its positive twin`,
+        )
+      }
+      expect(codes).not.toContain('ideal_weight_result')
     }, 30_000)
 
     it.failing('a provider error on the orders poll is recorded in the audit trail', async () => {

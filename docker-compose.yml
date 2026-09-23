@@ -24,6 +24,9 @@
 #     `worker` process (Bull polling) from one image, built from the sibling `dmi-engine` checkout
 #     with the antech-v6 and wisdom-panel modules injected from THEIR sibling checkouts (the
 #     engine's own Dockerfile would install the published packages instead).
+#   - `wisdom-panel`: redis, the wisdom-panel mock (src/wisdom-panel-mock, zero deps), and the SAME
+#     two `dmi-engine` services as `antech-v6` — the Wisdom Panel integration is the other module
+#     that image carries — so the engine services list both profiles and each profile adds its mock.
 #   - `full-stack`: redis, the demo provider API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
@@ -68,7 +71,7 @@ services:
   # ---- full-stack profile: the demo provider loop (order -> engine -> provider -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
-  # Shared by every full-system loop (demo, idexx, antech-v3, zoetis and antech-v6).
+  # Shared by every full-system loop (demo, idexx, antech-v3, zoetis, antech-v6 and wisdom-panel).
   redis:
     image: redis:7-alpine
     profiles: ['full-stack', 'idexx', 'antech-v3', 'zoetis', 'antech-v6', 'wisdom-panel']

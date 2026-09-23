@@ -105,9 +105,9 @@ repo; on their machine the `reports/` files open straight from the filesystem.
 
 ### Nightly runs on the mac mini
 
-GitHub Actions reruns every suite nightly (`schedule:` in the five workflows) to catch upstream
+GitHub Actions reruns every suite nightly (`schedule:` in the six workflows) to catch upstream
 drift, but a cloud run leaves no report anywhere you can open. The mac mini therefore runs the same
-five suites itself each night and publishes each one, so the served index is never more than a day
+six suites itself each night and publishes each one, so the served index is never more than a day
 old.
 
 - [scripts/nightly.sh](scripts/nightly.sh) is the run, and it runs from **its own tree of clones**,
@@ -236,7 +236,7 @@ Each integration image builds from a sibling checkout (`../dmi-engine-idexx-inte
 `DMI_IDEXX_INTEGRATION_DIR` / `DMI_ANTECH_V3_INTEGRATION_DIR` / `DMI_ZOETIS_INTEGRATION_DIR` — the
 registry in `src/stacks.js` lists each loop's checkouts and the variable for each) and its
 `npm install` resolves `@nominal-systems/*` from GitHub Packages, so `GHP_TOKEN` (a `read:packages`
-token — a `gh auth token` works) must be exported for the Docker build. All four mocks are
+token — a `gh auth token` works) must be exported for the Docker build. All five mocks are
 zero-dependency Node servers built inline, so they need no token. The fast suite needs no token.
 
 The `antech-v6` and `wisdom-panel` loops build from the same **three** checkouts — `../dmi-engine`,
