@@ -1306,8 +1306,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         veterinarianName: 'Kim Vet',
         activated: true,
         /* A stage that would otherwise map to PARTIAL, so this test proves the FAILURE wins rather
-         * than merely that some ERROR appeared. `sample-failed` is the one failure value OBSERVED
-         * live, on 22 kits. */
+         * than merely that some ERROR appeared. `sample-failed` is the ONE failure value observed
+         * live — the vocabulary here is a single value, not a family. */
         stage: 'analyzing',
         failure: 'sample-failed',
         acknowledged: false,

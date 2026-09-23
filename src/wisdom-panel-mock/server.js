@@ -158,13 +158,14 @@ const HOSPITAL_NUMBER = String(process.env.WISDOM_PANEL_MOCK_HOSPITAL_NUMBER || 
  * for `expires_in * 0.25`, so a missing or non-numeric value makes that TTL NaN. */
 const TOKEN_EXPIRES_IN = 3456000
 
-/* OBSERVED live across 3193 kits, with `null` among them (72 kits) even though the integration's
- * `KitStage` type declares six strings and no null. `mapKitStatus` sends null to its `default:`
- * branch, i.e. dmi SUBMITTED. */
+/* OBSERVED live, paging through every kit of a development organization unit: these six strings —
+ * and `null`, on a small but real minority of them, even though the integration's `KitStage` type
+ * declares six strings and no null. `mapKitStatus` sends null to its `default:` branch, i.e. dmi
+ * SUBMITTED, so those kits report a status that is a guess. */
 const KIT_STAGES = [null, 'shipped', 'waiting', 'processing', 'analyzing', 'generating-report', 'report-ready']
 
-/* OBSERVED: exactly one non-null value across the same sweep (22 kits). A non-empty
- * `current-failure` is what `mapKitStatus` turns into dmi ERROR, whatever the stage says. */
+/* OBSERVED: exactly one non-null value across that same sweep. A non-empty `current-failure` is
+ * what `mapKitStatus` turns into dmi ERROR, whatever the stage says. */
 const KIT_FAILURES = [null, 'sample-failed']
 
 const PET_SPECIES = ['dog', 'cat']
