@@ -298,8 +298,10 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
   const batchOrderIds: { healthy: string, broken: string } = { healthy: '', broken: '' }
 
   /* A bearer the scenario mints for itself, so the direct provider probes below look like the
-   * integration rather than like the control plane. */
+   * integration rather than like the control plane — and a count of how many grants that cost, so
+   * the login accounting can subtract the harness's own. */
   let probeToken = ''
+  let probeLogins = 0
 
   function patientFor (overrides: Record<string, unknown> = {}): Record<string, unknown> {
     /* NOTE the shape: `orderPayload`'s `patient:` override REPLACES the whole default patient,
@@ -557,6 +559,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     await mapRef('sex', SEX_REF_NAME, EXPECTED_SEX)
 
     probeToken = await mintProbeToken()
+    probeLogins += 1
   }, 180_000)
 
   afterAll(async () => {
@@ -732,28 +735,65 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       expect(list.some((service) => typeof service.name === 'string' && service.name !== '')).toBe(true)
     }, 30_000)
 
-    it('the mock issued exactly one token per engine process, and every later call bore one of them', async () => {
+    it('the two engine processes hold separate tokens, and nothing makes either fetch another', async () => {
       /* The integration caches its token per username IN PROCESS for `expires_in * 0.25` — ten days
-       * at the vendor's 40-day expiry — and never re-authenticates. So the login count is a direct
-       * read of how many engine processes have talked to the provider: the `worker` logged in for
-       * its polls, and the `api` process logged in for the services call in the previous test. Two
-       * is therefore the shape of a healthy two-process engine; one would mean the split collapsed,
-       * and three or more would mean the cache stopped working (or a container restarted). */
-      const log = await mockCalls()
+       * at the vendor's 40-day expiry — and never re-authenticates. So a token is, in effect, a
+       * fingerprint of the engine process that minted it, and the two roles must hold DIFFERENT
+       * ones: the `worker` authenticated for its polls (which carry `filter[unacknowledged]`) and
+       * the `api` process for the service list in the previous test (`filter[activated]`). Two
+       * disjoint sets is the shape of a healthy two-process engine; one shared token would mean the
+       * split had collapsed into a single container, and this loop would be proving nothing about
+       * the Redis handoff.
+       *
+       * The COUNT is deliberately not pinned at two. Both of a process's Bull queues start on the
+       * same tick and `authenticate` has no in-flight de-duplication, so two concurrent cache
+       * misses can each mint a token — a real property of the integration, not a harness artefact,
+       * and one the vendor would see as a duplicate login rather than as an error. What IS pinned
+       * is the thing that matters: every login is accounted for by one of the two processes, and
+       * nothing afterwards triggers another. */
+      const before = await mockCalls()
 
-      expect(log.counters.login).toBe(2)
-      expect(log.tokens).toHaveLength(2)
+      const tokensOn = (predicate: (call: MockCall) => boolean): Set<string> =>
+        new Set(
+          before.calls
+            .filter(predicate)
+            .map((call) => String(call.authorization ?? '').replace('Bearer ', '')),
+        )
+      /* The worker is whatever polls the two unacknowledged feeds; the api process is whatever
+       * asked for the service list. Both of the worker's queues are counted, because they start on
+       * the same tick and can each mint a token before the other populates the cache — so the
+       * worker may hold one token or two, and which endpoint each ends up on is a race. */
+      const workerTokens = tokensOn(
+        (call) =>
+          (call.path === '/api/v1/kits' && call.query['filter[unacknowledged]'] === 'true') ||
+          call.path === '/api/v1/result-sets',
+      )
+      const apiTokens = tokensOn(
+        (call) => call.path === '/api/v1/kits' && call.query['filter[activated]'] === 'false',
+      )
 
-      /* And no request after those two logins went out with anything else. The token strings are
-       * the mock's own, minted this run. */
+      expect(workerTokens.size).toBeGreaterThanOrEqual(1)
+      expect(apiTokens.size).toBe(1)
+      expect([...workerTokens].some((token) => apiTokens.has(token))).toBe(false)
+
+      /* Every login the mock has served is one of those, plus the one this scenario minted for its
+       * own direct probes — so nothing else on the compose network is authenticating as this
+       * account, and no request went out bearing a token the mock did not issue. */
+      expect(before.counters.login).toBe(workerTokens.size + apiTokens.size + probeLogins)
       const bearers = new Set(
-        log.calls
+        before.calls
           .filter((call) => call.path !== '/oauth/token')
           .map((call) => String(call.authorization ?? '').replace('Bearer ', '')),
       )
-      expect([...bearers].every((token) => log.tokens.includes(token))).toBe(true)
       expect(bearers.size).toBeGreaterThan(0)
-    })
+      expect([...bearers].every((token) => before.tokens.includes(token))).toBe(true)
+
+      /* And the cache really holds: several more poll ticks, dozens more requests, no new token.
+       * This is the same property the re-authentication tripwire at the bottom rests on — there it
+       * is a defect, because a 401 does not break the cache either. */
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS * 3))
+      expect((await mockCalls()).counters.login).toBe(before.counters.login)
+    }, 60_000)
   })
 
   describe('activation: an order is a kit activation', () => {
@@ -1513,16 +1553,20 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
   describe('cancel: this provider has no cancel path at all', () => {
     it('DELETE /orders/:id is refused, the order keeps its status, and the mock sees no call', async () => {
-      /* Wisdom Panel has no cancel surface, and the integration reflects that twice over: its
-       * `cancelOrder` throws `Method not implemented` — and, more to the point, its controller
-       * declares NO message pattern for `wisdom-panel/orders/cancel` at all, so the RPC dmi-api
-       * sends has no subscriber and times out at `ENGINE_RESPONSE_TIMEOUT` instead.
+      /* Wisdom Panel has no cancel surface, and the integration reflects that twice over. Its
+       * `WisdomPanelService.cancelOrder` throws `Method not implemented` — but that is not what an
+       * operator sees, because `WisdomPanelController` declares NO message pattern for
+       * `wisdom-panel/orders/cancel` at all. Nothing is subscribed, so the RPC dmi-api sends is
+       * never answered and the request fails on dmi-api's own `ENGINE_RESPONSE_TIMEOUT` instead:
+       * **504, "The engine did not respond in time"**, after the full timeout. Asserted as it is
+       * rather than as one might expect it to be — the unimplemented method is unreachable, so a
+       * fix that made `cancelOrder` return a better message would change nothing here; what would
+       * change this test is the controller gaining the pattern.
        *
-       * What this pins is dmi-api's side of that: `cancelOrder` marks the local order CANCELLED
-       * only AFTER the engine RPC resolves, so an unanswered RPC must leave the order exactly as it
-       * was — at the provider and in dmi. An implementation that marked it CANCELLED optimistically
-       * would show a cancelled order for a kit that is still activated and still on its way to the
-       * lab. */
+       * What it also pins is dmi-api's side: `cancelOrder` marks the local order CANCELLED only
+       * AFTER the engine RPC resolves, so an unanswered RPC must leave the order exactly as it was,
+       * at the provider and in dmi. An implementation that marked it CANCELLED optimistically would
+       * show a cancelled order for a kit that is still activated and still on its way to the lab. */
       const created = expectOk<{ id: string, status: string }>(
         await org.api.post('/orders', payloadFor(KIT_CANCEL, { patient: patientFor({ name: 'Marigold' }) })),
         'activate a kit to attempt cancelling',
@@ -1534,7 +1578,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       console.log(
         `[wisdom-panel-scenario] cancel response -> HTTP ${response.status}: ${response.text.slice(0, 400)}`,
       )
-      expect(response.ok).toBe(false)
+      expect(response.status).toBe(504)
+      expect(response.body.message).toBe('The engine did not respond in time')
 
       const order = await org.api.get(`/orders/${created.id}`)
       expect(order.body.status).toBe('SUBMITTED')
