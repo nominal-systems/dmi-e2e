@@ -973,6 +973,21 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       expect(page).toBeDefined()
       expect(page?.status).toBe(200)
       expect(page?.method).toBe('GET')
+
+      /* And `meta['record-count']` is the ONLY thing keeping the idle polls out of the audit trail.
+       * The interceptor's `filter()` reads it — unguarded, on every page of both feeds — and
+       * returns false at zero; nothing else distinguishes an empty page from a full one. So by this
+       * point, after dozens of polls of two feeds against a clinic that has had exactly one kit and
+       * no results at all, the trail must hold NO record for the results feed and no kits record
+       * without an accession id. A mock that stopped sending the count (or sent it in the wrong
+       * place) would bury every real record under a poll-by-poll log of nothing happening — and,
+       * if `meta` itself went missing, would kill both polls inside the interceptor. */
+      expect(records.filter((record) => record.url.includes('/api/v1/result-sets'))).toEqual([])
+      expect(
+        records
+          .filter((record) => record.url.includes('/api/v1/kits'))
+          .every((record) => (record.accessionIds ?? []).length > 0),
+      ).toBe(true)
     }, ORDER_WAIT_MS + 30_000)
   })
 
