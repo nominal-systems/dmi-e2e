@@ -179,10 +179,14 @@ const KIT_FAILURES = [null, 'sample-failed']
 const PET_SPECIES = ['dog', 'cat']
 const PET_SEXES = ['male', 'female']
 
-/* How the PDF generator can fail. BOTH bodies were OBSERVED live, on a sizeable minority of the
- * development endpoint's result sets — the same endpoint answering two different 500s — which is
- * why the control plane picks between them rather than the mock choosing one. */
-const PDF_FAILURE_MODES = [null, 'text', 'json']
+/* How the PDF generator can fail. `text` and `json` are two 500s whose BODIES were both OBSERVED
+ * live, on a sizeable minority of the development endpoint's result sets — the same endpoint
+ * answering two different 500s — which is why the control plane picks between them rather than the
+ * mock choosing one. `not-generated` is the 404 production answers for a released kit whose report
+ * has not been generated yet: the STATUS is OBSERVED (production, 2026-09) and the body is the one
+ * the development endpoint gives every kit that has no report-ready result set (OBSERVED there
+ * 2026-09-25, INFERRED for the released-but-pending state; see handleVetReport). */
+const PDF_FAILURE_MODES = [null, 'text', 'json', 'not-generated']
 
 /* The clinic's unactivated kit inventory: the physical kits it holds and has not used. This is the
  * whole of this provider's "service catalogue" — `getServices` is
@@ -823,8 +827,16 @@ function handleSimplifiedResults (req, res, params) {
  *     `An unknown error occurred.` and a JSON `{"error": "Internal Server Error"}`. Which one a
  *     given kit gets is a control-plane flag, because the live endpoint produced both and nothing
  *     was found that predicts which.
- * The integration reads this with `responseType: 'arraybuffer'` and rethrows on any non-2xx, which
- * is what makes the 500 take a whole batch down with it. */
+ * And a fourth, half observed: a released kit whose report has not been generated yet (the
+ * `not-generated` flag). The **404** STATUS is OBSERVED in production (2026-09), where it lasts for
+ * hours after release; its BODY is INFERRED from the development endpoint, which answers exactly
+ * `Result set not found.` (`text/html`, 21 bytes, OBSERVED 2026-09-25) for every kit without a
+ * report-ready result set, in any stage — the one state not seen there is a released set whose
+ * report is still pending, which is the production case. Nothing in the integration reads the body.
+ * The integration reads this with `responseType: 'arraybuffer'`. A non-2xx costs that one result
+ * set, which it leaves unacknowledged and asks for again on every poll; the rest of the batch is
+ * delivered. Its HTTP layer retries a 5xx once inside the same request and never a 4xx, so a poll
+ * makes two requests here for a 500 and one for a 404. */
 function handleVetReport (req, res, params) {
   if (!requireVoyagerAuth(req, res)) return
   state.counters.pdf += 1
@@ -843,6 +855,12 @@ function handleVetReport (req, res, params) {
   if (kit.pdfFailure === 'json') {
     log(`500 vet report (json) for kit ${kit.code}`)
     return sendJson(res, 500, { error: 'Internal Server Error' })
+  }
+  if (kit.pdfFailure === 'not-generated') {
+    /* Status OBSERVED (production, 2026-09); body OBSERVED on dev for the no-report case, INFERRED
+     * for the pending one — see above. */
+    log(`404 vet report (not generated yet) for kit ${kit.code}`)
+    return sendText(res, 404, 'Result set not found.', 'text/html; charset=utf-8')
   }
 
   sendPdf(res, buildPdf(`Wisdom Panel harness vet report - kit ${kit.code}`))

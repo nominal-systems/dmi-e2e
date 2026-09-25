@@ -119,6 +119,7 @@ const KIT_CANCEL = 'WPKIT-0004'
 const KIT_BATCH_HEALTHY = 'WPKIT-0005'
 const KIT_BATCH_PDF_FAILS = 'WPKIT-0006'
 const KIT_EMPTY_SECTIONS = 'WPKIT-0007'
+const KIT_PDF_NOT_GENERATED = 'WPKIT-0008'
 
 /* Provider-side kits, provisioned through the mock's control plane rather than activated through
  * dmi — the clinic activating a kit in the vendor's own UI, which is what the integration's status
@@ -293,8 +294,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
   /* The empty-sections result set, seeded by a test in the results section and read back by its
    * tripwire at the bottom of the file. */
   let emptySectionsOrderId = ''
-  /* The PDF-failure batch pair, placed by the tripwire that poisons the results poll and read back
-   * by the positive twin that follows it. */
+  /* The PDF-failure batch pair, placed by the test whose failing PDF must cost only its own result
+   * set, and read back by the positive twin that follows it. */
   const batchOrderIds: { healthy: string, broken: string } = { healthy: '', broken: '' }
 
   /* A bearer the scenario mints for itself, so the direct provider probes below look like the
@@ -1631,19 +1632,227 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     }, 60_000)
   })
 
+  describe('a failing PDF costs its own result set, not the batch', () => {
+    it('a result set whose PDF fails does not take the rest of the batch with it', async () => {
+      /* One result set whose vet report the provider cannot generate costs that one result set,
+       * not the batch: the healthy set in the same feed completes and is acknowledged, and the
+       * failing set is left unacknowledged and asked for again on the next tick. The provider's PDF
+       * generator does answer 500 for a sizeable minority of real result sets, in two different
+       * bodies; it also answers 404 for a report not generated yet, which the last test of this
+       * block covers.
+       *
+       * A reaching FINAL is only half the proof: it would hold just as well of a mock that never
+       * failed B's PDF at all. So, with B's flag still set, the test also asserts that B's report
+       * is not FINAL, that the mock holds A's result set acknowledged and B's not, and that B's PDF
+       * was asked for again on a later tick. The positive twin follows: clearing B's flag completes
+       * B too, which shows the machinery is live and that only the failure was blocking it. */
+      const healthy = await mockKit(KIT_BATCH_HEALTHY)
+      const broken = await mockKit(KIT_BATCH_PDF_FAILS)
+
+      const orderA = expectOk<{ id: string, externalId: string }>(
+        await org.api.post('/orders', payloadFor(KIT_BATCH_HEALTHY, { patient: patientFor({ name: 'Cedar' }) })),
+        'activate the healthy kit of the batch pair',
+      )
+      const orderB = expectOk<{ id: string, externalId: string }>(
+        await org.api.post('/orders', payloadFor(KIT_BATCH_PDF_FAILS, { patient: patientFor({ name: 'Hazel' }) })),
+        'activate the PDF-failing kit of the batch pair',
+      )
+      expect(orderA.externalId).toBe(healthy.id)
+      expect(orderB.externalId).toBe(broken.id)
+      batchOrderIds.healthy = orderA.id
+      batchOrderIds.broken = orderB.id
+
+      try {
+        /* B first, then A: the mock lists result sets in the order they were seeded, so no tick can
+         * see A without B, and every tick that delivers A has met B's failing PDF first. */
+        await seedResultSet(KIT_BATCH_PDF_FAILS, {
+          breeds: BREEDS,
+          idealWeight: IDEAL_WEIGHT,
+          notable: NOTABLE_NONE,
+          /* One of the two 500 bodies OBSERVED live; the other is `text`. */
+          pdfFailure: 'json',
+        })
+        await seedResultSet(KIT_BATCH_HEALTHY, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE })
+
+        const report = await pollUntil(
+          async () => await org.api.get(`/orders/${orderA.id}/report`),
+          (response) => response.body?.status === 'FINAL',
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        const heldBack = 'healthy, held back by the PDF-failing set'
+        expect({ label: heldBack, status: report.body?.status }).toEqual({ label: heldBack, status: 'FINAL' })
+
+        /* B's flag is still set, so B must still be short of FINAL. */
+        const stillFailing = 'pdf-failing, while its PDF still fails'
+        const brokenReport = await reportFor(orderB.id)
+        expect({ label: stillFailing, status: brokenReport.status }).not.toEqual({ label: stillFailing, status: 'FINAL' })
+
+        /* Only A was acknowledged. Polled rather than read once: the engine acknowledges A just
+         * after emitting it, which does not order the ack before A's report turning FINAL. */
+        const sets = await pollUntil(
+          async () => expectOk<{ resultSets: Array<{ kitCode: string, acknowledged: boolean }> }>(
+            await mock.get('/__control__/result-sets'),
+            'read the mock result sets while the PDF still fails',
+          ).resultSets,
+          (resultSets) => resultSets.find((set) => set.kitCode === KIT_BATCH_HEALTHY)?.acknowledged === true,
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        expect({
+          healthy: sets.find((set) => set.kitCode === KIT_BATCH_HEALTHY)?.acknowledged,
+          pdfFailing: sets.find((set) => set.kitCode === KIT_BATCH_PDF_FAILS)?.acknowledged,
+        }).toEqual({ healthy: true, pdfFailing: false })
+
+        /* And B was not given up on. The count alone cannot show that: the engine's HTTP layer
+         * retries a 5xx once inside the same request, so a single tick already asks for B's PDF
+         * twice. What proves a later tick is the count still growing after A completed and was
+         * acknowledged. */
+        const fetchesAfterAck = (await mockKit(KIT_BATCH_PDF_FAILS)).pdfFetches
+        const brokenKit = await pollUntil(
+          async () => await mockKit(KIT_BATCH_PDF_FAILS),
+          (kit) => kit.pdfFetches > fetchesAfterAck,
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        expect(brokenKit.pdfFetches).toBeGreaterThan(fetchesAfterAck)
+      } finally {
+        expectOk(
+          await mock.post(`/__control__/kits/${KIT_BATCH_PDF_FAILS}/pdf`, { pdfFailure: null }),
+          'clear the PDF failure flag',
+        )
+      }
+    }, 3 * COMPLETION_WAIT_MS + 60_000)
+
+    it('with the PDF failure cleared, both result sets of that batch complete', async () => {
+      /* The positive twin of the test above, and the proof that nothing else was wrong with the
+       * failing result set: A is already FINAL and acknowledged from the tick above, and B, left
+       * unacknowledged while its PDF failed, completes on the next healthy tick. */
+      for (const [label, orderId] of [['healthy', batchOrderIds.healthy], ['pdf-failing', batchOrderIds.broken]] as const) {
+        const report = await pollUntil(
+          async () => await org.api.get(`/orders/${orderId}/report`),
+          (response) => response.body?.status === 'FINAL',
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        expect({ label, status: report.body?.status }).toEqual({ label, status: 'FINAL' })
+      }
+
+      /* Both acknowledged, so the feed really drained rather than the reports arriving by some
+       * other route. */
+      const sets = expectOk<{ resultSets: Array<{ kitCode: string, acknowledged: boolean }> }>(
+        await mock.get('/__control__/result-sets'),
+        'read the mock result sets after the batch recovered',
+      ).resultSets
+      expect(sets.find((set) => set.kitCode === KIT_BATCH_HEALTHY)?.acknowledged).toBe(true)
+      expect(sets.find((set) => set.kitCode === KIT_BATCH_PDF_FAILS)?.acknowledged).toBe(true)
+    }, COMPLETION_WAIT_MS + 60_000)
+
+    it('a report that is not generated yet is retried each poll and delivered once it appears', async () => {
+      /* The production shape behind the isolation above: Wisdom Panel answers 404 for the vet
+       * report of a freshly released kit until the report is generated, which takes hours. The
+       * status is OBSERVED in production; the body is the one the development endpoint gives any kit
+       * without a report-ready result set, INFERRED for the pending case (the `not-generated` flag). The integration reads a 404 on the PDF call as "not generated
+       * yet": it warns, leaves the set unacknowledged and asks again on the next poll.
+       *
+       * What this can prove from outside is narrower than what the integration does. A 404 and a
+       * 500 end the same way here (the set unacknowledged, the report not FINAL, the PDF asked for
+       * again), and whether the integration logged a warning or an error is not observable; the
+       * set is also alone in the feed, so the batch isolation itself is the test above's. The point
+       * is that the real HTTP stack hands the 404 to the path that leaves the set for the next
+       * poll, and that nothing retries it inside the request: the engine's HTTP layer retries a
+       * 5xx once but never a 4xx, so each poll asks for the simplified result once and then the
+       * PDF once, and the PDF count can never get ahead of the simplified one. Then the report
+       * appears (the flag is cleared) and the set is delivered and acknowledged, which shows
+       * nothing else was holding it back. */
+      const kit = await mockKit(KIT_PDF_NOT_GENERATED)
+      const order = expectOk<{ id: string, externalId: string }>(
+        await org.api.post('/orders', payloadFor(KIT_PDF_NOT_GENERATED, { patient: patientFor({ name: 'Juniper' }) })),
+        'activate the kit whose report is not generated yet',
+      )
+      expect(order.externalId).toBe(kit.id)
+
+      try {
+        await seedResultSet(KIT_PDF_NOT_GENERATED, {
+          breeds: BREEDS,
+          idealWeight: IDEAL_WEIGHT,
+          notable: NOTABLE_NONE,
+          pdfFailure: 'not-generated',
+        })
+
+        /* Two PDF requests, with no retry inside a request, are two polls. */
+        const pending = await pollUntil(
+          async () => await mockKit(KIT_PDF_NOT_GENERATED),
+          (entry) => entry.pdfFetches >= 2,
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        expect(pending.pdfFetches).toBeGreaterThanOrEqual(2)
+        const onePerPoll = 'PDF requests beyond one per poll'
+        expect({ label: onePerPoll, extra: Math.max(0, pending.pdfFetches - pending.simplifiedFetches) })
+          .toEqual({ label: onePerPoll, extra: 0 })
+
+        const notYet = 'report not generated yet'
+        const pendingReport = await reportFor(order.id)
+        expect({ label: notYet, status: pendingReport.status }).not.toEqual({ label: notYet, status: 'FINAL' })
+        const setsWhilePending = expectOk<{ resultSets: Array<{ kitCode: string, acknowledged: boolean }> }>(
+          await mock.get('/__control__/result-sets'),
+          'read the mock result sets while the report is not generated',
+        ).resultSets
+        expect({ label: notYet, acknowledged: setsWhilePending.find((set) => set.kitCode === KIT_PDF_NOT_GENERATED)?.acknowledged })
+          .toEqual({ label: notYet, acknowledged: false })
+
+        /* The report is generated. */
+        expectOk(
+          await mock.post(`/__control__/kits/${KIT_PDF_NOT_GENERATED}/pdf`, { pdfFailure: null }),
+          'let the report be generated',
+        )
+
+        const report = await pollUntil(
+          async () => await org.api.get(`/orders/${order.id}/report`),
+          (response) => response.body?.status === 'FINAL',
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        const generated = 'report generated after the not-generated polls'
+        expect({ label: generated, status: report.body?.status }).toEqual({ label: generated, status: 'FINAL' })
+
+        /* Polled for the same reason as the ack check above: the ack follows the emit. */
+        const sets = await pollUntil(
+          async () => expectOk<{ resultSets: Array<{ kitCode: string, acknowledged: boolean }> }>(
+            await mock.get('/__control__/result-sets'),
+            'read the mock result sets after the report was generated',
+          ).resultSets,
+          (resultSets) => resultSets.find((set) => set.kitCode === KIT_PDF_NOT_GENERATED)?.acknowledged === true,
+          COMPLETION_WAIT_MS,
+          1_000,
+        )
+        expect({ label: generated, acknowledged: sets.find((set) => set.kitCode === KIT_PDF_NOT_GENERATED)?.acknowledged })
+          .toEqual({ label: generated, acknowledged: true })
+      } finally {
+        expectOk(
+          await mock.post(`/__control__/kits/${KIT_PDF_NOT_GENERATED}/pdf`, { pdfFailure: null }),
+          'clear the not-generated flag',
+        )
+      }
+    }, 3 * COMPLETION_WAIT_MS + 60_000)
+  })
+
   /* ---- tripwires ----
    *
-   * Each asserts the CORRECT behaviour and is marked `failing` while the platform does not have it.
-   * That keeps CI green while the defect stands, and turns the test red the moment someone fixes it
-   * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
-   * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
-   * even though it was supposed to fail", and the only correct response is to delete the marker,
-   * not to relax the assertion.
+   * Each tripwire asserts the CORRECT behaviour and is marked `failing` while the platform does not
+   * have it. That keeps CI green while the defect stands, and turns the test red the moment someone
+   * fixes it — at which point the `.failing` marker comes off in the same commit and the test stays
+   * on as a plain regression guard, outside this block. A tripwire that PASSES is a red run: jest
+   * reports "Failing test passed even though it was supposed to fail", and the only correct
+   * response is to delete the marker, not to relax the assertion.
    *
    * Each is paired with a positive that proves the mechanism is live, and each cleans up in a
-   * `finally` so the tests after it are unaffected. The two that POISON A POLL come last, and in
-   * that order, because a failed Bull job is retried three times with exponential backoff and the
-   * backlog has to drain before anything else can be believed. */
+   * `finally` so the tests after it are unaffected. Two of them POISON THE POLLS while they run, by
+   * making the mock refuse the engine's tokens, and a failed Bull job is retried three times with
+   * exponential backoff, so that backlog has to drain before anything else can be believed: the
+   * audit tripwire is followed by the test that proves the polls resume, and the
+   * re-authentication tripwire, which has nothing after it, comes LAST. */
   describe('tripwires: behaviours the loop should have and does not', () => {
     it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
@@ -1778,89 +1987,6 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
       expect((await mockCalls()).counters.login).toBe(loginsBefore)
     }, ORDER_WAIT_MS + 60_000)
-
-    it.failing('a result set whose PDF fails does not take the rest of the batch with it', async () => {
-      /* EXPECTED: one result set whose vet report the provider cannot generate should cost that one
-       * result set, not the batch. ACTUAL: the healthy result set that came before it in the feed
-       * is discarded too, and nothing is acknowledged — so the identical batch comes back every
-       * tick and fails at the same place for ever.
-       *
-       * `getBatchResults` loops the unacknowledged result sets and makes TWO calls per set inside
-       * ONE `try`: the simplified results and the PDF. `getReportPdfBase64` rethrows on any
-       * non-2xx, the throw escapes the `for`, and the outer catch replaces the whole return value.
-       * This is not a hypothetical shape: the provider's PDF generator answered 500 for a sizeable
-       * minority of live result sets, in two different bodies, with the first failure a few
-       * positions into the feed.
-       *
-       * A is placed first so it is first in the feed, and its report is what the assertion waits
-       * for — if the batch survived B, A would complete. The positive twin follows: clearing B's
-       * flag completes both, which shows the machinery is live and that only the failure was
-       * blocking it. */
-      const healthy = await mockKit(KIT_BATCH_HEALTHY)
-      const broken = await mockKit(KIT_BATCH_PDF_FAILS)
-
-      const orderA = expectOk<{ id: string, externalId: string }>(
-        await org.api.post('/orders', payloadFor(KIT_BATCH_HEALTHY, { patient: patientFor({ name: 'Cedar' }) })),
-        'activate the healthy kit of the batch pair',
-      )
-      const orderB = expectOk<{ id: string, externalId: string }>(
-        await org.api.post('/orders', payloadFor(KIT_BATCH_PDF_FAILS, { patient: patientFor({ name: 'Hazel' }) })),
-        'activate the PDF-failing kit of the batch pair',
-      )
-      expect(orderA.externalId).toBe(healthy.id)
-      expect(orderB.externalId).toBe(broken.id)
-      batchOrderIds.healthy = orderA.id
-      batchOrderIds.broken = orderB.id
-
-      try {
-        /* A first, then B: `getBatchResults` walks the feed in order, maps A, and throws on B. */
-        await seedResultSet(KIT_BATCH_HEALTHY, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE })
-        await seedResultSet(KIT_BATCH_PDF_FAILS, {
-          breeds: BREEDS,
-          idealWeight: IDEAL_WEIGHT,
-          notable: NOTABLE_NONE,
-          /* One of the two 500 bodies OBSERVED live; the other is `text`. */
-          pdfFailure: 'json',
-        })
-
-        const report = await pollUntil(
-          async () => await org.api.get(`/orders/${orderA.id}/report`),
-          (response) => response.body?.status === 'FINAL',
-          NEGATIVE_WAIT_MS,
-          1_000,
-        )
-        expect(report.body.status).toBe('FINAL')
-      } finally {
-        expectOk(
-          await mock.post(`/__control__/kits/${KIT_BATCH_PDF_FAILS}/pdf`, { pdfFailure: null }),
-          'clear the PDF failure flag',
-        )
-      }
-    }, NEGATIVE_WAIT_MS + 90_000)
-
-    it('with the PDF failure cleared, both result sets of that batch complete', async () => {
-      /* The positive twin of the tripwire above, and the proof that nothing else was wrong with
-       * either result set: the same two sets, still unacknowledged because the batch never got as
-       * far as acking anything, complete on the next healthy tick. */
-      for (const [label, orderId] of [['healthy', batchOrderIds.healthy], ['pdf-failing', batchOrderIds.broken]] as const) {
-        const report = await pollUntil(
-          async () => await org.api.get(`/orders/${orderId}/report`),
-          (response) => response.body?.status === 'FINAL',
-          COMPLETION_WAIT_MS,
-          1_000,
-        )
-        expect({ label, status: report.body?.status }).toEqual({ label, status: 'FINAL' })
-      }
-
-      /* Both acknowledged, so the feed really drained rather than the reports arriving by some
-       * other route. */
-      const sets = expectOk<{ resultSets: Array<{ kitCode: string, acknowledged: boolean }> }>(
-        await mock.get('/__control__/result-sets'),
-        'read the mock result sets after the batch recovered',
-      ).resultSets
-      expect(sets.find((set) => set.kitCode === KIT_BATCH_HEALTHY)?.acknowledged).toBe(true)
-      expect(sets.find((set) => set.kitCode === KIT_BATCH_PDF_FAILS)?.acknowledged).toBe(true)
-    }, COMPLETION_WAIT_MS + 60_000)
 
     it.failing('the integration re-authenticates when the provider stops accepting its token', async () => {
       /* EXPECTED: a 401 from the provider makes the integration fetch a new token. ACTUAL: it never

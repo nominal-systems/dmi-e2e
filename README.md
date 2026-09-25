@@ -577,7 +577,7 @@ scenarios/
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end, four tripwires red by design
-  wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes end to end, five tripwires red by design
+  wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes end to end, four tripwires red by design
   full-stack-smoke.e2e.ts     the demo loop (HARNESS_FULL_STACK=1 HARNESS_STACK=demo); blocked upstream
 ```
 
@@ -791,7 +791,7 @@ integration takes an OAuth2 token and ACTIVATES the kit at `/api/voyager/pet` (t
 manifest the requisition form) → the `worker` process polls two JSON:API feeds scoped by hospital
 number: kits (acknowledged by kit id) and result-sets (each resolved to its kit from `included`,
 then the simplified genetic result and the vet-report PDF fetched per set, emitted, acknowledged
-by result-set id) → dmi-api writes the report. 35 tests, five of them `it.failing` tripwires.
+by result-set id) → dmi-api writes the report. 36 tests, four of them `it.failing` tripwires.
 What the fifth provider taught us:
 
 - **An `included` that is omitted, not empty, is the whole orders channel.** JSON:API leaves the
@@ -810,9 +810,14 @@ What the fifth provider taught us:
   transfer between loops.
 - **The ideal-weight section can be an empty object**, on a sizeable minority of real kits, and the
   mapper turns it into three DONE observations with no value. Tripwire.
-- **A single failed PDF discards the whole results batch**, and since nothing is acknowledged the
-  same batch fails every tick — the provider's PDF generator does fail on a sizeable minority of
-  real kits. Tripwire, with its positive twin (clear the failure, both complete).
+- **A single failed PDF used to discard the whole results batch**, and since nothing was
+  acknowledged the same batch failed every tick — the provider's PDF generator does fail on a
+  sizeable minority of real kits. Fixed upstream in the integration, which now fetches each result
+  set on its own. The test is now a plain regression guard that also checks the failing set is
+  retried and left unacknowledged while the healthy one completes, with its positive twin (clear
+  the failure, both complete), and a variant for the production shape behind the fix — a 404
+  while a released kit's report is not generated yet (status observed in production, body from the development endpoint's no-report answer), asked for
+  once per poll with no retry inside the request, and delivered once the report appears.
 - **The token is cached for ten days and never refreshed on a 401**, so a rotated credential fails
   every call for up to ten days. Tripwire — measured at the grant endpoint, because the results
   path throws a plain `Error` that never reaches dmi-api as a provider error.
