@@ -1751,8 +1751,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     it('a report that is not generated yet is retried each poll and delivered once it appears', async () => {
       /* The production shape behind the isolation above: Wisdom Panel answers 404 for the vet
        * report of a freshly released kit until the report is generated, which takes hours. The
-       * status is OBSERVED in production; its body was never captured, so the mock's is INVENTED
-       * (the `not-generated` flag). The integration reads a 404 on the PDF call as "not generated
+       * status is OBSERVED in production; the body is the one the development endpoint gives any kit
+       * without a report-ready result set, INFERRED for the pending case (the `not-generated` flag). The integration reads a 404 on the PDF call as "not generated
        * yet": it warns, leaves the set unacknowledged and asks again on the next poll.
        *
        * What this can prove from outside is narrower than what the integration does. A 404 and a

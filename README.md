@@ -816,7 +816,7 @@ What the fifth provider taught us:
   set on its own. The test is now a plain regression guard that also checks the failing set is
   retried and left unacknowledged while the healthy one completes, with its positive twin (clear
   the failure, both complete), and a variant for the production shape behind the fix — a 404
-  while a released kit's report is not generated yet (status observed, body invented), asked for
+  while a released kit's report is not generated yet (status observed in production, body from the development endpoint's no-report answer), asked for
   once per poll with no retry inside the request, and delivered once the report appears.
 - **The token is cached for ten days and never refreshed on a 401**, so a rotated credential fails
   every call for up to ten days. Tripwire — measured at the grant endpoint, because the results

@@ -183,8 +183,9 @@ const PET_SEXES = ['male', 'female']
  * live, on a sizeable minority of the development endpoint's result sets — the same endpoint
  * answering two different 500s — which is why the control plane picks between them rather than the
  * mock choosing one. `not-generated` is the 404 production answers for a released kit whose report
- * has not been generated yet: the STATUS is OBSERVED (production, 2026-09), the body was never
- * captured and is INVENTED (see handleVetReport). */
+ * has not been generated yet: the STATUS is OBSERVED (production, 2026-09) and the body is the one
+ * the development endpoint gives every kit that has no report-ready result set (OBSERVED there
+ * 2026-09-25, INFERRED for the released-but-pending state; see handleVetReport). */
 const PDF_FAILURE_MODES = [null, 'text', 'json', 'not-generated']
 
 /* The clinic's unactivated kit inventory: the physical kits it holds and has not used. This is the
@@ -828,9 +829,10 @@ function handleSimplifiedResults (req, res, params) {
  *     was found that predicts which.
  * And a fourth, half observed: a released kit whose report has not been generated yet (the
  * `not-generated` flag). The **404** STATUS is OBSERVED in production (2026-09), where it lasts for
- * hours after release; its BODY was never captured, so the `text/html` sentence below is INVENTED,
- * worded unlike the unknown-kit body so a log reader can tell the two 404s apart. Nothing in the
- * integration reads the body.
+ * hours after release; its BODY is INFERRED from the development endpoint, which answers exactly
+ * `Result set not found.` (`text/html`, 21 bytes, OBSERVED 2026-09-25) for every kit without a
+ * report-ready result set, in any stage — the one state not seen there is a released set whose
+ * report is still pending, which is the production case. Nothing in the integration reads the body.
  * The integration reads this with `responseType: 'arraybuffer'`. A non-2xx costs that one result
  * set, which it leaves unacknowledged and asks for again on every poll; the rest of the batch is
  * delivered. Its HTTP layer retries a 5xx once inside the same request and never a 4xx, so a poll
@@ -855,9 +857,10 @@ function handleVetReport (req, res, params) {
     return sendJson(res, 500, { error: 'Internal Server Error' })
   }
   if (kit.pdfFailure === 'not-generated') {
-    /* Status OBSERVED (production, 2026-09); body INVENTED — see above. */
+    /* Status OBSERVED (production, 2026-09); body OBSERVED on dev for the no-report case, INFERRED
+     * for the pending one — see above. */
     log(`404 vet report (not generated yet) for kit ${kit.code}`)
-    return sendText(res, 404, 'Report not generated yet.', 'text/html; charset=utf-8')
+    return sendText(res, 404, 'Result set not found.', 'text/html; charset=utf-8')
   }
 
   sendPdf(res, buildPdf(`Wisdom Panel harness vet report - kit ${kit.code}`))
