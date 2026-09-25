@@ -1779,23 +1779,22 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       expect((await mockCalls()).counters.login).toBe(loginsBefore)
     }, ORDER_WAIT_MS + 60_000)
 
-    it.failing('a result set whose PDF fails does not take the rest of the batch with it', async () => {
-      /* EXPECTED: one result set whose vet report the provider cannot generate should cost that one
-       * result set, not the batch. ACTUAL: the healthy result set that came before it in the feed
-       * is discarded too, and nothing is acknowledged — so the identical batch comes back every
-       * tick and fails at the same place for ever.
-       *
-       * `getBatchResults` loops the unacknowledged result sets and makes TWO calls per set inside
-       * ONE `try`: the simplified results and the PDF. `getReportPdfBase64` rethrows on any
-       * non-2xx, the throw escapes the `for`, and the outer catch replaces the whole return value.
-       * This is not a hypothetical shape: the provider's PDF generator answered 500 for a sizeable
-       * minority of live result sets, in two different bodies, with the first failure a few
-       * positions into the feed.
+    it('a result set whose PDF fails does not take the rest of the batch with it', async () => {
+      /* One result set whose vet report the provider cannot generate costs that one result set,
+       * not the batch: the healthy set before it in the feed completes, and the failing set is
+       * left unacknowledged for the next tick. Until the integration fetched each result set on
+       * its own (`getBatchResults` used to make its two calls per set, the simplified results and
+       * the PDF, inside one `try`, so the first non-2xx PDF escaped the loop and replaced the whole
+       * batch), the healthy set was discarded too and nothing was acknowledged — the identical
+       * batch came back every tick and failed at the same place for ever. This is not a
+       * hypothetical shape: the provider's PDF generator answered 500 for a sizeable minority of
+       * live result sets, in two different bodies, and in production it answers 404 for freshly
+       * released kits' reports for hours overnight, which held back every result of the affected
+       * hospitals until morning.
        *
        * A is placed first so it is first in the feed, and its report is what the assertion waits
-       * for — if the batch survived B, A would complete. The positive twin follows: clearing B's
-       * flag completes both, which shows the machinery is live and that only the failure was
-       * blocking it. */
+       * for. The positive twin follows: clearing B's flag completes B too, which shows the
+       * machinery is live and that only the failure was blocking it. */
       const healthy = await mockKit(KIT_BATCH_HEALTHY)
       const broken = await mockKit(KIT_BATCH_PDF_FAILS)
 
@@ -1839,9 +1838,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     }, NEGATIVE_WAIT_MS + 90_000)
 
     it('with the PDF failure cleared, both result sets of that batch complete', async () => {
-      /* The positive twin of the tripwire above, and the proof that nothing else was wrong with
-       * either result set: the same two sets, still unacknowledged because the batch never got as
-       * far as acking anything, complete on the next healthy tick. */
+      /* The positive twin of the test above, and the proof that nothing else was wrong with the
+       * failing result set: A is already FINAL and acknowledged from the tick above, and B, left
+       * unacknowledged while its PDF failed, completes on the next healthy tick. */
       for (const [label, orderId] of [['healthy', batchOrderIds.healthy], ['pdf-failing', batchOrderIds.broken]] as const) {
         const report = await pollUntil(
           async () => await org.api.get(`/orders/${orderId}/report`),
