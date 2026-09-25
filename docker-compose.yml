@@ -24,6 +24,9 @@
 #     `worker` process (Bull polling) from one image, built from the sibling `dmi-engine` checkout
 #     with the antech-v6 and wisdom-panel modules injected from THEIR sibling checkouts (the
 #     engine's own Dockerfile would install the published packages instead).
+#   - `wisdom-panel`: redis, the wisdom-panel mock (src/wisdom-panel-mock, zero deps), and the SAME
+#     two `dmi-engine` services as `antech-v6` — the Wisdom Panel integration is the other module
+#     that image carries — so the engine services list both profiles and each profile adds its mock.
 #   - `full-stack`: redis, the demo provider API + its own MySQL, and the demo provider integration
 #     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
@@ -68,10 +71,10 @@ services:
   # ---- full-stack profile: the demo provider loop (order -> engine -> provider -> report) ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
-  # Shared by every full-system loop (demo, idexx, antech-v3, zoetis and antech-v6).
+  # Shared by every full-system loop (demo, idexx, antech-v3, zoetis, antech-v6 and wisdom-panel).
   redis:
     image: redis:7-alpine
-    profiles: ['full-stack', 'idexx', 'antech-v3', 'zoetis', 'antech-v6']
+    profiles: ['full-stack', 'idexx', 'antech-v3', 'zoetis', 'antech-v6', 'wisdom-panel']
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
 
@@ -297,9 +300,12 @@ services:
     ports:
       - '${HARNESS_ANTECH_V6_MOCK_PORT:-3015}:3000'
 
+  # ---- the engine, shared by the antech-v6 and wisdom-panel profiles ----
+
   # The REAL dmi-engine — the process that hosts the Antech V6 and Wisdom Panel integrations in
   # production (`dmiengineapi`). Neither integration is a container: both are npm modules the engine
-  # imports, so this is what the loop stands up. Built here from the sibling `dmi-engine` checkout
+  # imports, so this is what BOTH loops stand up — the two services below carry both profiles, and
+  # each profile adds its own mock. Built here from the sibling `dmi-engine` checkout
   # with the two module checkouts INJECTED: the engine's own Dockerfile runs `npm install` against
   # its `^x.y.z` ranges, i.e. the published packages, which would leave a change in either module
   # repo untested until it is released. The build below packs each module from its checkout
@@ -317,17 +323,23 @@ services:
   #
   # Env, from dmi-engine/src/config/configuration.ts and src/app.module.ts. REDIS_PORT must stay
   # 6379 (the compose-network port; the harness publishes Redis on 6380 for the host only): the
-  # engine derives REDIS_TLS_ENABLED from the port. The wisdom-panel module is part of the image AND
-  # loaded (`WISDOM_PANEL_DISABLED` deliberately unset): production runs both modules in one
-  # process, so a boot-time incompatibility between them is exactly what this profile should catch;
-  # with no wisdom-panel integration its queues register and sit idle. The poll interval is the
-  # engine's own env knob, dialled down.
+  # engine derives REDIS_TLS_ENABLED from the port. BOTH modules are part of the image AND loaded
+  # under either profile (`ANTECH_V6_DISABLED` / `WISDOM_PANEL_DISABLED` deliberately unset):
+  # production runs both in one process, so a boot-time incompatibility between them is exactly
+  # what each profile should catch; the module whose provider has no integration registers its
+  # queues and sits idle. Each poll interval is the engine's own env knob, dialled down.
   #
   # `restart: on-failure` because the engine refuses to start if a queue cannot reach Redis within
   # 30s, and compose's `depends_on` orders starts without waiting for readiness — on a slow runner
   # a first attempt can lose that race.
+  #
+  # No `depends_on` on either mock, on purpose: a service carrying two profiles may not depend on a
+  # service that is enabled by only one of them (compose refuses the project as "depends on
+  # undefined service" under the other profile), and the ordering would buy nothing — the engine
+  # first reaches a mock when the scenario creates an integration, after the harness has already
+  # waited on that mock's /status.
   dmi-engine-api:
-    profiles: ['antech-v6']
+    profiles: ['antech-v6', 'wisdom-panel']
     image: dmi-e2e-dmi-engine
     restart: on-failure
     build:
@@ -375,6 +387,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: '6379'
       ANTECH_V6_POLLING_INTERVAL_MS: '${HARNESS_ANTECH_V6_POLL_MS:-3000}'
+      WISDOM_PANEL_POLLING_INTERVAL_MS: '${HARNESS_WISDOM_PANEL_POLL_MS:-3000}'
       STATSIG_ENABLED: 'false'
       # dmi-engine-common logs every outbound provider request; the only diagnostic when a poll
       # fails silently.
@@ -382,14 +395,13 @@ services:
     depends_on:
       - activemq
       - redis
-      - antech-v6-mock
 
   # `image:` only, no `build:`: it runs the image the api service built. Compose builds every
   # buildable service before starting any container, so under the harness's `up --build` the image
   # always exists by the time this starts; a bare `docker compose up` on a host that never built it
   # would try to pull it and fail — build the profile first.
   dmi-engine-worker:
-    profiles: ['antech-v6']
+    profiles: ['antech-v6', 'wisdom-panel']
     image: dmi-e2e-dmi-engine
     restart: on-failure
     environment:
@@ -398,8 +410,38 @@ services:
     depends_on:
       - activemq
       - redis
-      - antech-v6-mock
       - dmi-engine-api
+
+  # ---- wisdom-panel profile: the Wisdom Panel loop, hosted by the same dmi-engine (api + worker) ----
+
+  # The wisdom-panel mock provider, built from this repo's zero-dependency Node server. Speaks the
+  # Wisdom Panel API's two dialects (an OAuth2 password grant; JSON:API on the kits and result-sets
+  # feeds with `filter[…]`/`include` and an `included` that is OMITTED rather than empty; plain
+  # `{message, data}` envelopes on the voyager endpoints: pet creation = kit activation, the two
+  # acknowledge channels; simplified results; a binary vet-report PDF) plus a /__control__ plane
+  # the scenario drives. Its shapes come from the integration's source AND a live probe of the
+  # provider's development endpoint; see the header of server.js. `baseUrl` in the dmi-api provider
+  # config points at this service's compose-network name, never at a live Wisdom Panel host. The
+  # credentials, organization unit and hospital number it accepts are the harness's own dummies,
+  # passed through so an override on the harness side reaches the mock too.
+  wisdom-panel-mock:
+    profiles: ['wisdom-panel']
+    build:
+      context: ./src/wisdom-panel-mock
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY server.js ./
+        EXPOSE 3000
+        CMD ["node", "server.js"]
+    environment:
+      PORT: '3000'
+      WISDOM_PANEL_MOCK_USERNAME: '${HARNESS_WISDOM_PANEL_USERNAME:-harness-user}'
+      WISDOM_PANEL_MOCK_PASSWORD: '${HARNESS_WISDOM_PANEL_PASSWORD:-harness-pass}'
+      WISDOM_PANEL_MOCK_ORGANIZATION_UNIT_ID: '${HARNESS_WISDOM_PANEL_ORGANIZATION_UNIT_ID:-harness-org-unit}'
+      WISDOM_PANEL_MOCK_HOSPITAL_NUMBER: '${HARNESS_WISDOM_PANEL_HOSPITAL_NUMBER:-700001}'
+    ports:
+      - '${HARNESS_WISDOM_PANEL_MOCK_PORT:-3016}:3000'
 
   # ---- zoetis profile: the Zoetis VetSync loop (order -> engine -> mock provider -> report) ----
 
