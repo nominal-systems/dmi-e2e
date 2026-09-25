@@ -823,8 +823,9 @@ function handleSimplifiedResults (req, res, params) {
  *     `An unknown error occurred.` and a JSON `{"error": "Internal Server Error"}`. Which one a
  *     given kit gets is a control-plane flag, because the live endpoint produced both and nothing
  *     was found that predicts which.
- * The integration reads this with `responseType: 'arraybuffer'` and rethrows on any non-2xx, which
- * is what makes the 500 take a whole batch down with it. */
+ * The integration reads this with `responseType: 'arraybuffer'`. A non-2xx costs that one result
+ * set, which it leaves unacknowledged and asks for again on every poll; the rest of the batch is
+ * delivered. */
 function handleVetReport (req, res, params) {
   if (!requireVoyagerAuth(req, res)) return
   state.counters.pdf += 1
