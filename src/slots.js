@@ -253,13 +253,22 @@ function verifySlots () {
     }
   }
 
+  /* One line per pair of variables that meet (the first slots they meet in), not one per slot. */
   const owner = new Map()
+  const reported = new Set()
   for (let slot = 0; slot <= MAX_SLOT; slot++) {
     for (const { variable, port } of portsFor(slot)) {
-      if (port > 65535) problems.push(`${variable} is ${port} in slot ${slot}, past the last port`)
+      if (port > 65535 && !reported.has(variable)) {
+        reported.add(variable)
+        problems.push(`${variable} is ${port} in slot ${slot}, past the last port`)
+      }
       const other = owner.get(port)
-      if (other != null) problems.push(`port ${port} is ${other.variable} in slot ${other.slot} and ${variable} in slot ${slot}`)
-      else owner.set(port, { variable, slot })
+      if (other == null) {
+        owner.set(port, { variable, slot })
+      } else if (!reported.has(`${other.variable}|${variable}`)) {
+        reported.add(`${other.variable}|${variable}`)
+        problems.push(`port ${port} is ${other.variable} in slot ${other.slot} and ${variable} in slot ${slot}`)
+      }
     }
   }
 
