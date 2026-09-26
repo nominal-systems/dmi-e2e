@@ -1,5 +1,7 @@
-import { spawn } from 'child_process'
+import { execFile, spawn } from 'child_process'
+import { realpathSync } from 'fs'
 import * as net from 'net'
+import { promisify } from 'util'
 import { appEnv, env, mockBaseUrlFor, requireDmiApiDir } from './env'
 import { stacks } from './stacks'
 import { waitForMysql } from './sql'
@@ -112,6 +114,37 @@ function composeBaseArgs (): string[] {
   const args = ['compose', '-f', env.composeFile]
   if (env.fullStack) args.push('--profile', composeProfile())
   return args
+}
+
+/* Refuses to start into a compose project that already has containers another checkout created.
+ * compose does not refuse that itself: `up` under a project name that is taken ADOPTS the running
+ * containers, the migrations then run into the other run's database, and this run's teardown
+ * (`down -v`) deletes it — no error on either side. The lock (src/slots.js) keeps two live runs off
+ * one slot; this covers the stack a run leaves behind after the lock is gone (HARNESS_KEEP_UP=1, or
+ * a run that was killed). Containers this checkout left are ours to reuse, exactly as before. */
+export async function assertProjectIsOurs (): Promise<void> {
+  const { stdout } = await promisify(execFile)('docker', [
+    'ps', '--all',
+    '--filter', `label=com.docker.compose.project=${env.composeProject}`,
+    '--format', '{{.Label "com.docker.compose.project.working_dir"}}',
+  ])
+  const canonical = (dir: string): string => {
+    try {
+      return realpathSync(dir)
+    } catch {
+      return dir
+    }
+  }
+  const ours = canonical(env.harnessRoot)
+  const foreign = [...new Set(stdout.split(/\r?\n/).filter((dir) => dir !== ''))].filter((dir) => canonical(dir) !== ours)
+  if (foreign.length > 0) {
+    throw new Error(
+      `compose project '${env.composeProject}' (slot ${env.slot}) already has containers from ${foreign.join(', ')}, ` +
+        `not from this checkout (${env.harnessRoot}). Starting here would adopt them and wipe their database. ` +
+        `If that run is over, remove its stack with \`docker compose -p ${env.composeProject} down -v\`; ` +
+        'otherwise run this one in another slot (HARNESS_SLOT, or .harness-slot in the checkout).',
+    )
+  }
 }
 
 export async function composeUp (): Promise<void> {

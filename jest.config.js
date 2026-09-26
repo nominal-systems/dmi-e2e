@@ -17,11 +17,15 @@
  * plain-JS registry env.ts does, and both resolve HARNESS_STACK through the registry's validator. */
 const path = require('path')
 const { resolveStack, stacks, suiteName, verifyStacks } = require('./src/stacks')
+const { verifySlots } = require('./src/slots')
 
 /* Every run starts by checking the registry against the files it points at (scenario, compose
  * profile, workflow glob), so a wrong entry fails here, naming the loop and field, rather than as
- * jest's "No tests found" or a readiness timeout twenty minutes in. */
+ * jest's "No tests found" or a readiness timeout twenty minutes in. Then the slot table against
+ * docker-compose.yml: a published port no slot can move, or an image every slot would share, fails
+ * here too — rather than as two parallel runs quietly sharing it. */
 verifyStacks()
+verifySlots()
 
 const fullStack =
   process.env.HARNESS_FULL_STACK === '1' ||
