@@ -125,7 +125,7 @@ Slot $n is ready: $tree
 
 Check out a branch in each repo you change, then run the harness from the tree's dmi-e2e:
   cd $tree/<repo> && git switch -c <topic>
-  cd $tree/dmi-e2e && npm run test:harness                                        # fast suite
+  cd $tree/dmi-e2e && npm run test:harness
   cd $tree/dmi-e2e && HARNESS_FULL_STACK=1 HARNESS_STACK=<suite> npm run test:harness
 
 When done: scripts/slot-tree.sh --remove $n
@@ -145,7 +145,9 @@ remove() {
   for dir in "$tree"/*/; do
     dir=${dir%/}; repo=${dir##*/}
     [ -e "$dir/.git" ] || continue
-    [ -z "$(git -C "$dir" status --porcelain)" ] || problems="$problems\n  $repo: uncommitted changes (git -C $dir status)"
+    # (.harness-slot is the tree's own file: a dmi-e2e commit older than its .gitignore entry
+    # would otherwise count it as uncommitted work.)
+    [ -z "$(git -C "$dir" status --porcelain -- . ':(exclude).harness-slot')" ] || problems="$problems\n  $repo: uncommitted changes (git -C $dir status)"
     if git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
       branches="$branches $repo:$(git -C "$dir" symbolic-ref --short HEAD)"
     elif [ -z "$(git -C "$dir" for-each-ref --count=1 --contains HEAD refs/heads refs/remotes)" ]; then
@@ -167,6 +169,7 @@ remove() {
     dir=${dir%/}
     [ -e "$dir/.git" ] || continue
     src=$(dirname "$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)")
+    rm -f "$dir/.harness-slot"
     git -C "$src" worktree remove "$dir" || die "git worktree remove failed for $dir — nothing after it was removed"
   done
   rm -f "$tree"/npm-ci-*.log

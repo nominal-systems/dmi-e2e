@@ -47,7 +47,8 @@ npm run test:harness        # DMI_API_DIR defaults to ../dmi-api
 
 That does the whole thing from a clean state:
 
-1. `docker compose up -d` — MySQL 8, Mongo 4, ActiveMQ (this repo's `docker-compose.yml`).
+1. Take the run's slot (slot 0 unless you ask for another — see "Parallel runs" below), then
+   `docker compose up -d` — MySQL 8, Mongo 4, ActiveMQ (this repo's `docker-compose.yml`).
 2. Poll until all three accept connections. No fixed sleeps.
 3. `npm run migration:run` in the dmi-api checkout, against the harness database. This also
    regression-tests that dmi-api's migrations produce a working schema from empty.
@@ -65,6 +66,54 @@ HARNESS_BUILD=0   npm run test:harness   # skip `npm run build` in the checkout
 # drive a dmi-api you are already running yourself; the harness touches no checkout:
 HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:harness
 ```
+
+### Parallel runs — slots
+
+A run owns a compose project and a set of host ports, so by default runs go one at a time. A
+**slot** moves a run off both at once: every host port is its default **+10 per slot**, and the
+compose project is `dmi-e2e-s<n>`. Slot 0 is the plain `dmi-e2e` project on the default ports —
+the harness exactly as it always ran. Runs in different slots share nothing: each has its own MySQL,
+Mongo, broker, Redis, mock and locally built images. The broker matters as much as the ports: two
+dmi-api instances on one broker are one MQTT shared-subscription group, so the broker would split
+each run's results between them, and nothing in a serial run would show it.
+
+```bash
+HARNESS_SLOT=2 npm run test:harness   # slot 2: dmi-api on 3030, MySQL on 3327, project dmi-e2e-s2
+echo 2 > .harness-slot                # or make 2 this checkout's slot (the file is gitignored)
+node src/slots.js ports 2             # every host port slot 2 uses
+```
+
+- The slot comes from `HARNESS_SLOT`, else a `.harness-slot` file in the checkout's root, else 0.
+  An explicit `HARNESS_*_PORT` still wins over the slot's. The harness sets `COMPOSE_PROJECT_NAME`
+  itself, and refuses to start if a different one is already set.
+- **A run holds its slot until it ends.** A second run on a taken slot fails at once, naming the run
+  that holds it. The locks live in `~/.cache/dmi-e2e/slot-locks` (`HARNESS_LOCK_DIR` moves them); a
+  lock whose run died is taken over by the next run.
+- **A stack left up stays with the checkout that started it.** After `HARNESS_KEEP_UP=1`, a run from
+  another checkout in the same slot refuses to start into those containers — compose would adopt
+  them, and that run's teardown would wipe their database — and names the
+  `docker compose -p <project> down -v` that clears them. The checkout that left them reuses them, as
+  before.
+- **A slot separates the stacks, not the code.** The harness builds from the checkouts beside this
+  one (`../dmi-api`, `../<integration>`), so runs from one set of checkouts test the same files, and
+  two runs from one checkout share its dmi-api build and `reports/`. To work on several changes at
+  once, give each slot its own tree of checkouts:
+
+```bash
+scripts/slot-tree.sh 3 idexx      # ../slots/s3/: worktrees of dmi-e2e, dmi-api and the idexx
+                                  # integration, detached at origin's default branch;
+                                  # .harness-slot = 3; npm ci in dmi-e2e and dmi-api
+cd ../slots/s3/dmi-engine-idexx-integration && git switch -c <topic>    # change it here
+cd ../dmi-e2e && HARNESS_FULL_STACK=1 HARNESS_STACK=idexx npm run test:harness
+scripts/slot-tree.sh --list       # the trees, what each worktree is on, which slots are running
+scripts/slot-tree.sh --remove 3   # stack, volumes, images and worktrees; refused while a run holds
+                                  # the slot or a worktree has uncommitted work
+```
+
+A tree holds a worktree of every repo its suites build from, edited or not, made from the clones
+beside the main dmi-e2e clone (clone a missing one there first). With no suites named it covers every
+loop whose checkouts are cloned. Branches made in a tree are ordinary branches of those clones, and
+outlive the tree. Trees go in `slots/` next to the clones; `DMI_SLOTS_DIR` moves them.
 
 ### Run reports
 
@@ -433,6 +482,7 @@ suite is unaffected.
 ### Ports
 
 Shifted off dmi-api's defaults so a developer's dev stack can keep running alongside the harness.
+These are slot 0's; slot n adds 10 × n to every one (see "Parallel runs — slots").
 
 | Service  | Harness | dmi-api default |
 |----------|---------|-----------------|
@@ -456,10 +506,14 @@ Full-system services (behind a compose profile — only the selected loop's port
 
 ## Environment
 
-Every variable has a working default; the table exists so CI and debugging are not guesswork.
+Every variable has a working default; the table exists so CI and debugging are not guesswork. Port
+defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `HARNESS_SLOT` | the checkout's `.harness-slot`, else `0` | Which slot the run occupies (0–99): every host port + 10 × slot, compose project `dmi-e2e-s<n>`. See "Parallel runs — slots". |
+| `HARNESS_LOCK_DIR` | `~/.cache/dmi-e2e/slot-locks` | Where the per-slot locks live. Must be one directory for every run sharing a Docker daemon. |
+| `DMI_SLOTS_DIR` | `slots/` beside the main dmi-e2e clone | `scripts/slot-tree.sh` only: where slot trees are created. |
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
@@ -546,7 +600,8 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               profile (redis + the demo provider + its MySQL + the demo integration)
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
-  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name (every run does too, at start)
+  slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
+  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
@@ -570,6 +625,7 @@ scripts/
   nightly.sh                  every suite in turn from the nightly tree's clones, forced to origin/main,
                               each report published — what the LaunchAgent runs
   nightly-install.sh          create the nightly tree, render + load (or --uninstall) the LaunchAgent
+  slot-tree.sh                create (or --remove, --list) a slot's tree of worktrees, so parallel slots also test separate code
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     the point of this suite

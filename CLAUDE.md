@@ -123,6 +123,13 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   API generations the key carries the generation (`antech-v3`, `antech-v6`; dmi-api's ids are
   `antech` and `antech-v6`), and no key may be a prefix of another — the workflow `paths:` globs
   are `scenarios/<key>*.e2e.ts`, so `antech` next to `antech-v6` would fire on both.
+- **Every host port and every image name belongs to a slot.** Several harness runs can share a
+  machine, one per slot (`src/slots.js`: ports + 10 per slot, compose project `dmi-e2e-s<n>`), and
+  runs in different slots must share nothing — two runs that do share a database or a broker corrupt
+  each other without an error. So a new published port is `${HARNESS_<NAME>_PORT:-<default>}`,
+  with its default in `src/slots.js` (a base service) or its registry entry (a mock), and an image
+  this repo names is `${COMPOSE_PROJECT_NAME:-dmi-e2e}-<name>` — compose's own naming for what it
+  builds. `verifySlots()` refuses anything else at the start of every run.
 - **One name per mock: `<stack>-mock`, in every position** — directory, compose service, log
   prefix, `/status` service name, readiness label, env prefix `HARNESS_<STACK>_MOCK_*`. The
   provider's product name (VetConnect Plus, VetSync) belongs in prose only; a mock that goes by
@@ -162,5 +169,5 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 
 See the README ("Running it", "Environment"). Practical notes: prefer native Linux (the full-stack
 loops build the integration Dockerfiles, which needs a GitHub Packages `read:packages` token as
-`GHP_TOKEN`); a cold run is `docker compose down -v` first; `maxWorkers: 1` is load-bearing —
+`GHP_TOKEN`); a cold run is `docker compose down -v` first (in slot n, `docker compose -p dmi-e2e-s<n> down -v`); `maxWorkers: 1` is load-bearing —
 scenarios share one database and one event stream and must not race.
