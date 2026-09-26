@@ -87,8 +87,15 @@ node src/slots.js ports 2             # every host port slot 2 uses
   An explicit `HARNESS_*_PORT` still wins over the slot's. The harness sets `COMPOSE_PROJECT_NAME`
   itself, and refuses to start if a different one is already set.
 - **A run holds its slot until it ends.** A second run on a taken slot fails at once, naming the run
-  that holds it. The locks live in `~/.cache/dmi-e2e/slot-locks` (`HARNESS_LOCK_DIR` moves them); a
-  lock whose run died is taken over by the next run.
+  that holds it; a lock whose run died is taken over by the next run. A run is also refused while
+  another run, in any slot, works from the same checkout (they would share its `reports/`) or on the
+  same dmi-api checkout while either of them builds it (`npm run build` deletes `dist/` first).
+- **The locks are per OS user**: `~/.cache/dmi-e2e/slot-locks`. Runs under *different* OS users that
+  share one Docker daemon do not see each other's locks — point `HARNESS_LOCK_DIR` at one directory
+  they can all write.
+- **A run will not start dmi-api where something already listens.** A dmi-api that a killed run left
+  behind would otherwise answer `/health` for this run and be tested in place of this checkout's
+  build. The run fails at the start instead, naming the port.
 - **A stack left up stays with the checkout that started it.** After `HARNESS_KEEP_UP=1`, a run from
   another checkout in the same slot refuses to start into those containers — compose would adopt
   them, and that run's teardown would wipe their database — and names the
@@ -113,7 +120,16 @@ scripts/slot-tree.sh --remove 3   # stack, volumes, images and worktrees; refuse
 A tree holds a worktree of every repo its suites build from, edited or not, made from the clones
 beside the main dmi-e2e clone (clone a missing one there first). With no suites named it covers every
 loop whose checkouts are cloned. Branches made in a tree are ordinary branches of those clones, and
-outlive the tree. Trees go in `slots/` next to the clones; `DMI_SLOTS_DIR` moves them.
+outlive the tree; `--remove` takes the tree's gitignored files (`node_modules`, `reports/`, builds)
+with it. Trees go in `slots/` next to the clones; `DMI_SLOTS_DIR` moves them.
+
+**`docker compose` by hand.** A tree's dmi-e2e carries a gitignored `.env` naming its slot's project
+and ports, which compose reads on its own — so `docker compose ps` or `docker compose down -v` typed
+in a tree addresses that tree's stack. Anywhere else, a bare `docker compose` addresses slot 0: with
+`HARNESS_SLOT` exported, add `-p dmi-e2e-s<n>`.
+
+**The nightly** runs at slot 0 and starts each suite by taking the `dmi-e2e` project down, so on a
+machine that runs it, keep other work off slot 0 at night.
 
 ### Run reports
 
@@ -900,6 +916,6 @@ What the fifth provider taught us:
   kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
   results. Both mock-backed scenarios avoid this by stopping their integration in `afterAll` (removing
   its jobs); if a run is interrupted before that, `docker compose --profile <loop> down -v` clears
-  Redis. A normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
+  Redis (outside a slot tree, in slot n add `-p dmi-e2e-s<n>`). A normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
 - **No wire-format snapshots** yet (a follow-up).
 - **`maxWorkers: 1`.** One database, one event stream, one `seq` counter. Scenarios must not race.

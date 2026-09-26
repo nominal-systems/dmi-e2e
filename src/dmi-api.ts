@@ -1,5 +1,6 @@
 import { ChildProcess, spawn } from 'child_process'
 import { existsSync, mkdirSync } from 'fs'
+import * as net from 'net'
 import * as path from 'path'
 import { appEnv, env, requireDmiApiDir } from './env'
 
@@ -63,8 +64,40 @@ export async function waitForHealth (
   throw new Error(`dmi-api at ${env.baseUrl} not healthy within ${timeoutMs}ms: ${String(lastError)}`)
 }
 
+/* Refuses to start dmi-api where something already listens. waitForHealth takes any 2xx from
+ * /health as this run's dmi-api, so a dmi-api left running by a killed harness run — or anything
+ * else answering on that port — would stand in for this checkout's build, and the suite would test
+ * it instead, quite possibly green. Checked when setup starts and again just before the spawn. */
+export async function assertAppPortFree (): Promise<void> {
+  const { hostname, port } = new URL(env.baseUrl)
+  const inUse = await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection({ host: hostname, port: Number(port) })
+    socket.setTimeout(2000)
+    socket.once('connect', () => {
+      socket.destroy()
+      resolve(true)
+    })
+    socket.once('timeout', () => {
+      socket.destroy()
+      resolve(false)
+    })
+    socket.once('error', () => {
+      socket.destroy()
+      resolve(false)
+    })
+  })
+  if (inUse) {
+    throw new Error(
+      `something is already listening on ${hostname}:${port}, where slot ${env.slot} starts dmi-api — most likely a dmi-api ` +
+        'that a killed harness run left behind. Starting anyway would test whatever answers there instead of this ' +
+        `checkout's build. Stop it (\`ss -ltnp 'sport = :${port}'\` or \`lsof -i :${port}\` names its pid), or use another slot.`,
+    )
+  }
+}
+
 export async function startDmiApi (): Promise<ChildProcess> {
   const dmiApiDir = requireDmiApiDir()
+  await assertAppPortFree()
   ensurePublicDir(dmiApiDir)
   if (env.build) await buildDmiApi(dmiApiDir)
 

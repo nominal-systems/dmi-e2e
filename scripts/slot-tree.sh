@@ -5,11 +5,13 @@
 #   scripts/slot-tree.sh <n> [suite …]   create slot tree <n> (1–99): a worktree of dmi-e2e, of
 #                                        dmi-api and of every checkout the named suites are built
 #                                        from (default: every loop in src/stacks.js), each detached
-#                                        at origin's default branch; `.harness-slot` = n in its
-#                                        dmi-e2e; `npm ci` in dmi-e2e and dmi-api
+#                                        at origin's default branch; `.harness-slot` = n and a `.env`
+#                                        naming the slot's compose project in its dmi-e2e; `npm ci`
+#                                        in dmi-e2e and dmi-api
 #   scripts/slot-tree.sh --remove <n>    take slot n's stack down (containers, volumes, the images it
-#                                        built) and remove the tree's worktrees. Refused while a run
-#                                        holds the slot, or while any worktree has uncommitted
+#                                        built) and remove the tree's worktrees, gitignored files
+#                                        (node_modules, reports/, builds) included. Refused while a
+#                                        run holds the slot, or while any worktree has uncommitted
 #                                        changes or commits that no branch holds
 #   scripts/slot-tree.sh --list          every slot tree: what each worktree is on, and whether a
 #                                        run holds the slot
@@ -22,7 +24,8 @@
 # the tree, and nothing in it is shared with another slot. After creating one: check out a branch
 # in the repos you change (a change across two repos is two branches in one tree, tested
 # together), then run the harness from the tree's dmi-e2e — it reads its slot from `.harness-slot`,
-# so there is nothing else to set.
+# so there is nothing else to set. The `.env` beside it (gitignored, read by compose itself) makes a
+# bare `docker compose` typed in the tree address the tree's stack too, not slot 0's.
 #
 # Worktrees, not clones: they share the existing clones' objects, so a tree takes seconds, needs no
 # credentials beyond a fetch, and a branch made in one is an ordinary branch of the clone it came
@@ -102,11 +105,14 @@ create() {
     src=$REPOS/$repo
     git -C "$src" fetch -q origin || echo "slot-tree: could not fetch $repo; using the origin refs it already has"
     ref=$(default_ref "$src")
-    git -C "$src" worktree prune
-    git -C "$src" worktree add -q --detach "$tree/$repo" "$ref" || die "git worktree add failed for $repo"
+    git -C "$src" worktree add -q --detach "$tree/$repo" "$ref" ||
+      die "git worktree add failed for $repo (if an earlier $tree was deleted by hand rather than with --remove, \`git -C $src worktree prune\` clears its registration)"
     printf '  %-38s %s @ %s\n' "$repo" "$ref" "$(git -C "$tree/$repo" rev-parse --short HEAD)"
   done
   echo "$n" > "$tree/dmi-e2e/.harness-slot"
+  { echo "# Written by scripts/slot-tree.sh for slot $n: compose reads this, so a bare \`docker compose\`"
+    echo "# here addresses slot $n's stack. The harness refuses to run if it disagrees with .harness-slot."
+    slots env "$n"; } > "$tree/dmi-e2e/.env"
 
   # The harness runs these two on the host; the integrations and the engine build inside Docker.
   for repo in dmi-e2e dmi-api; do
@@ -157,7 +163,9 @@ remove() {
   [ -z "$problems" ] || die "not removing $tree:$(printf '%b' "$problems")"
 
   echo "slot-tree: removing slot $n ($project)"
-  docker compose -p "$project" down -v --remove-orphans >/dev/null 2>&1 || true
+  local out
+  out=$(docker compose -p "$project" down -v --remove-orphans 2>&1) || die "docker compose -p $project down failed, so nothing was removed:
+$out"
   local images
   images=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep "^$project-" || true)
   if [ -n "$images" ]; then

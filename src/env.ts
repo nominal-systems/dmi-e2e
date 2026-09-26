@@ -75,8 +75,9 @@ export interface HarnessEnv {
   suite: string
   /* The sibling checkouts the selected full-system loop builds its containers from — as the stack
    * registry lists them, with the same DMI_*_DIR defaults docker-compose.yml uses. Only read to
-   * record what was under test in the run report. Empty for the fast suite. */
-  checkouts: Array<{ name: string, dir: string }>
+   * record what was under test in the run report. Empty for the fast suite. `fromVariable` names the
+   * DMI_*_DIR that put a checkout somewhere other than beside this one. */
+  checkouts: Array<{ name: string, dir: string, fromVariable?: string }>
   /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
    * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
    * suite that just ran into publishDir on teardown — the directory an nginx serves — and rebuilds
@@ -240,11 +241,12 @@ export function mockBaseUrlFor (stackName: StackName): string {
   return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}${mock.pathPrefix}`)
 }
 
-function checkoutsUnderTest (): Array<{ name: string, dir: string }> {
+function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?: string }> {
   if (!fullStack) return []
   return stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
     name: repo,
     dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))),
+    ...(process.env[dirVariable] != null && process.env[dirVariable] !== '' ? { fromVariable: dirVariable } : {}),
   }))
 }
 

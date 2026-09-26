@@ -1,6 +1,6 @@
 import { ChildProcess } from 'child_process'
 import { assertProjectIsOurs, composeUp, runMigrations, waitForDependencies } from './containers'
-import { startDmiApi } from './dmi-api'
+import { assertAppPortFree, startDmiApi } from './dmi-api'
 import { env } from './env'
 import { beginRun } from './report/report'
 import { acquireSlot, releaseSlot } from './slots'
@@ -18,7 +18,7 @@ export default async function globalSetup (): Promise<void> {
   /* The slot before anything else — before the report step below clears reports/<suite>/, which a
    * run already holding this slot from this checkout would still be writing. A taken slot is a
    * loud error naming the run that holds it; teardown releases it. */
-  acquireSlot(env.slot, env.harnessRoot)
+  acquireSlot(env.slot, { harnessRoot: env.harnessRoot, dmiApiDir: env.dmiApiDir, buildsDmiApi: env.manageApp && env.build })
   log(`slot ${env.slot} (${env.slotSource}): compose project ${env.composeProject}, dmi-api on port ${env.appPort}`)
   try {
     await setUp(log)
@@ -36,6 +36,10 @@ async function setUp (log: (message: string) => void): Promise<void> {
    * results, so the report can never show a stale result against a fresh run. */
   const run = beginRun()
   log(`suite '${run.suite}' — under test: ${Object.entries(run.versions).map(([name, version]) => `${name} ${version}`).join(', ')}`)
+  log(`from: ${Object.entries(run.locations ?? {}).map(([name, location]) => `${name} ${location}`).join(', ')}`)
+
+  /* Before minutes of containers and migrations: a port taken now would only fail the run later. */
+  if (env.manageApp) await assertAppPortFree()
 
   if (env.manageContainers) {
     await assertProjectIsOurs()

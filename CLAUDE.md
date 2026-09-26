@@ -169,5 +169,5 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 
 See the README ("Running it", "Environment"). Practical notes: prefer native Linux (the full-stack
 loops build the integration Dockerfiles, which needs a GitHub Packages `read:packages` token as
-`GHP_TOKEN`); a cold run is `docker compose down -v` first (in slot n, `docker compose -p dmi-e2e-s<n> down -v`); `maxWorkers: 1` is load-bearing —
+`GHP_TOKEN`); a cold run is `docker compose down -v` first (a slot tree's `.env` points a bare `docker compose` at its own slot; with only `HARNESS_SLOT` set, add `-p dmi-e2e-s<n>` or you take down slot 0's stack); `maxWorkers: 1` is load-bearing —
 scenarios share one database and one event stream and must not race.

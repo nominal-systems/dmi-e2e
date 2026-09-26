@@ -117,6 +117,19 @@ function applySlot (environment, harnessRoot) {
         'The harness names the compose project after the slot: unset COMPOSE_PROJECT_NAME and choose the slot with HARNESS_SLOT.',
     )
   }
+  /* A slot tree's dmi-e2e carries a gitignored .env naming its slot's project and ports
+   * (scripts/slot-tree.sh writes it; compose reads it on its own), so a bare `docker compose` typed
+   * in the tree addresses the tree's stack rather than slot 0's. It must name the same project as
+   * the slot, or a hand-typed `down -v` would hit a different stack from the one the harness runs. */
+  const dotEnv = path.join(harnessRoot, '.env')
+  const named = fs.existsSync(dotEnv) ? /^[ \t]*COMPOSE_PROJECT_NAME[ \t]*=[ \t]*['"]?([^'"\s#]+)/m.exec(fs.readFileSync(dotEnv, 'utf8'))?.[1] : undefined
+  if (named != null && named !== project) {
+    throw new Error(
+      `${dotEnv} names the compose project '${named}', but slot ${slot} (from ${source}) runs as '${project}': a bare ` +
+        '`docker compose` there would address a different stack from the one the harness runs. Make them agree ' +
+        `(\`node src/slots.js env ${slot}\` prints the lines slot ${slot} wants).`,
+    )
+  }
   environment.COMPOSE_PROJECT_NAME = project
   for (const { variable, port } of portsFor(slot)) {
     if (environment[variable] == null || environment[variable] === '') environment[variable] = String(port)
@@ -126,9 +139,10 @@ function applySlot (environment, harnessRoot) {
 
 /* ---- the lock ------------------------------------------------------------------------------ */
 
-/* One directory per user, outside every checkout, so a run in one checkout sees a run in another.
- * HARNESS_LOCK_DIR moves it (tests, or a machine where the home directory is not shared by the
- * runs that share its Docker). */
+/* One directory per OS user, under the home directory and outside every checkout, so a run in one
+ * checkout sees a run in any other. Not the system temp directory: sessions of one user need not
+ * share a TMPDIR. Runs under DIFFERENT OS users that share one Docker daemon do not see each other's
+ * locks — point HARNESS_LOCK_DIR at one directory they can all write. */
 function lockDir (environment = process.env) {
   const configured = environment.HARNESS_LOCK_DIR
   return path.resolve(configured != null && configured !== '' ? configured : path.join(os.homedir(), '.cache', 'dmi-e2e', 'slot-locks'))
@@ -157,6 +171,33 @@ function readHolder (file) {
   }
 }
 
+function ageMs (file) {
+  try {
+    return Date.now() - fs.statSync(file).mtimeMs
+  } catch {
+    return Infinity
+  }
+}
+
+/* Creates `file` only if it does not exist (O_EXCL): of several processes, exactly one succeeds. */
+function tryCreate (file, content) {
+  try {
+    fs.writeFileSync(file, content, { flag: 'wx' })
+    return true
+  } catch (error) {
+    if (error.code === 'EEXIST') return false
+    throw error
+  }
+}
+
+function canonical (dir) {
+  try {
+    return fs.realpathSync(dir)
+  } catch {
+    return path.resolve(dir)
+  }
+}
+
 /* The live holder of a slot's lock, or undefined when the slot is free (no lock, or its holder is
  * gone). */
 function slotHolder (slot, environment = process.env) {
@@ -164,37 +205,86 @@ function slotHolder (slot, environment = process.env) {
   return holder != null && isAlive(holder.pid) ? holder : undefined
 }
 
-/* Takes the slot for this process, or throws naming whoever has it. A lock whose process is gone
- * (a run that crashed or was killed — jest runs no teardown when setup throws) is reclaimed. The
- * file is created O_EXCL, so of two runs racing for a free slot exactly one wins.
- * @param {number} slot @param {string} harnessRoot */
-function acquireSlot (slot, harnessRoot, environment = process.env) {
+function takenError (slot, holder, file) {
+  return new Error(
+    `slot ${slot} is taken: pid ${holder.pid} has held it since ${holder.since}, running from ${holder.harnessRoot}. ` +
+      'Two runs on one slot would share one database. Pick another slot (HARNESS_SLOT, or .harness-slot in the checkout) ' +
+      `or wait for that run to finish. If pid ${holder.pid} is not a harness run, delete ${file}.`,
+  )
+}
+
+/* Takes the slot for this process, or throws naming whoever has it.
+ *   - A free slot: the lock is created O_EXCL, so of several runs racing for it exactly one wins.
+ *   - A stale lock (its process is gone — a run that crashed or was killed) is taken over, but only
+ *     by the one run that first creates its `.takeover` marker (O_EXCL again), and that run re-reads
+ *     the lock under the marker before it clears it. Without the marker, two runs could each find
+ *     the lock stale, and the second one's delete would remove the lock the first had just taken:
+ *     both would run on one slot. (A marker older than ten seconds is a takeover that died midway,
+ *     and is cleared.)
+ *   - Then the claim is checked against every other live lock, whatever its slot: two runs from one
+ *     checkout share its reports/<suite>/, and two runs on one dmi-api checkout share its dist/,
+ *     which `npm run build` deletes first. The later run gives its slot back and is refused.
+ * @param {number} slot
+ * @param {{ harnessRoot: string, dmiApiDir: string, buildsDmiApi: boolean }} claim */
+function acquireSlot (slot, claim, environment = process.env) {
   const file = lockFile(slot, environment)
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  const mine = JSON.stringify({ pid: process.pid, harnessRoot, since: new Date().toISOString() }) + '\n'
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.writeFileSync(file, mine, { flag: 'wx' })
-      return file
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error
-    }
-    const holder = readHolder(file)
-    if (holder == null) {
-      /* Unreadable: either half-written by a run taking it this instant, or debris. */
-      let ageMs = Infinity
-      try { ageMs = Date.now() - fs.statSync(file).mtimeMs } catch { /* gone meanwhile */ }
-      if (ageMs < 10_000) throw new Error(`slot ${slot} is being taken by another run right now (${file})`)
-    } else if (isAlive(holder.pid)) {
+  const mine = { pid: process.pid, harnessRoot: canonical(claim.harnessRoot), dmiApiDir: canonical(claim.dmiApiDir), buildsDmiApi: claim.buildsDmiApi }
+  const content = JSON.stringify({ ...mine, since: new Date().toISOString() }) + '\n'
+  if (!tryCreate(file, content)) takeOver(slot, file, content)
+  try {
+    assertNothingShared(slot, mine, environment)
+  } catch (error) {
+    releaseSlot(slot, environment)
+    throw error
+  }
+  return file
+}
+
+function takeOver (slot, file, content) {
+  const holder = readHolder(file)
+  if (holder != null && isAlive(holder.pid)) throw takenError(slot, holder, file)
+  /* Unreadable and fresh: another run created it an instant ago and is still writing it. */
+  if (holder == null && ageMs(file) < 10_000) throw new Error(`slot ${slot} is being taken by another run right now (${file})`)
+  const marker = `${file}.takeover`
+  if (!tryCreate(marker, content)) {
+    if (ageMs(marker) < 10_000) throw new Error(`slot ${slot} is being taken over by another run right now (${marker})`)
+    fs.rmSync(marker, { force: true })
+    if (!tryCreate(marker, content)) throw new Error(`slot ${slot} is being taken over by another run right now (${marker})`)
+  }
+  try {
+    /* Only the marker's holder clears the lock, but a takeover that finished before ours may already
+     * have replaced it with a live run's. */
+    const current = readHolder(file)
+    if (current != null && isAlive(current.pid)) throw takenError(slot, current, file)
+    fs.rmSync(file, { force: true })
+    if (!tryCreate(file, content)) throw new Error(`slot ${slot} was taken by another run at the same moment (${file})`)
+  } finally {
+    fs.rmSync(marker, { force: true })
+  }
+}
+
+function assertNothingShared (slot, mine, environment) {
+  const dir = lockDir(environment)
+  for (const name of fs.readdirSync(dir)) {
+    const match = /^slot-(\d+)\.lock$/.exec(name)
+    if (match == null || Number(match[1]) === slot) continue
+    const other = readHolder(path.join(dir, name))
+    if (other == null || other.pid === process.pid || !isAlive(other.pid)) continue
+    if (other.harnessRoot === mine.harnessRoot) {
       throw new Error(
-        `slot ${slot} is taken: pid ${holder.pid} has held it since ${holder.since}, running from ${holder.harnessRoot}. ` +
-          'Two runs on one slot would share one database. Pick another slot (HARNESS_SLOT, or .harness-slot in the checkout) ' +
-          `or wait for that run to finish. If pid ${holder.pid} is not a harness run, delete ${file}.`,
+        `slot ${match[1]} is already running from this checkout (pid ${other.pid}, since ${other.since}). Two runs in one ` +
+          'checkout share its reports/ and its dmi-api build: run this one from its own slot tree (scripts/slot-tree.sh).',
       )
     }
-    fs.rmSync(file, { force: true })
+    if (other.dmiApiDir === mine.dmiApiDir && (other.buildsDmiApi === true || mine.buildsDmiApi)) {
+      throw new Error(
+        `slot ${match[1]} (pid ${other.pid}, from ${other.harnessRoot}) is using the dmi-api checkout ${mine.dmiApiDir}, and ` +
+          'one of the two runs builds it — `npm run build` deletes dist/ first. Give each run its own dmi-api checkout ' +
+          '(scripts/slot-tree.sh), or run both with HARNESS_BUILD=0 against a build made beforehand.',
+      )
+    }
   }
-  throw new Error(`could not take ${file}: another run keeps taking slot ${slot} at the same moment`)
 }
 
 /* Releases the slot if this process holds it — never another run's lock. */
@@ -272,8 +362,23 @@ function verifySlots () {
     }
   }
 
-  for (const image of compose.matchAll(/^\s*image:\s*['"]?(dmi-e2e[^'"\s]*)/gm)) {
-    problems.push(`image '${image[1]}' is a fixed name: every slot would build and run the same tag — name it \${COMPOSE_PROJECT_NAME:-${BASE_PROJECT}}-<name>`)
+  /* Names that would be the same in every slot. An image may follow the project name, or be a
+   * pulled image pinned by a tag (`mysql:8`); any other name — an image built here under a fixed
+   * name — is built and run by every slot as one tag. `container_name:`, and `name:` on a top-level
+   * volume or network, fix a name across projects outright. */
+  for (const image of compose.matchAll(/^\s*image:\s*['"]?([^'"\s#]+)/gm)) {
+    const name = image[1]
+    if (name.includes('${COMPOSE_PROJECT_NAME')) continue
+    if (/:[\w][\w.-]*$/.test(name) && !name.startsWith(BASE_PROJECT)) continue
+    problems.push(`image '${name}' has the same name in every slot, so every slot would build and run one tag — name it \${COMPOSE_PROJECT_NAME:-${BASE_PROJECT}}-<name> (a pulled image: pin it with a tag)`)
+  }
+  for (const fixed of compose.matchAll(/^\s*container_name:\s*(\S+)/gm)) {
+    problems.push(`container_name ${fixed[1]} is the same in every slot — drop it and let compose name the container after the project`)
+  }
+  for (const section of compose.matchAll(/^(volumes|networks):[^\n]*\n((?:[ \t]+[^\n]*\n|[ \t]*\n)*)/gm)) {
+    for (const fixed of section[2].matchAll(/^[ \t]+name:\s*(\S+)/gm)) {
+      problems.push(`top-level ${section[1]} entry named ${fixed[1]} is the same in every slot — drop \`name:\` and let compose prefix it with the project`)
+    }
   }
   const name = /^name:\s*['"]?([^'"\s]+)/m.exec(compose)?.[1]
   if (name !== BASE_PROJECT) problems.push(`docker-compose.yml's project name is '${name}', not '${BASE_PROJECT}' — slot 0 would not be the project a bare \`docker compose\` uses`)
@@ -302,6 +407,8 @@ module.exports = {
 /* CLI for shell callers (scripts/slot-tree.sh), so no script restates the table:
  *   node src/slots.js project <n>   → the compose project slot <n> runs as (exit 1 if <n> is no slot)
  *   node src/slots.js ports <n>     → one "<variable> <port> <label>" line per host port
+ *   node src/slots.js env <n>       → the .env lines a slot tree's dmi-e2e carries: the project
+ *                                     name and every port, as compose reads them
  *   node src/slots.js holder <n>    → "<pid> <since> <checkout>" when a live run holds slot <n>;
  *                                     nothing when it is free
  *   node src/slots.js check         → verifySlots(), exit 1 with the problems if any */
@@ -312,6 +419,9 @@ if (require.main === module) {
       console.log(projectName(parseSlot(String(value ?? ''), 'slot')))
     } else if (command === 'ports') {
       console.log(portsFor(parseSlot(String(value ?? ''), 'slot')).map(({ variable, port, label }) => `${variable} ${port} ${label}`).join('\n'))
+    } else if (command === 'env') {
+      const slot = parseSlot(String(value ?? ''), 'slot')
+      console.log([`COMPOSE_PROJECT_NAME=${projectName(slot)}`, ...portsFor(slot).map(({ variable, port }) => `${variable}=${port}`)].join('\n'))
     } else if (command === 'holder') {
       const holder = slotHolder(parseSlot(String(value ?? ''), 'slot'))
       if (holder != null) console.log(`${holder.pid} ${holder.since} ${holder.harnessRoot}`)
@@ -319,7 +429,7 @@ if (require.main === module) {
       verifySlots()
       console.log(`harness slots ok: ${hostPorts().length} host ports, slots 0–${MAX_SLOT}`)
     } else {
-      throw new Error('usage: node src/slots.js project <n> | ports <n> | holder <n> | check')
+      throw new Error('usage: node src/slots.js project <n> | ports <n> | env <n> | holder <n> | check')
     }
   } catch (error) {
     console.error(error.message)
