@@ -174,6 +174,7 @@ remove() {
   done
   rm -f "$tree"/npm-ci-*.log
   rmdir "$tree" 2>/dev/null || die "$tree still holds files the tree did not make — left in place: $(ls -A "$tree" | tr '\n' ' ')"
+  rmdir "$SLOTS" 2>/dev/null || true   # the last tree takes the empty slots directory with it
   echo "slot-tree: slot $n removed"
   local b
   for b in $branches; do
