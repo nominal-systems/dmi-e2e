@@ -6,3 +6,5 @@ dist/
 .env.local
 .idea/
 reports/
+# the harness slot this checkout runs as (src/slots.js); local to each checkout
+.harness-slot

@@ -9,6 +9,12 @@
 # Host ports are shifted off the defaults so a developer's dmi-api dev stack can keep running
 # alongside the harness. Override with HARNESS_*_PORT.
 #
+# Harness slots (src/slots.js) run several copies of this project side by side: the harness sets
+# COMPOSE_PROJECT_NAME (`dmi-e2e`, or `dmi-e2e-s<n>` for slot n) and every HARNESS_*_PORT (+10 per
+# slot) before it calls compose, and the `${…:-default}` values below are slot 0. So every published
+# port must be a `${HARNESS_<NAME>_PORT:-<default>}`, and an image this file names must follow the
+# project name — `verifySlots()` refuses either otherwise, at the start of every run.
+#
 # The base services (mysql, mongo, activemq) are what dmi-api alone needs and always start. The
 # full-system suite (HARNESS_FULL_STACK=1) additionally starts one provider loop, selected by
 # HARNESS_STACK and mapped to a compose profile:
@@ -338,9 +344,14 @@ services:
   # undefined service" under the other profile), and the ordering would buy nothing — the engine
   # first reaches a mock when the scenario creates an integration, after the harness has already
   # waited on that mock's /status.
+  #
+  # The image is named after the compose project, as compose names every image it builds unless
+  # told otherwise, because the worker below must run the image THIS project built. Under a fixed
+  # name, two harness slots building from different engine or module checkouts would retag one
+  # image, and a slot's worker would run whichever slot built last — no error, the wrong code.
   dmi-engine-api:
     profiles: ['antech-v6', 'wisdom-panel']
-    image: dmi-e2e-dmi-engine
+    image: ${COMPOSE_PROJECT_NAME:-dmi-e2e}-dmi-engine
     restart: on-failure
     build:
       context: ${DMI_ENGINE_DIR:-../dmi-engine}
@@ -402,7 +413,7 @@ services:
   # would try to pull it and fail — build the profile first.
   dmi-engine-worker:
     profiles: ['antech-v6', 'wisdom-panel']
-    image: dmi-e2e-dmi-engine
+    image: ${COMPOSE_PROJECT_NAME:-dmi-e2e}-dmi-engine
     restart: on-failure
     environment:
       <<: *dmi-engine-env

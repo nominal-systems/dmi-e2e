@@ -4,6 +4,7 @@ import { composeDown } from './containers'
 import { stopDmiApi } from './dmi-api'
 import { env } from './env'
 import { buildIndex, publish } from './report/report'
+import { releaseSlot } from './slots'
 import { closePool } from './sql'
 
 /* Mirrors the declaration in global-setup.ts. Identical `var` declarations in the global scope
@@ -14,6 +15,17 @@ declare global {
 }
 
 export default async function globalTeardown (): Promise<void> {
+  try {
+    await teardown()
+  } finally {
+    /* Released even when teardown fails, and after the stack is down, so the next run in this slot
+     * never starts into containers still being removed. A kept-up stack outlives the lock; the
+     * adoption check in globalSetup covers that case. */
+    releaseSlot(env.slot)
+  }
+}
+
+async function teardown (): Promise<void> {
   const log = (message: string): void => console.log(`[harness] ${message}`)
 
   await closePool()

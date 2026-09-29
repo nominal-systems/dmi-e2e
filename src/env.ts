@@ -1,5 +1,6 @@
 import { existsSync } from 'fs'
 import * as path from 'path'
+import { applySlot } from './slots'
 import { resolveStack, stacks, suiteName } from './stacks'
 
 /* Harness configuration, resolved once from process.env against defaults that match
@@ -42,6 +43,13 @@ export interface HarnessEnv {
   /* Root of a dmi-api checkout. Only used for process orchestration. */
   dmiApiDir: string
   composeFile: string
+  /* The harness slot this run occupies (src/slots.js): 0 unless HARNESS_SLOT or a `.harness-slot`
+   * file in this checkout says otherwise. It moves every host port by +10 per slot and names the
+   * compose project, so runs in different slots share nothing. `slotSource` says where it came
+   * from ('HARNESS_SLOT', '.harness-slot' or 'default'). */
+  slot: number
+  slotSource: string
+  composeProject: string
   /* Host that published container ports are reachable on. A single knob (default 127.0.0.1) so the
    * suite can run against a remote docker host unchanged; the per-service *_HOST vars default to it. */
   host: string
@@ -67,8 +75,9 @@ export interface HarnessEnv {
   suite: string
   /* The sibling checkouts the selected full-system loop builds its containers from — as the stack
    * registry lists them, with the same DMI_*_DIR defaults docker-compose.yml uses. Only read to
-   * record what was under test in the run report. Empty for the fast suite. */
-  checkouts: Array<{ name: string, dir: string }>
+   * record what was under test in the run report. Empty for the fast suite. `fromVariable` names the
+   * DMI_*_DIR that put a checkout somewhere other than beside this one. */
+  checkouts: Array<{ name: string, dir: string, fromVariable?: string }>
   /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
    * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
    * suite that just ran into publishDir on teardown — the directory an nginx serves — and rebuilds
@@ -202,8 +211,23 @@ export interface HarnessEnv {
 }
 
 const harnessRoot = path.resolve(__dirname, '..')
+
+/* First, before any port is read: the slot writes its compose project name and every host port not
+ * already set into process.env, which is also what every `docker compose` the harness runs is
+ * handed — so the ports below and the ports the containers publish are the same numbers, read from
+ * one place. The defaults live in src/slots.js (and the registry, for the mocks). */
+const slot = applySlot(process.env, harnessRoot)
+
+/* A host port, as the slot left it. Every port variable is set by now, so there is no default to
+ * restate here; one missing means src/slots.js does not list a port this file reads. */
+function port (name: string): number {
+  const value = int(name, -1)
+  if (value < 0) throw new Error(`${name} is not a host port the slot table (src/slots.js) knows`)
+  return value
+}
+
 const host = str('HARNESS_HOST', '127.0.0.1')
-const appPort = int('HARNESS_APP_PORT', 3010)
+const appPort = port('HARNESS_APP_PORT')
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
 
 const fullStack = flag('HARNESS_FULL_STACK', false)
@@ -214,14 +238,15 @@ const stack = resolveStack(process.env.HARNESS_STACK)
  * below and the stack-agnostic readiness wait in containers.ts cannot disagree. */
 export function mockBaseUrlFor (stackName: StackName): string {
   const { mock } = stacks[stackName]
-  return str(mock.urlVariable, `http://${host}:${int(mock.portVariable, mock.defaultPort)}${mock.pathPrefix}`)
+  return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}${mock.pathPrefix}`)
 }
 
-function checkoutsUnderTest (): Array<{ name: string, dir: string }> {
+function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?: string }> {
   if (!fullStack) return []
   return stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
     name: repo,
     dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))),
+    ...(process.env[dirVariable] != null && process.env[dirVariable] !== '' ? { fromVariable: dirVariable } : {}),
   }))
 }
 
@@ -229,6 +254,9 @@ export const env: HarnessEnv = {
   harnessRoot,
   dmiApiDir: path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api'))),
   composeFile: path.join(harnessRoot, 'docker-compose.yml'),
+  slot: slot.slot,
+  slotSource: slot.source,
+  composeProject: slot.project,
   host,
   appPort,
   baseUrl: str('HARNESS_BASE_URL', `http://${host}:${appPort}`),
@@ -240,18 +268,18 @@ export const env: HarnessEnv = {
   jwtSecretKey: str('HARNESS_JWT_SECRET_KEY', 'harness-jwt-secret'),
   mysql: {
     host: str('HARNESS_MYSQL_HOST', host),
-    port: int('HARNESS_MYSQL_PORT', 3307),
+    port: port('HARNESS_MYSQL_PORT'),
     user: str('HARNESS_MYSQL_USER', 'root'),
     password: str('HARNESS_MYSQL_PASSWORD', 'harness'),
     database: str('HARNESS_MYSQL_DATABASE', 'dmi_harness'),
   },
   mongoUri: str(
     'HARNESS_MONGO_URI',
-    `mongodb://${host}:${int('HARNESS_MONGO_PORT', 27018)}/dmi_harness`,
+    `mongodb://${host}:${port('HARNESS_MONGO_PORT')}/dmi_harness`,
   ),
   activemq: {
     hostname: str('HARNESS_ACTIVEMQ_HOST', host),
-    port: int('HARNESS_ACTIVEMQ_PORT', 1884),
+    port: port('HARNESS_ACTIVEMQ_PORT'),
   },
   fullStack,
   stack,

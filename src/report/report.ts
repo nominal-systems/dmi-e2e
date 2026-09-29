@@ -31,6 +31,12 @@ export interface RunInfo {
   startedAt: string
   /* checkout name -> `git describe` (tag or sha, `-dirty` when it has local changes). */
   versions: Record<string, string>
+  /* The harness slot the run occupied and its compose project (src/slots.js), and checkout name ->
+   * the absolute path it was built from: with several checkouts of each repo on one machine, a
+   * version alone does not say which one ran. Absent in runs recorded before slots existed. */
+  slot?: number
+  composeProject?: string
+  locations?: Record<string, string>
 }
 
 export interface Failure {
@@ -128,6 +134,18 @@ export function versionsUnderTest (): Record<string, string> {
   return versions
 }
 
+/* checkout name -> where it was taken from: an absolute path, marked with the DMI_*_DIR that put
+ * it there when one did (rather than the layout beside this checkout). */
+export function locationsUnderTest (): Record<string, string> {
+  const locations: Record<string, string> = { 'dmi-e2e': env.harnessRoot }
+  const apiOverride = process.env.DMI_API_DIR != null && process.env.DMI_API_DIR !== ''
+  locations['dmi-api'] = env.manageApp ? `${env.dmiApiDir}${apiOverride ? ' (DMI_API_DIR)' : ''}` : `external, at ${env.baseUrl}`
+  for (const checkout of env.checkouts) {
+    locations[checkout.name] = `${checkout.dir}${checkout.fromVariable != null ? ` (${checkout.fromVariable})` : ''}`
+  }
+  return locations
+}
+
 export function suiteDir (root: string, suite: string): string {
   return path.join(root, suite)
 }
@@ -205,6 +223,9 @@ export function beginRun (): RunInfo {
     suite: env.suite,
     startedAt: new Date().toISOString(),
     versions: versionsUnderTest(),
+    slot: env.slot,
+    composeProject: env.composeProject,
+    locations: locationsUnderTest(),
   }
   writeJson(path.join(dir, 'run.json'), run)
   recordHistory(dir, run, undefined)
