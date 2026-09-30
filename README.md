@@ -238,16 +238,17 @@ The default suite is dmi-api alone under `NODE_ENV=seed`. `HARNESS_FULL_STACK=1`
 jest project that runs dmi-api under a **normal `NODE_ENV`** (so `createOrder` actually RPCs the
 engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS_STACK`:
 
-- **`idexx`** (default) — the Phase 0 loop. dmi-api + ActiveMQ + Redis + the **VetConnect Plus mock**
-  (`src/idexx-mock`, built from this repo) + the **real `dmi-engine-idexx-integration`** container,
-  behind the `idexx` compose profile. Runs `scenarios/idexx-full-stack.e2e.ts`.
-- **`antech-v3`** — the Phase 1 loop for **classic Antech**, API generation V3. dmi-api's provider id
+- **`idexx`** (default) — the loop for **IDEXX VetConnect Plus** (provider id `idexx`). dmi-api +
+  ActiveMQ + Redis + the **VetConnect Plus mock** (`src/idexx-mock`, built from this repo) + the
+  **real `dmi-engine-idexx-integration`** container, behind the `idexx` compose profile. Runs
+  `scenarios/idexx-full-stack.e2e.ts`.
+- **`antech-v3`** — the loop for **classic Antech**, API generation V3. dmi-api's provider id
   is the bare `antech` (it predates V6); the harness key carries the generation so nothing derived
   from it — files, env variables, the workflow's `paths:` glob — can be confused with the
   `antech-v6` loop's. dmi-api + ActiveMQ + Redis + the **antech-v3 mock** (`src/antech-v3-mock`,
   built from this repo) + the **real `dmi-engine-antech-integration`** container (the repo keeps its
   name), behind the `antech-v3` compose profile. Runs `scenarios/antech-v3-full-stack.e2e.ts`.
-- **`zoetis`** — the Phase 1 loop for **Zoetis VetSync v1** (provider id `zoetis`). dmi-api +
+- **`zoetis`** — the loop for **Zoetis VetSync v1** (provider id `zoetis`). dmi-api +
   ActiveMQ + Redis + the **Zoetis mock** (`src/zoetis-mock`, built from this repo) + the **real
   `dmi-engine-zoetis-integration`** container, behind the `zoetis` compose profile. Runs
   `scenarios/zoetis-full-stack.e2e.ts`.
@@ -682,7 +683,7 @@ marker and the comment above it. That is the only correct response.
 
 ## Full-system findings
 
-**The idexx loop closes.** Standing up the idexx loop (Phase 0) confirmed that
+**The idexx loop closes.** Standing up the idexx loop, the first provider loop, confirmed that
 `dmi-engine-idexx-integration` interoperates with the current dmi-api over the real MQTT transport:
 `POST /orders` RPCs the integration, which creates the order at the mock (and runs the confirmOrder
 browser handshake), and the integration's results poll pushes a seeded result back so dmi-api writes a
@@ -703,7 +704,7 @@ next integration:
   `$share/<group>/<topic>` subscriptions; ActiveMQ 5.x "classic" (the old harness broker) silently
   drops them, so the harness broker is `eclipse-mosquitto:2` (see "The MQTT broker" below).
 
-**The antech-v3 loop closes too** (Phase 1), confirming `dmi-engine-antech-integration` (the classic
+**The antech-v3 loop closes too**, confirming `dmi-engine-antech-integration` (the classic
 `antech` provider) interoperates with the current dmi-api the same way. What the second provider
 taught us, beyond the mechanics above:
 
@@ -739,7 +740,7 @@ taught us, beyond the mechanics above:
   batch was **acknowledged** as explicit positive evidence that the poll ran to completion rather than
   dying midway. Worth knowing before you debug this loop — and worth copying for the next provider.
 
-**The zoetis loop closes too** (Phase 1), making `dmi-engine-zoetis-integration` the third provider
+**The zoetis loop closes too**, making `dmi-engine-zoetis-integration` the third provider
 confirmed to interoperate with the current dmi-api. What the third provider taught us:
 
 - **Reconciliation has a third shape, not two.** idexx orders must *carry* a `pims:patient:id` and

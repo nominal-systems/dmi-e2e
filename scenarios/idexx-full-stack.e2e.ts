@@ -5,7 +5,7 @@ import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
-/* Phase 0 full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
+/* Full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
  * `dmi-engine-idexx-integration` container and a VetConnect Plus mock provider (src/idexx-mock). It
  * drives the whole loop as an integrator would — configure the idexx provider pointed at the mock,

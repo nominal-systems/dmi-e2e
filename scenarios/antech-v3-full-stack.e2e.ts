@@ -5,7 +5,7 @@ import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
-/* Phase 1 full-system gate for classic Antech, V3 (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3):
+/* Full-system gate for classic Antech, V3 (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
  * `dmi-engine-antech-integration` container (dmi-api provider id `antech` — it predates V6; the
  * harness key carries the generation) and the antech-v3 mock provider (src/antech-v3-mock).
