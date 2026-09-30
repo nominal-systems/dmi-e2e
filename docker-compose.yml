@@ -33,8 +33,6 @@
 #   - `wisdom-panel`: redis, the wisdom-panel mock (src/wisdom-panel-mock, zero deps), and the SAME
 #     two `dmi-engine` services as `antech-v6` — the Wisdom Panel integration is the other module
 #     that image carries — so the engine services list both profiles and each profile adds its mock.
-#   - `full-stack`: redis, the demo provider API + its own MySQL, and the demo provider integration
-#     (the pre-existing, upstream-blocked loop).
 # The integration images build from sibling checkouts and need a GHP_TOKEN build-arg to resolve
 # @nominal-systems/* from GitHub Packages; the mock needs no token.
 
@@ -74,110 +72,15 @@ services:
     ports:
       - '${HARNESS_ACTIVEMQ_PORT:-1884}:1883'
 
-  # ---- full-stack profile: the demo provider loop (order -> engine -> provider -> report) ----
+  # ---- shared by every full-system profile ----
 
   # Bull repeatable-job store for the integration's order/result polling. No harness-facing use.
-  # Shared by every full-system loop (demo, idexx, antech-v3, zoetis, antech-v6 and wisdom-panel).
+  # Shared by every full-system loop (idexx, antech-v3, zoetis, antech-v6 and wisdom-panel).
   redis:
     image: redis:7-alpine
-    profiles: ['full-stack', 'idexx', 'antech-v3', 'zoetis', 'antech-v6', 'wisdom-panel']
+    profiles: ['idexx', 'antech-v3', 'zoetis', 'antech-v6', 'wisdom-panel']
     ports:
       - '${HARNESS_REDIS_PORT:-6380}:6379'
-
-  # The demo provider's own database. DATABASE_SYNCHRONIZE=true lets the provider auto-create its schema
-  # on boot, so there is no migration step for it.
-  demo-provider-mysql:
-    image: mysql:8
-    profiles: ['full-stack']
-    environment:
-      MYSQL_ROOT_PASSWORD: ${HARNESS_DEMO_MYSQL_PASSWORD:-demo}
-      MYSQL_DATABASE: ${HARNESS_DEMO_MYSQL_DATABASE:-demo_provider}
-    ports:
-      - '${HARNESS_DEMO_MYSQL_PORT:-3308}:3306'
-    volumes:
-      - demo-provider-mysql-data:/var/lib/mysql
-    healthcheck:
-      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
-  # Simulated provider (NestJS + MySQL). X-Api-Key auth minted via GET /demo/keys; orders auto-complete
-  # ~6s after creation. Built from its own Node-14 Dockerfile (production stage).
-  dmi-demo-provider-api:
-    profiles: ['full-stack']
-    build:
-      context: ${DMI_DEMO_PROVIDER_DIR:-../dmi-demo-provider-api}
-      target: production
-      args:
-        GHP_TOKEN: ${GHP_TOKEN:-}
-    environment:
-      PORT: '3000'
-      DATABASE_TYPE: mysql
-      DATABASE_HOST: demo-provider-mysql
-      DATABASE_PORT: '3306'
-      DATABASE_USERNAME: root
-      DATABASE_PASSWORD: ${HARNESS_DEMO_MYSQL_PASSWORD:-demo}
-      DATABASE_DATABASE: ${HARNESS_DEMO_MYSQL_DATABASE:-demo_provider}
-      DATABASE_SYNCHRONIZE: 'true'
-    ports:
-      - '${HARNESS_DEMO_PROVIDER_PORT:-3011}:3000'
-    depends_on:
-      demo-provider-mysql:
-        condition: service_healthy
-
-  # Demo provider integration (standalone NestJS microservice, one container per provider, matching
-  # production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the provider over HTTP
-  # using the base URL carried inside each MQTT message (the provider configuration's `url`).
-  dmi-engine-demo-provider-integration:
-    profiles: ['full-stack']
-    build:
-      context: ${DMI_DEMO_INTEGRATION_DIR:-../dmi-engine-demo-provider-integration}
-      target: production
-      args:
-        GHP_TOKEN: ${GHP_TOKEN:-}
-      # Builds the demo integration from its own (Node-14-era) sources. Its in-repo Dockerfile needs a
-      # small adjustment to build under current tooling, so we mirror it here (the repo itself stays
-      # untouched / read-only) rather than reference its Dockerfile. The image is included so the full
-      # topology stands up and the gate can be exercised; the end-to-end loop is gated pending an
-      # upstream fix to the demo integration (see README "Full-system mode"). Unused stages and the
-      # runtime `wait-for` download are trimmed — the production CMD does not use them.
-      dockerfile_inline: |
-        FROM node:14-alpine AS base
-        WORKDIR /app
-        ARG GHP_TOKEN
-        COPY package*.json .npmrc ./
-        RUN apk add --no-cache --virtual build-base &&\
-            npm install -g node-gyp &&\
-            npm install &&\
-            apk del build-base &&\
-            npm un -g node-gyp &&\
-            rm -rf /var/cache/apk/*
-        COPY . .
-        RUN chmod +x ./scripts/wait-for-all.sh && rm .npmrc
-        FROM base AS build
-        ENV NODE_ENV=production
-        RUN npm run build && npm prune --production
-        FROM node:14-alpine AS production
-        WORKDIR /app
-        ENV NODE_ENV=production
-        COPY --from=build /app/scripts scripts
-        COPY --from=build /app/dist dist
-        COPY --from=build /app/node_modules node_modules
-        COPY --from=build /app/package.json .
-        EXPOSE 3000
-        CMD ["npm", "run", "start:prod"]
-    environment:
-      PORT: '3000'
-      MQTT_PROTOCOL: mqtt
-      MQTT_HOST: activemq
-      MQTT_PORT: '1883'
-      REDIS_HOST: redis
-      REDIS_PORT: '6379'
-    depends_on:
-      - activemq
-      - redis
-      - dmi-demo-provider-api
 
   # ---- idexx profile: the VetConnect Plus loop (order -> engine -> mock provider -> report) ----
 
@@ -205,9 +108,9 @@ services:
   # The REAL idexx provider integration (standalone NestJS microservice, one container per provider,
   # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
   # provider over HTTP using the orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the
-  # provider configuration). Built from its own (Node-20) Dockerfile's `production` stage — unlike
-  # the demo repo it needs no inline workaround. The polling intervals are dialed down from the
-  # 30s default so the results loop closes quickly in the harness.
+  # provider configuration). Built from its own (Node-20) Dockerfile's `production` stage, as the
+  # repo ships it. The polling intervals are dialed down from the 30s default so the results loop
+  # closes quickly in the harness.
   dmi-engine-idexx-integration:
     profiles: ['idexx']
     build:
@@ -257,8 +160,7 @@ services:
   # every generation-agnostic sense, only the harness's loop key says `-v3`. Needs only ActiveMQ
   # (MQTT) + Redis (Bull); no database. Reaches the mock provider over HTTP using the baseUrl
   # carried inside each MQTT message (the provider configuration). Built from its own (Node-20)
-  # Dockerfile's `production` stage — like idexx, and unlike the demo repo, it needs no inline
-  # workaround.
+  # Dockerfile's `production` stage, as the repo ships it — like idexx.
   #
   # Note there is no polling-interval env var to set here: the antech integration hardcodes both its
   # results and orders Bull intervals to 30s (src/config/configuration.ts), where idexx exposes
@@ -482,8 +384,8 @@ services:
   # The REAL zoetis provider integration (standalone NestJS microservice, one container per provider,
   # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
   # provider over HTTP using the baseUrl carried inside each MQTT message (the provider configuration).
-  # Built from its own (Node-20) Dockerfile's `production` stage — like idexx and antech, and unlike
-  # the demo repo, it needs no inline workaround.
+  # Built from its own (Node-20) Dockerfile's `production` stage, as the repo ships it — like idexx
+  # and antech.
   #
   # `target: production` is deliberate and matches the idexx/antech-v3 profiles: it is the stage that
   # runs the built service. The Dockerfile offers other stages that are not the deployable one.
@@ -517,4 +419,3 @@ services:
 volumes:
   mysql-data:
   mongo-data:
-  demo-provider-mysql-data:

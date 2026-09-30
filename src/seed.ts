@@ -14,9 +14,11 @@ import { HARNESS_USER_PASSWORD, insertUser } from './sql'
  * two tenants means two users. Every name is suffixed uniquely, so repeated runs against a warm
  * database never collide. */
 
-/* The demo lab is never contacted: dmi-api runs under NODE_ENV=seed, which returns from
- * createOrder before the engine round-trip. `.invalid` is reserved by RFC 2606 and guarantees a
- * DNS failure rather than a surprise request if that ever stops being true. */
+/* The fast suite's provider is dmi-api's own `demo` provider, which dmi-api's migrations seed (a
+ * `url` configuration option, an `apiKey` integration option). Its lab is never contacted: dmi-api
+ * runs under NODE_ENV=seed, which returns from createOrder before the engine round-trip. `.invalid`
+ * is reserved by RFC 2606 and guarantees a DNS failure rather than a surprise request if that ever
+ * stops being true. */
 const DEMO_LAB_URL = 'http://demo-lab.invalid'
 
 export interface SeededOrg {
@@ -44,15 +46,6 @@ function unique (label: string): string {
   return `${label}-${randomUUID().slice(0, 8)}`
 }
 
-/* Mint an X-Api-Key from the demo provider (GET /demo/keys). Full-stack mode hands this to the
- * integration as its credential so it authenticates to the provider as itself; the fast suite never
- * calls this (its provider URL is unreachable by design). */
-export async function mintDemoKey (): Promise<string> {
-  const demo = ApiClient.create(env.demoProvider.baseUrl)
-  const created = expectOk<{ key: string }>(await demo.get('/keys'), 'mint demo provider API key')
-  return created.key
-}
-
 /* Mint an admin JWT via POST /auth/admin/login (admin/admin by default). dmi-api's AdminGuard uses
  * the `admin-jwt` strategy, which only verifies the signature against JWT_SECRET_KEY and does no
  * role check, so this token authorizes the admin routes. The full-stack idexx scenario needs it to
@@ -73,14 +66,12 @@ export interface SeedOrgOptions {
   /* Provider id in the POST /providers/:id/configurations path. Default 'demo'. */
   providerId?: string
   /* The `configuration` body posted to POST /providers/:id/configurations. Defaults to the demo
-   * provider's `{ url }` shape (see providerUrl); idexx passes
-   * `{ orderingBaseUrl, resultBaseUrl, 'X-Pims-Id', 'X-Pims-Version' }`. */
+   * provider's `{ url }` shape, pointed at the unreachable DEMO_LAB_URL — fast mode never contacts
+   * the provider; idexx passes `{ orderingBaseUrl, resultBaseUrl, 'X-Pims-Id', 'X-Pims-Version' }`. */
   configuration?: Record<string, unknown>
-  /* Convenience for the default demo `{ url }` configuration. Ignored when `configuration` is given.
-   * Default is an unreachable .invalid host — fast mode never contacts the provider. */
-  providerUrl?: string
-  /* integrationOptions merged into the create-integration body. Default is a dummy apiKey; full-stack
-   * modes pass real credentials (a demo provider key, or idexx username/password/locale). */
+  /* integrationOptions merged into the create-integration body. Default is a dummy apiKey for the
+   * demo provider; each full-stack loop passes its own provider's options (idexx's
+   * username/password/locale, for example). */
   integrationOptions?: Record<string, unknown>
 }
 
@@ -92,8 +83,7 @@ export async function seedOrganization (
   const suffix = unique(label)
   const email = `harness-${suffix}@example.test`
   const providerId = options.providerId ?? 'demo'
-  const providerUrl = options.providerUrl ?? DEMO_LAB_URL
-  const configuration = options.configuration ?? { url: providerUrl }
+  const configuration = options.configuration ?? { url: DEMO_LAB_URL }
   const integrationOptions = options.integrationOptions ?? { apiKey: `demo-key-${suffix}` }
 
   /* F6: dmi-api's POST /users is broken (see sql.insertUser). Insert the user row directly; the
