@@ -683,7 +683,7 @@ marker and the comment above it. That is the only correct response.
 
 ## Full-system findings
 
-**The idexx loop closes.** Standing up the idexx loop, the first provider loop, confirmed that
+**The idexx loop closes.** Standing up the idexx loop, the first to close, confirmed that
 `dmi-engine-idexx-integration` interoperates with the current dmi-api over the real MQTT transport:
 `POST /orders` RPCs the integration, which creates the order at the mock (and runs the confirmOrder
 browser handshake), and the integration's results poll pushes a seeded result back so dmi-api writes a
