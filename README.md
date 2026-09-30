@@ -793,7 +793,7 @@ test guide, otherwise as a **pre-order draft** (dmi `WAITING_FOR_INPUT`, with a 
 a human to finish in Antech's UI) → the `worker` engine process polls: orders (`GetStatus`, then a
 per-order result status and a requisition form unless every test is in-house, acknowledged by
 clinic accession id) and results (`GetAllResults`, emitted then acknowledged by lab accession id on
-the irregular `labAccessionsIds` key) → dmi-api writes the report. 30 tests, four of them
+the irregular `labAccessionsIds` key) → dmi-api writes the report. 31 tests, four of them
 `it.failing` tripwires. What the fourth provider taught us:
 
 - **The engine's two roles really are two halves.** The `api` process takes the integration
