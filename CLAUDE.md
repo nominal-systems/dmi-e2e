@@ -179,8 +179,9 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 - **Provider PRs stay provider-only.** Cross-cutting changes (shared `src/`, another provider's
   scenario or workflow) go in their own PR so provider branches rebase cleanly.
 - **Keep a running log in the PR description** — Progress, Corrections (where dmi-api or the
-  integration differed from expectation), Deviations (+ why), Blockers, Findings (SUSPECTED /
-  CONFIRMED, with evidence).
+  integration differed from expectation), Deviations (+ why), Blockers, Findings (SUSPECTED = read
+  from source, not exercised; CONFIRMED = reproduced by this suite against a running system; with
+  evidence either way).
 - **Defects found in private integration repos get no specifics here — and don't file them
   yourself.** Surface them to the human running the session, in a clearly separated section of your
   output; the human decides where (and whether) each gets tracked. In this repo, at most a neutral

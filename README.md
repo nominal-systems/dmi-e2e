@@ -25,10 +25,12 @@ could have. Those defects are fixed now, and the tests that caught them stay on 
 
 It imports **nothing** from dmi-api. It talks to a running server over HTTP, and — for setup and
 assertions that no HTTP route exposes — to MySQL directly via `mysql2`. That boundary is the whole
-point: the harness must survive dmi-api refactors and stay reusable as a conformance suite. The one
-setup step that could go over HTTP and does not is user creation: `POST /users` answers 500, because
-dmi-api never registers the HTTP Basic auth that guards it (F6, see "Tripwires"), so the seeder
-inserts each user over SQL and does everything after that, from login to orders, over real HTTP.
+point: the harness must survive dmi-api refactors and stay reusable as a conformance suite. Two
+setup steps could go over HTTP and do not, each because the route that exists for it is broken and
+pinned by a tripwire (see "Tripwires"): the shared seeder inserts each user over SQL, because
+`POST /users` answers 500 (F6), and the two engine loops insert their provider's reference data,
+because `POST /admin/refs/sync/<provider>` stores nothing. Everything after that, from login to
+orders, is real HTTP.
 
 ## Requirements
 
@@ -528,7 +530,7 @@ Six GitHub Actions workflows run the suites: `e2e.yml` the fast suite, and one w
 (`e2e-idexx.yml`, `e2e-antech-v3.yml`, `e2e-zoetis.yml`, `e2e-antech-v6.yml`,
 `e2e-wisdom-panel.yml`). Each loop has a workflow of its own because it needs a `paths:` filter, and
 those are per workflow, not per job — a filter in `e2e.yml` would gate the fast suite too. Each
-workflow's header comment carries its reasoning.
+loop workflow's header comment carries its reasoning.
 
 - **Push to `main`**: every workflow, always.
 - **Pull request**: the fast suite always. A loop only when the harness or a mock (`src/`), compose,
@@ -660,17 +662,15 @@ scripts/
   nightly-install.sh          create the nightly tree, render + load (or --uninstall) the LaunchAgent
   slot-tree.sh                create (or --remove, --list) a slot's tree of worktrees, so parallel slots also test separate code
 scenarios/
-  smoke.e2e.ts                the stack is really up and really wired; two tripwires (POST /users, F6)
+  smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
-  zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end;
-                              one tripwire (test cancel)
-  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end;
-                              four tripwires (ref sync, orders-channel status, status-poll audit, unmapped patient)
+  zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
+  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
-                              end to end; four tripwires (ref sync, empty ideal weight, orders-poll audit,
-                              re-authentication)
+                              end to end
+                              (which scenarios carry `it.failing` tripwires, and for what: the table under "Tripwires")
 ```
 
 ## Tripwires
@@ -689,8 +689,9 @@ guards.
 
 If any scenario fails with *"Failing test passed even though it was supposed to fail"*, that is a
 tripwire firing: the defect underneath it was fixed. Delete the `.failing` marker, make the comment
-above the test say what it now guards, and take its row out of the table below. That is the only
-correct response. A plain test that goes red is the same case in reverse — something the suite
+above the test say what it now guards, move the test out of the scenario's tripwires block where
+the scenario keeps one, and take its row out of the table below. That is the only correct
+response. A plain test that goes red is the same case in reverse — something the suite
 guards has broken — and the fix belongs where the break is, not in the assertion.
 
 ### Open tripwires on `main`
@@ -707,4 +708,4 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 | wisdom-panel | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | As in the antech-v6 loop: dmi-api's defect, not the provider's | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | wisdom-panel | `a result whose ideal-weight section is empty yields no ideal-weight items` | No ideal-weight panel. Today three DONE items with no value | [dmi-engine-wisdom-panel-integration#46](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/46) |
 | wisdom-panel | `a provider error on the orders poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none, as in the antech-v6 loop | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
-| wisdom-panel | `the integration re-authenticates when the provider stops accepting its token` | A new token after a 401. Today the token is cached for ten days and never refreshed, so a credential rotated at the provider fails every call until the cache expires | not yet filed |
+| wisdom-panel | `the integration re-authenticates when the provider stops accepting its token` | A new token after a 401. Today the token is cached for ten days and never refreshed, so a credential rotated at the provider fails every call until the cache expires | no open issue |

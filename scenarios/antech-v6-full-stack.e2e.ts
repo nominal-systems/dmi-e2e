@@ -31,7 +31,7 @@ import { closePool, query } from '../src/sql'
  *
  * 3. ONLY THE RESULTS CHANNEL CAN COMPLETE AN ORDER TODAY, and that is not a property of this
  *    harness — it is a defect in the integration, pinned by a tripwire at the bottom of this file
- *    and not yet filed upstream. `OrderStatus` is a STRING on
+ *    and filed as nominal-systems/dmi-engine-antech-v6-integration#84. `OrderStatus` is a STRING on
  *    the wire (`"Submitted"`, `"Received"`, `"Final"`, …) while the integration's status enum is a
  *    bare numeric one, so its `mapOrderStatus` switch never matches a wire value and every polled
  *    status falls to its default, dmi SUBMITTED. The orders channel can therefore move an order
