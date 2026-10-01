@@ -1,7 +1,7 @@
 # Working in dmi-e2e
 
 Guidance for AI-assisted sessions in this repo. [README.md](README.md) documents the harness itself —
-how to run it, every environment variable, the findings it has produced. This file is about how to
+how to run it, every environment variable, the tripwires it carries. This file is about how to
 **change** this repo without degrading the gate. The rules below were each learned the hard way; the
 short version is that this suite's only product is a trustworthy red.
 
@@ -26,6 +26,11 @@ green; the assertions were decorative. So:
   codes, units, numbers, reference-range bounds, and the identity chain report → order → patient.
 - **Know the wire-value traps:** dmi-api persists enum *wire* values (`'H'`, not `'HIGH'`), and a
   deleted in-range interpretation serialises as `null`, not `undefined`.
+- **A defect the suite finds gets a tripwire.** Write the test for the *correct* behaviour, mark it
+  `it.failing`, and state in its comment what it expects, what happens today and why. Pair it with
+  a passing test that proves the path is live, because `it.failing` cannot tell "still broken" from
+  "never ran". Give it a row in the README's tripwire table. When the fix lands, delete the marker
+  in the companion commit, keep the test as a regression guard, and take its row out of the table.
 - **Never "fix" a red build by relaxing an assertion.** See the README's section of the same name —
   reds here are usually the suite doing its job.
 
@@ -45,9 +50,22 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   integration's error mapper actually reads (e.g. an envelope keyed `errorCode` where the mock said
   `code` leaves the mapper's real branch unexercised — the test stays red-capable but proves less
   than it claims). After wiring a rejection, trigger it once and read the surfaced HTTP error:
-  "goes red" is not the same as "surfaces correctly".
+  "goes red" is not the same as "surfaces correctly". One provider can speak several error dialects
+  (its feeds, its write endpoints and its token grant may each differ) and can enforce request
+  headers strictly. Emit each envelope where the integration meets it, and enforce the provider's
+  content negotiation, so a client-side tidy-up such as an explicit `Accept` goes red here rather
+  than in production.
 - **Model the provider's acknowledge semantics** (results persist until acked, then stop). A mock that
-  serves results unconditionally forever leaves the integration's ack path untested.
+  serves results unconditionally forever leaves the integration's ack path untested. Those semantics
+  differ per provider: the status an ack answers with, what a duplicate ack returns, whether an
+  acked item leaves the feed or is only filtered from it, and whether the order and result channels
+  are independent. Establish them for each provider, and never inherit them from another loop's
+  mock.
+- **Where a poll can fail without a trace, assert its acknowledgement.** Some integrations catch and
+  swallow poll errors, so a poll that died midway looks exactly like a healthy one that found
+  nothing. Assert that the mock saw each acknowledge channel, as positive evidence the poll ran to
+  completion, and check the mock's response shapes against the mapper's accessors up front, because
+  iterating against the running stack gives no feedback.
 - **Use real provider catalogue codes** (test mnemonics) in the mock's catalogue, and **enforce it** —
   an invented code that both mock and scenario agree on is evidence about the author, not the
   provider.
@@ -72,7 +90,10 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   with the canonical ref code (look it up by name over `GET /refs/*` — `lookupRefCode()` in
   `src/refs.ts`; dmi's codes are opaque UUIDs), assert the **provider's** vocabulary arrived at the
   mock, and make sure the two strings differ. Which fields are mapped at all varies: check the
-  provider's `provider_ref` rows, not just its reference endpoints.
+  provider's `provider_ref` rows, not just its reference endpoints. Where the integration
+  substitutes a default for a value it does not recognise, place orders whose correct mapping
+  differs from that default, so a completely broken mapping goes red naming the default instead of
+  delivering the right value by accident.
 - **Watch element multiplicity in XML dialects.** Where an integration calls `.find`/`.filter`/`.map`
   on a parsed collection without normalising, a one-element response deserialises to an object and
   throws. Grep the mapper and service for that before deciding how many of each element to emit. Then
