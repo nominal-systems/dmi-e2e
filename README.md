@@ -18,12 +18,17 @@ different from everything else that carries the name:
 
 **`dmi-e2e` is the platform's only real-services suite.** It runs the actual dmi-api process
 against actual MySQL/Mongo/ActiveMQ containers and asserts on real HTTP responses. Nothing here is
-mocked. It is the first true integration layer the platform has had, which is also why it is the
-thing that surfaced the tenant-isolation findings below — no mocked suite could have.
+mocked. It is the first true integration layer the platform has had, which is also why it was the
+first to catch dmi-api letting one organization read and write another's data — no mocked suite
+could have. Those defects are fixed now, and the tests that caught them stay on as guards (see
+"Tripwires").
 
 It imports **nothing** from dmi-api. It talks to a running server over HTTP, and — for setup and
 assertions that no HTTP route exposes — to MySQL directly via `mysql2`. That boundary is the whole
-point: the harness must survive dmi-api refactors and stay reusable as a conformance suite.
+point: the harness must survive dmi-api refactors and stay reusable as a conformance suite. The one
+setup step that could go over HTTP and does not is user creation: `POST /users` answers 500, because
+dmi-api never registers the HTTP Basic auth that guards it (F6, see "Tripwires"), so the seeder
+inserts each user over SQL and does everything after that, from login to orders, over real HTTP.
 
 ## Requirements
 
@@ -54,7 +59,8 @@ That does the whole thing from a clean state:
    regression-tests that dmi-api's migrations produce a working schema from empty.
 4. `npm run build` in the checkout, then spawn `node dist/main` and poll `/health` until every
    dependency reports up.
-5. Run the scenarios.
+5. Run the scenarios, one file at a time (`maxWorkers: 1`): they share one database, one event
+   stream and one `seq` counter, and must not race.
 6. Stop dmi-api and `docker compose down -v`.
 
 Faster iteration:
@@ -66,6 +72,14 @@ HARNESS_BUILD=0   npm run test:harness   # skip `npm run build` in the checkout
 # drive a dmi-api you are already running yourself; the harness touches no checkout:
 HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:harness
 ```
+
+**Full-system re-runs with `HARNESS_KEEP_UP=1`.** A loop's integration (see "Full-system mode"
+below) polls its mock through Bull jobs kept in Redis, and Redis outlives a kept-up run, so a stale
+job from an earlier run could race a later run for its results. Each loop's scenario stops the
+integration it started in `afterAll`, which removes its jobs. If a run is interrupted before that,
+`docker compose --profile <loop> down -v` clears Redis (outside a slot tree, in slot n add
+`-p dmi-e2e-s<n>`; see "Parallel runs — slots" below). A run without `HARNESS_KEEP_UP` tears Redis
+down every time, so it is never affected.
 
 ### Parallel runs — slots
 
@@ -314,7 +328,8 @@ the order at the mock and runs IDEXX's confirmOrder browser handshake against it
 results poll picks up a result the scenario seeds at the mock → dmi-api writes a `FINAL` report with
 test results and moves the order to `COMPLETED`, and `/events` shows the `order:*`/`report:*`
 sequence. The harness talks **only to the mock**, never to live `*.vetconnectplus.com`, so runs are
-deterministic, need no credentials, and place no real orders. See "The VetConnect Plus mock" below.
+deterministic, need no credentials, and place no real orders. See "The idexx mock (VetConnect Plus)"
+below.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -344,7 +359,8 @@ touches a live Zoetis host. What differs from the other two:
   ack one at a time by POSTing to an `href` the order-status document itself advertises.
 - **Its species and sex really are ref-mapped**, which made it the first loop where the scenario could
   assert dmi-api's ref mapping end to end; the antech and idexx loops now do the same for species, sex
-  and breed. See "Full-system findings".
+  and breed. Why it takes a value assertion: the *Ref-mapped fields need value assertions* rule in
+  [CLAUDE.md](CLAUDE.md).
 
 ### The idexx mock (VetConnect Plus)
 
@@ -506,6 +522,25 @@ Full-system services (behind a compose profile — only the selected loop's port
 | wisdom-panel mock  | 3016    | `wisdom-panel` | the simulated Wisdom Panel provider; tests drive its `/__control__` plane. Same two `dmi-engine` containers, no port |
 | Redis              | 6380    | all         | the integration's Bull queues |
 
+### CI
+
+Six GitHub Actions workflows run the suites: `e2e.yml` the fast suite, and one workflow per loop
+(`e2e-idexx.yml`, `e2e-antech-v3.yml`, `e2e-zoetis.yml`, `e2e-antech-v6.yml`,
+`e2e-wisdom-panel.yml`). Each loop has a workflow of its own because it needs a `paths:` filter, and
+those are per workflow, not per job — a filter in `e2e.yml` would gate the fast suite too. Each
+workflow's header comment carries its reasoning.
+
+- **Push to `main`**: every workflow, always.
+- **Pull request**: the fast suite always. A loop only when the harness or a mock (`src/`), compose,
+  the jest or TypeScript config, the dependencies, its own workflow or that loop's scenario changes:
+  a docs or tenant-isolation edit should not pay for ~7 containers per provider. A loop also skips a
+  pull request from a **fork**, which cannot read the org secrets it needs.
+- **Nightly** (`schedule:`): every workflow, at 03:17 UTC — wisdom-panel at 03:37, twenty minutes
+  after antech-v6, which builds the same engine image. dmi-api and the integrations are checked out
+  at `main` and move without a pull request here to trigger a run, so the nightly is what surfaces
+  their drift within a day.
+- **On demand**: `workflow_dispatch`, every workflow.
+
 ## Environment
 
 Every variable has a working default; the table exists so CI and debugging are not guesswork. Port
@@ -625,273 +660,51 @@ scripts/
   nightly-install.sh          create the nightly tree, render + load (or --uninstall) the LaunchAgent
   slot-tree.sh                create (or --remove, --list) a slot's tree of worktrees, so parallel slots also test separate code
 scenarios/
-  smoke.e2e.ts                the stack is really up and really wired
-  tenant-isolation.e2e.ts     the point of this suite
+  smoke.e2e.ts                the stack is really up and really wired; two tripwires (POST /users, F6)
+  tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
-  zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
-  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end, four tripwires red by design
-  wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes end to end, four tripwires red by design
+  zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end;
+                              one tripwire (test cancel)
+  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end;
+                              four tripwires (ref sync, orders-channel status, status-poll audit, unmapped patient)
+  wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
+                              end to end; four tripwires (ref sync, empty ideal weight, orders-poll audit,
+                              re-authentication)
 ```
 
-## Findings
+## Tripwires
 
-Tenant isolation was the first scenario this harness exercised — not the reason it exists (it is a
-general-purpose real-services suite for the platform). That first pass immediately turned up six
-distinct places where dmi-api's isolation or auth is missing. **None are fixed here** — that is out
-of scope, and they want a considered fix plus a data-exposure review, not a drive-by patch.
-
-Each finding has a test that asserts the *correct* behaviour. While the defect is open the test is
-marked `it.failing`: that keeps CI green while the defect exists, and turns the test red the moment
-someone fixes it — at which point the `.failing` marker is deleted in the same commit and the test
-stays on as a plain regression guard. F2–F5 have reached that stage (dmi-api #361).
-
-| # | Route | Defect | Observed | Status |
-|---|---|---|---|---|
-| F1 | `GET /events` | `getEventsForOrganization` takes an `organization` and never reads it. Returns **every tenant's** events. | org B → **200**, sees org A's events; counts identical | **CONFIRMED** |
-| F2 | `GET /reports/*` | `ReportsController` had **no guard**, and there is no global guard. Was reachable **unauthenticated**. | anon → **200** | **FIXED** in dmi-api #361; guarded |
-| F3 | `GET /reports/:id` | `getReport(id, _organization)` ignored the organization (had a `TODO` admitting it). | org B → **200** | **FIXED** in dmi-api #361; guarded |
-| F4 | `POST /orders`, `POST /integrations`, `PUT /providers/:id/configurations/:id` | None took an `@Organization()`; referenced IDs were never checked for ownership. Cross-tenant **writes**. | org B → **201 Created** / **200** | **FIXED** in dmi-api #361; guarded |
-| F5 | `GET /orders/:id/report` | `getOrderReport(organization, orderId)` ignored the organization. | org B → **200** | **FIXED** in dmi-api #361; guarded |
-| F6 | `POST /users`, `GET /users` | HTTP Basic auth is unregistered: `BasicStrategy` is in no module's `providers`, so Passport has no `basic` strategy. | any → **500** "Unknown authentication strategy 'basic'" | **CONFIRMED** |
-
-**SUSPECTED** = read from dmi-api source. **CONFIRMED** = reproduced by this suite against a running
-app. **FIXED** = closed upstream, and the test now runs as a plain guard that fails if the defect
-returns. All six were CONFIRMED end-to-end against a live dmi-api with the status codes above; the
-`HARNESS_IMPLEMENTATION_PLAN.md` log records the full probe output. F1 and F6 remain open.
-
-F1 is the most serious: `GET /events` is reachable with any valid API key, and `event.data` for an
-`order:created` event embeds the whole order — patient name, client name, veterinarian. F2 needs no
-credentials at all, though report IDs are UUIDv4 and so are not enumerable. F4 compounds: on
-success, org B binds its own practice to org A's provider configuration.
-
-F6 is a functional break rather than a data leak, but it blocks the documented user-provisioning
-flow entirely. Because of it, the seeder cannot create users over HTTP; it inserts each user row via
-`sql.ts` (a constant `argon2id` password hash) and then runs the rest of the quickstart — login,
-org, keys, provider config, practice, integration, order — over real HTTP. Only user creation is
-faked.
-
-Correctly scoped, and asserted as ordinary passing tests: `GET /orders/:id` (org B → **403**, *not*
-404), `GET /orders/:id/result.json` (**403**), and all of `/orders`, `/practices`, `/integrations`,
-`/providers/configurations`, `/organizations/:id/keys`.
+When this suite finds a defect that is still open, the test asserts the *correct* behaviour and is
+marked `it.failing`. That keeps CI green while the defect exists and turns the test red the moment
+it is fixed. The fix's companion commit here deletes the marker, the test stays on as a plain
+regression guard, and its row leaves the table below. Each tripwire's comment says what it expects,
+what happens today and why, so a fix can be matched to it. The tenant-isolation suite is the worked
+example: every defect it found has been fixed upstream
+([dmi-api#347](https://github.com/nominal-systems/dmi-api/pull/347),
+[dmi-api#361](https://github.com/nominal-systems/dmi-api/pull/361)), and all its tests are now
+guards.
 
 ### Do not "fix" a red build by relaxing an assertion
 
-If a test in `tenant-isolation.e2e.ts` fails with *"Failing test passed even though it was supposed
-to fail"*, that is the tripwire firing: the underlying defect was fixed. Delete the `.failing`
-marker and the comment above it. That is the only correct response.
+If any scenario fails with *"Failing test passed even though it was supposed to fail"*, that is a
+tripwire firing: the defect underneath it was fixed. Delete the `.failing` marker, make the comment
+above the test say what it now guards, and take its row out of the table below. That is the only
+correct response. A plain test that goes red is the same case in reverse — something the suite
+guards has broken — and the fix belongs where the break is, not in the assertion.
 
-## Full-system findings
+### Open tripwires on `main`
 
-**The idexx loop closes.** Standing up the idexx loop, the first to close, confirmed that
-`dmi-engine-idexx-integration` interoperates with the current dmi-api over the real MQTT transport:
-`POST /orders` RPCs the integration, which creates the order at the mock (and runs the confirmOrder
-browser handshake), and the integration's results poll pushes a seeded result back so dmi-api writes a
-`FINAL` report and moves the order to `COMPLETED`. Two dmi-api mechanics are worth recording for the
-next integration:
-
-- **Creating an integration does not start its polling.** `POST /integrations` leaves it `NEW`;
-  polling begins only after `POST /admin/integrations/:id/start` (which emits the engine's
-  `integration/create` event and moves the integration to `RUNNING`). The harness gets an admin JWT
-  from `POST /auth/admin/login`.
-- **Results correlate to an order by its `externalId`** (the provider order id the create RPC returned),
-  and dmi-api completes the order only when the result's PIMS patient id matches the order's — so the
-  order carries a `pims:patient:id` and the mock echoes it back in the result. Without one, the result
-  lands as a duplicate orphan order and the original stays `SUBMITTED` — a dmi-api reconciliation bug
-  tracked as [nominal-systems/dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334);
-  the `pims:patient:id` is the workaround until it lands.
-- **The broker must speak MQTT 5.0 shared subscriptions.** The engine transport uses
-  `$share/<group>/<topic>` subscriptions; ActiveMQ 5.x "classic" (the old harness broker) silently
-  drops them, so the harness broker is `eclipse-mosquitto:2` (see "The MQTT broker" below).
-
-**The antech-v3 loop closes too**, confirming `dmi-engine-antech-integration` (the classic
-`antech` provider) interoperates with the current dmi-api the same way. What the second provider
-taught us, beyond the mechanics above:
-
-- **The `pims:patient:id` workaround is provider-specific — and inverts for antech.** dmi-api's
-  reconciliation guard (`ProviderResultUtils.isMatchingOrder`) compares `pims:patient:id` across the
-  order it holds and the order the integration extracts from a result, and rejects the match when only
-  one side carries one. The antech result mapper tags the patient it extracts with its **own**
-  `antech:pet:id` system, never the PIMS one — so an antech order carrying a `pims:patient:id` can
-  *never* be reconciled by its own results (dmi-api logs `Skipping order update ... patient/client
-  mismatch` and the order sits at `SUBMITTED`). The antech-v3 scenario therefore deliberately places its
-  order **without** a patient identifier, which leaves both sides without one — a state the guard
-  treats as compatible — and falls back to matching on patient name + client last name. This is the
-  exact opposite of the idexx scenario, which must *supply* one. The generalisable lesson: whether a
-  provider needs the identifier depends on which identifier system *its* result mapper emits, so check
-  the mapper before copying either scenario.
-- **Two ids are in play and must agree.** The integration assigns the **raw body** of
-  `External/OrderPlacement` as the order's `externalId`, but results are correlated by
-  `ClinicAccessionID` — so a provider whose placement response is anything other than the
-  ClinicAccessionID would strand every result as an orphan. The mock echoes the requisition id back,
-  which is the only self-consistent reading of the contract.
-- **A mock that defaults is a mock that agrees with you.** The first cut of the antech-v3 mock filled in
-  `PetName`/`ClientLastName`/test-code when an order omitted them — with exactly the values the
-  scenario then asserted. That made the order-forwarding test unfalsifiable, and because dmi-api
-  reconciles results on patient name + client last name, the fabricated values kept completion, the
-  report and `/events` green too: an integration that stopped forwarding the patient would have
-  shipped a permanently green gate. The mocks now validate required fields and reject unknown test
-  codes. Worth checking in any provider mock: **for each field the scenario asserts, ask what happens if
-  the integration stops sending it.** If the answer isn't "the test fails", the assertion is decorative.
-- **A failing antech results poll is silent**, so shape errors in the mock are invisible from outside:
-  a healthy poll and a fatally broken one look identical, with no log output either way. The mock's
-  response shapes were therefore verified directly against the mapper's accessors (and `xmlbuilder2`'s
-  object format) rather than by iterating against the running stack, and the scenario asserts the
-  batch was **acknowledged** as explicit positive evidence that the poll ran to completion rather than
-  dying midway. Worth knowing before you debug this loop — and worth copying for the next provider.
-
-**The zoetis loop closes too**, making `dmi-engine-zoetis-integration` the third provider
-confirmed to interoperate with the current dmi-api. What the third provider taught us:
-
-- **Reconciliation has a third shape, not two.** idexx orders must *carry* a `pims:patient:id` and
-  antech orders must *omit* one — but both are workarounds for the same guard,
-  `ProviderResultUtils.isMatchingOrder`. Zoetis never reaches that guard at all: its result mapper
-  attaches no `.order` to a result, so results always take dmi-api's `externalId` path.
-  Reconciliation is purely `PracticeRef == client_order_id == externalId == requisitionId`, and the
-  patient identifier is a free choice. The generalisable lesson is stronger than "check the mapper's
-  identifier system": **check first whether the provider's results reach the guard at all.**
-- **Ref mapping was never actually exercised until this loop.** dmi-api maps an order's
-  species/sex/breed from its canonical refs to provider codes (`RefsService.mapPatientRefs`) before
-  handing the order to the engine, and nothing in the earlier scenarios asserted the result — they
-  place orders with `species: 'DOG'`, `sex: 'MALE'`, `breed: 'LABRADOR'`, **none of which is a dmi ref
-  code**, so the mapping silently no-ops and the raw strings are forwarded. A mapping that stopped
-  resolving would have changed nothing observable. The zoetis scenario closes that hole for its own
-  loop by placing the order with the canonical ref codes (looked up by name over `GET /refs/*`, since
-  dmi's codes are opaque UUIDs) and asserting the provider received the *zoetis* vocabulary — `DOG` and
-  `MALE_NEUTERED` — with the mock enforcing both. Input and expected output are deliberately
-  different strings, so a no-op mapping fails loudly. Verified: pointing the order at a species with
-  no zoetis mapping makes the mock reject placement with `'<uuid>' is not a Zoetis species code`.
-  The antech-v3 loop now does the same — and for **all three** fields, because antech maps breeds too
-  (numeric BreedIDs, from the ~1,100 dog-breed rows dmi-api's migrations seed): `Canis familiaris`,
-  `Male Sterilized`, `Labrador Retriever` in, `41` / `CM` / `130` at the mock, numeric ids as numbers.
-  The antech-v3 mock echoes these rather than validating them, so there the scenario assertion is the
-  whole guard: with an unmapped species the raw dmi code reaches the mock and the assertion names it.
-  The idexx loop asserts **all three** as well, because idexx maps breeds too (upper-case
-  mnemonics, from the ~1,100 dog-breed rows dmi-api's migrations seed): `Canis familiaris`,
-  `Male Sterilized`, `Labrador Retriever` in, `CANINE` / `MALE_NEUTERED` / `LABRADOR_RETRIEVER` at the
-  mock. The idexx mock echoes these rather than validating them, so there the scenario assertion is
-  the whole guard: with an unmapped ref the raw dmi code reaches the mock and the assertion names it.
-- **Zoetis breeds cannot be ref-mapped at all.** dmi-api seeds 1307 zoetis breed `provider_ref` rows
-  and **every one has a NULL `code`** (the other three providers have none) — consistent with the
-  integration's `getBreeds` being a no-op, since Zoetis publishes no breed catalogue. So a breed that
-  *does* resolve maps to null and is dropped from the order; only an unresolvable string survives.
-  The scenario therefore sends a plain descriptive breed and asserts forwarding, not mapping.
-- **Multiplicity is this dialect's version of Antech's CDATA sensitivity.** Wherever an integration
-  consumes a parsed XML collection as an array, a one-element response is a different shape — the
-  object formats return an object, not a one-element array. Worth grepping for in the next provider
-  before deciding how many of each element its mock should emit.
-- **Its failing polls are silent too**, exactly as antech's are, so the scenario asserts **both**
-  acknowledge channels as positive evidence that each poll ran to completion rather than dying midway
-  — including that the *orders* ack happened at `COMPLETED`, which can only be true if a full
-  poll → fetch → emit → ack cycle ran after the result landed.
-
-**The antech-v6 loop closes too — and it is the first loop through the engine process itself.**
-`POST /orders` → dmi-api RPCs `antech-v6/orders/create` to the `api` engine process → the
-integration logs in to the mock and places the order: at `/LabOrders/v6/Order` when auto-submit was
-asked for, the integration option allows it and every code is point-of-care per the provider's own
-test guide, otherwise as a **pre-order draft** (dmi `WAITING_FOR_INPUT`, with a `submissionUri` for
-a human to finish in Antech's UI) → the `worker` engine process polls: orders (`GetStatus`, then a
-per-order result status and a requisition form unless every test is in-house, acknowledged by
-clinic accession id) and results (`GetAllResults`, emitted then acknowledged by lab accession id on
-the irregular `labAccessionsIds` key) → dmi-api writes the report. 31 tests, four of them
-`it.failing` tripwires. What the fourth provider taught us:
-
-- **The engine's two roles really are two halves.** The `api` process takes the integration
-  create and schedules the repeatable jobs; the `worker` process runs them. An order is placed by
-  one process and polled by the other, through Redis, and the loop closes — which a single
-  `all`-role container would have proved nothing about.
-- **Only the results channel can complete an order today.** The provider sends `OrderStatus` as a
-  string; the integration's status enum is numeric, so every polled status reaches dmi as
-  SUBMITTED. The mock serves the strings on purpose — integers would make the mapping appear to
-  work — and every completion assertion rests on the report reaching FINAL. Tripwire.
-- **A provider error on a status poll leaves no audit record.** The integration's logging
-  interceptor throws on the error body before emitting anything, so the provider's own explanation
-  is discarded. Tripwire, observable through `GET /admin/external-requests`.
-- **A fully unmapped patient's order is refused by the provider.** The integration substitutes a
-  default species and a default breed independently, and the pair is invalid at Antech; the mock
-  refuses it from the same species tree. Tripwire, paired with the assertion that the refusal's
-  wording reaches the operator through the one envelope the error mapper surfaces.
-- **Ref data is seeded the operator's way — almost.** dmi-api ships no antech-v6 provider refs. The
-  scenario reads the provider's species, breeds and sexes *through the engine* (the same RPC the
-  admin sync uses) and maps three canonical refs over the admin API, then asserts `41` / `130` /
-  `CM` arrived at the mock. The admin sync route itself answers 400 and stores nothing, for every
-  provider, so the rows are inserted from what the engine returned; a fourth tripwire pins the
-  route. The cause: the route's upsert passes the loaded Provider entity — decorated with two
-  computed properties — as a TypeORM relation condition, and TypeORM refuses the query
-  (`Property "integrationOptions" was not found in "Provider"`). Not yet filed upstream.
-- **A pre-order is a draft the engine cannot see** — it is in none of the status views and has no
-  requisition form (a 500, as live) — so the mock's control plane models the clinic completing it,
-  and the promoted order is the one place the orders channel moves a dmi order (to SUBMITTED).
-- **Deliberately not modelled:** the status feed's sub-minute visibility window and its retention,
-  both observed live and both a timing race against the engine's default 60 s poll that the
-  harness cannot make deterministic (it dials the poll to 3 s); and re-notification on status
-  change, observed *not* to happen.
-
-**The wisdom-panel loop closes too — through the same engine, under a second profile.**
-`POST /orders` (a `labRequisitionInfo.KitCode`, the one requisition parameter dmi-api declares
-for this provider) → dmi-api RPCs `wisdom-panel/orders/create` to the `api` engine process → the
-integration takes an OAuth2 token and ACTIVATES the kit at `/api/voyager/pet` (the order's
-`requisitionId` comes back overwritten by the kit code, its `externalId` is the kit's id, its
-manifest the requisition form) → the `worker` process polls two JSON:API feeds scoped by hospital
-number: kits (acknowledged by kit id) and result-sets (each resolved to its kit from `included`,
-then the simplified genetic result and the vet-report PDF fetched per set, emitted, acknowledged
-by result-set id) → dmi-api writes the report. 36 tests, four of them `it.failing` tripwires.
-What the fifth provider taught us:
-
-- **An `included` that is omitted, not empty, is the whole orders channel.** JSON:API leaves the
-  key out when nothing in the page carries the relationship — an empty page, and a page of
-  shipped-but-unused kits, which have no pet. The integration dereferences it unguarded, so the
-  second page is a `TypeError`; the mock omits the key exactly as the live server does, and an
-  active test pins that page shape. (It is not a tripwire: any kit that would become an order has
-  a pet, and its presence restores `included`, so the crash cannot be shown through dmi-api.)
-- **One vendor, three error dialects, and a strict content negotiator.** JSON:API `errors[]` on
-  the feeds, `{message}` on the voyager endpoints, RFC 6749 on the token grant; and a bare
-  `Accept: application/json` is a 406 — the integration passes only because axios's default
-  contains `*/*`. The mock enforces all of it, so a tidy-up is a red build here rather than an
-  outage.
-- **Acknowledge is a filter, not a delete; both channels answer 201; a duplicate is an idempotent
-  201.** Copying the zoetis mock's 409 would have been fiction — assertion strength does not
-  transfer between loops.
-- **The ideal-weight section can be an empty object**, on a sizeable minority of real kits, and the
-  mapper turns it into three DONE observations with no value. Tripwire.
-- **A single failed PDF used to discard the whole results batch**, and since nothing was
-  acknowledged the same batch failed every tick — the provider's PDF generator does fail on a
-  sizeable minority of real kits. Fixed upstream in the integration, which now fetches each result
-  set on its own. The test is now a plain regression guard that also checks the failing set is
-  retried and left unacknowledged while the healthy one completes, with its positive twin (clear
-  the failure, both complete), and a variant for the production shape behind the fix — a 404
-  while a released kit's report is not generated yet (status observed in production, body from the development endpoint's no-report answer), asked for
-  once per poll with no retry inside the request, and delivered once the report appears.
-- **The token is cached for ten days and never refreshed on a 401**, so a rotated credential fails
-  every call for up to ten days. Tripwire — measured at the grant endpoint, because the results
-  path throws a plain `Error` that never reaches dmi-api as a provider error.
-- **Ref mapping is the only transformation on the way out, and the integration defaults silently**
-  (`dog` / `male` for anything it does not recognise). Every order is therefore a cat and a female,
-  placed with canonical codes; a broken mapping goes red naming `dog` or `male`. There are no
-  breeds at all.
-- **The provider's "services" are its unactivated kits**, so the mock enforces its inventory as a
-  catalogue and depletes it on activation — and, uniquely, every kit code is invented, because a
-  kit code names one physical kit rather than an assay.
-
-## Known gaps
-
-- **The full-stack CI jobs are scoped, not universal.** Each provider loop lives in its own workflow
-  (`.github/workflows/e2e-idexx.yml`, `e2e-antech-v3.yml`, `e2e-zoetis.yml`, `e2e-antech-v6.yml`, `e2e-wisdom-panel.yml`) because each needs a
-  `paths:` filter and those are per-workflow, not per-job. They run: on **push to `main`** always; on a **pull request** only
-  when the harness, the mock, compose or that loop's scenario changes (a docs or tenant-isolation edit
-  shouldn't pay for ~7 containers per provider — this matters more as the fan-out grows); and on
-  demand via `workflow_dispatch`. They skip on **fork** PRs, which cannot read the org secrets they
-  need. The fast `harness` job in `e2e.yml` still runs on every PR.
-- **The antech-v3 and zoetis loops are slow by construction.** Both integrations hardcode their two Bull
-  poll intervals to 30s with no env knob (idexx exposes `IDEXX_*_POLLING_INTERVAL_MS`, which the
-  harness dials down to ~3s), so those scenarios wait whole intervals for a result. Making the
-  interval env-configurable would be a small change in each integration repo and would cut this
-  suite's runtime substantially — a possible team follow-up, out of scope here (both repos are
-  read-only).
-- **Full-stack re-runs with `HARNESS_KEEP_UP=1`.** The integration polls the shared mock via Bull jobs
-  kept in the (persisted) Redis, so a stale job from a prior run could race a later run for its
-  results. Each loop's scenario avoids this by stopping the integration it started in `afterAll` (removing
-  its jobs); if a run is interrupted before that, `docker compose --profile <loop> down -v` clears
-  Redis (outside a slot tree, in slot n add `-p dmi-e2e-s<n>`). A normal (non-KEEP_UP) run tears Redis down every time, so it is never affected.
-- **No wire-format snapshots** yet (a follow-up).
-- **`maxWorkers: 1`.** One database, one event stream, one `seq` counter. Scenarios must not race.
+| Suite | Test | Correct behaviour — and today | Tracked in |
+|---|---|---|---|
+| fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP (F6) | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause (F6) | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| zoetis | `the dmi order's local test list shrinks to the remaining code` | Cancelling one test removes it from the dmi order's test list. Today the provider-side cancel happens, but dmi-api appends the cancelled test to the order's list instead of removing it | not yet filed |
+| antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
+| antech-v6 | `the orders channel completes an order whose provider status has reached Final` | COMPLETED. Today it stays SUBMITTED: the integration's status enum is numeric and the provider sends strings, so every completion assertion in the loop rests on the results channel | [dmi-engine-antech-v6-integration#84](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/84) |
+| antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
+| antech-v6 | `an order for a patient with no species OR breed mapping is still placeable` | The order is placed. Today the provider refuses it: the integration's default species and default breed are not a valid pair | [dmi-engine-antech-v6-integration#88](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/88) |
+| wisdom-panel | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | As in the antech-v6 loop: dmi-api's defect, not the provider's | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
+| wisdom-panel | `a result whose ideal-weight section is empty yields no ideal-weight items` | No ideal-weight panel. Today three DONE items with no value | [dmi-engine-wisdom-panel-integration#46](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/46) |
+| wisdom-panel | `a provider error on the orders poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none, as in the antech-v6 loop | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
+| wisdom-panel | `the integration re-authenticates when the provider stops accepting its token` | A new token after a 401. Today the token is cached for ten days and never refreshed, so a credential rotated at the provider fails every call until the cache expires | not yet filed |
