@@ -50,7 +50,6 @@ const stacks = {
       urlVariable: 'HARNESS_IDEXX_MOCK_URL',
       portVariable: 'HARNESS_IDEXX_MOCK_PORT',
       defaultPort: 3012,
-      pathPrefix: '',
     },
     /* idexx exposes IDEXX_*_POLLING_INTERVAL_MS, which the harness dials down to ~3s. */
     slowPoll: false,
@@ -68,7 +67,6 @@ const stacks = {
       urlVariable: 'HARNESS_ANTECH_V3_MOCK_URL',
       portVariable: 'HARNESS_ANTECH_V3_MOCK_PORT',
       defaultPort: 3013,
-      pathPrefix: '',
     },
     /* The integration hardcodes its Bull poll interval to 30s with no env knob: a result can sit
      * for a full tick before the engine picks it up, so the per-test budget absorbs a missed one
@@ -85,7 +83,6 @@ const stacks = {
       urlVariable: 'HARNESS_ZOETIS_MOCK_URL',
       portVariable: 'HARNESS_ZOETIS_MOCK_PORT',
       defaultPort: 3014,
-      pathPrefix: '',
     },
     /* Hardcoded 30s poll, as antech-v3. */
     slowPoll: true,
@@ -110,7 +107,6 @@ const stacks = {
       urlVariable: 'HARNESS_ANTECH_V6_MOCK_URL',
       portVariable: 'HARNESS_ANTECH_V6_MOCK_PORT',
       defaultPort: 3015,
-      pathPrefix: '',
     },
     /* ANTECH_V6_POLLING_INTERVAL_MS is env-configurable; the compose profile dials it to ~3s. */
     slowPoll: false,
@@ -136,29 +132,9 @@ const stacks = {
       urlVariable: 'HARNESS_WISDOM_PANEL_MOCK_URL',
       portVariable: 'HARNESS_WISDOM_PANEL_MOCK_PORT',
       defaultPort: 3016,
-      pathPrefix: '',
     },
     /* WISDOM_PANEL_POLLING_INTERVAL_MS is env-configurable (the engine's default is 10 minutes);
      * the compose profile dials it to ~3s. */
-    slowPoll: false,
-  },
-  demo: {
-    providerId: 'demo',
-    scenario: 'scenarios/full-stack-smoke.e2e.ts',
-    composeProfile: 'full-stack',
-    checkouts: [{
-      repo: 'dmi-engine-demo-provider-integration',
-      dirVariable: 'DMI_DEMO_INTEGRATION_DIR',
-    }],
-    /* Not a mock but the demo provider itself (dmi-demo-provider-api), under its `/demo` global
-     * prefix. The harness mints an API key from it during seeding, so it must be up first. */
-    mock: {
-      label: 'demo-provider-api',
-      urlVariable: 'HARNESS_DEMO_PROVIDER_URL',
-      portVariable: 'HARNESS_DEMO_PROVIDER_PORT',
-      defaultPort: 3011,
-      pathPrefix: '/demo',
-    },
     slowPoll: false,
   },
 }
@@ -193,8 +169,9 @@ function suiteName (fullStack, stack) {
  * exist is jest's generic "No tests found"; a compose profile nobody declares boots MySQL, Mongo
  * and ActiveMQ alone and surfaces as a readiness timeout naming the mock; a scenario renamed out
  * of its workflow's `paths:` glob keeps every check green while the workflow silently stops
- * triggering. jest.config.js runs this at load, so every run — local or CI — trips on a bad entry
- * before anything is built. `node src/stacks.js check` runs it by hand. */
+ * triggering, and a loop with no workflow at all is simply never run by CI. jest.config.js runs
+ * this at load, so every run — local or CI — trips on a bad entry before anything is built.
+ * `node src/stacks.js check` runs it by hand. */
 function verifyStacks () {
   const root = path.resolve(__dirname, '..')
   const problems = []
@@ -238,14 +215,17 @@ function verifyStacks () {
       if (typeof entry.mock?.[field] !== 'string' || entry.mock[field] === '') fail(key, `mock.${field}`, 'missing')
     }
     if (!Number.isInteger(entry.mock?.defaultPort)) fail(key, 'mock.defaultPort', 'must be an integer')
-    if (typeof entry.mock?.pathPrefix !== 'string') fail(key, 'mock.pathPrefix', "must be a string ('' for none)")
     if (typeof entry.slowPoll !== 'boolean') fail(key, 'slowPoll', 'must be a boolean')
 
-    /* A loop with its own workflow must keep its scenario inside the workflow's `paths:` glob —
-     * the glob is `scenarios/<key>*.e2e.ts` by convention, so the scenario must start with the
-     * key. A loop without a workflow (demo, dispatch-only) is exempt. */
+    /* Every loop runs in CI from its own workflow, `.github/workflows/e2e-<key>.yml` (its own
+     * because `paths:` filters are per workflow), and must keep its scenario inside that
+     * workflow's `paths:` glob — the glob is `scenarios/<key>*.e2e.ts` by convention, so the
+     * scenario must start with the key. A loop without a workflow is refused: the harness would
+     * run it locally, and CI would never run it, with nothing to say so. */
     const workflow = path.join(root, '.github', 'workflows', `e2e-${key}.yml`)
-    if (fs.existsSync(workflow)) {
+    if (!fs.existsSync(workflow)) {
+      fail(key, 'workflow', `no .github/workflows/e2e-${key}.yml — every loop needs its own workflow, or CI never runs it`)
+    } else {
       const text = fs.readFileSync(workflow, 'utf8')
       const glob = `scenarios/${key}*.e2e.ts`
       if (!text.includes(`'${glob}'`)) fail(key, 'workflow', `e2e-${key}.yml does not filter on '${glob}'`)

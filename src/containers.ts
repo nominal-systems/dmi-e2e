@@ -148,9 +148,10 @@ export async function assertProjectIsOurs (): Promise<void> {
 }
 
 export async function composeUp (): Promise<void> {
-  /* `--build` in full-stack mode: the two integration/provider images are built from their own
-   * (Node-14-era) Dockerfiles, which need a GHP_TOKEN build-arg to reach GitHub Packages. Layer
-   * caching keeps rebuilds cheap after the first. Give the first cold build a generous budget. */
+  /* `--build` in full-stack mode: the loop's mock is built from this repo, and its integration (or
+   * the engine that hosts it) from sibling checkouts, a build that needs a GHP_TOKEN build-arg to
+   * reach GitHub Packages. Layer caching keeps rebuilds cheap after the first. Give the first cold
+   * build a generous budget. */
   const args = [...composeBaseArgs(), 'up', '-d']
   if (env.fullStack) args.push('--build')
   await run('docker', args, {
@@ -165,9 +166,9 @@ export async function composeDown (removeVolumes: boolean): Promise<void> {
   await run('docker', args, { cwd: env.harnessRoot, timeoutMs: 120_000 })
 }
 
-/* Poll an HTTP endpoint until it answers 2xx. Used for the demo provider API, whose port opens
- * only after its NestJS app has connected to its own MySQL (TypeORM is in the module graph), so a
- * 2xx from /status means "really ready", not merely "port bound". */
+/* Poll an HTTP endpoint until it answers 2xx. Used for the selected loop's mock, whose /status
+ * answers only once its server is listening, so a 2xx means "really ready", not merely "port
+ * published". */
 async function waitForHttpOk (url: string, label: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown
@@ -185,10 +186,8 @@ async function waitForHttpOk (url: string, label: string, timeoutMs: number): Pr
 }
 
 /* Polled rather than slept: generous readiness timeouts, no fixed sleeps. MySQL is the slow one —
- * mysql:8 bounces the server once during first-boot initialisation. In full-stack mode the demo
- * provider is added: the harness mints an API key from it during seeding, so it must be up first.
- * (Redis and the demo integration have no harness-facing endpoint; the broker/queue clients inside
- * the integration reconnect on their own, and the scenario's completion wait absorbs their start.) */
+ * mysql:8 bounces the server once during first-boot initialisation. In full-stack mode the loop's
+ * mock is added, as below. */
 export async function waitForDependencies (): Promise<void> {
   const { depsReadyMs } = env.timeouts
   const mongo = new URL(env.mongoUri)
@@ -197,9 +196,8 @@ export async function waitForDependencies (): Promise<void> {
   await waitForTcp(mongo.hostname, Number(mongo.port !== '' ? mongo.port : 27017), 'Mongo', depsReadyMs)
   await waitForTcp(env.activemq.hostname, env.activemq.port, 'ActiveMQ', depsReadyMs)
   if (env.fullStack) {
-    /* The provider the harness talks to during seeding must be up first: the mock-backed modes drive
-     * the mock's control plane, and its /status opens only once the mock is listening; demo mode
-     * mints an API key from the demo provider. Redis and the integration containers have no
+    /* The mock must be up first: the scenario drives its control plane, and its /status opens only
+     * once the mock is listening. Redis and the integration or engine containers have no
      * harness-facing endpoint — their broker/queue clients reconnect on their own and the scenario's
      * completion wait absorbs their start. */
     const { mock } = stacks[env.stack]

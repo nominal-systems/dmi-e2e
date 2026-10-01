@@ -6,15 +6,10 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      run_full_stack:
-        description: 'Attempt the demo full-stack harness job (blocked upstream; see full-stack job)'
-        type: boolean
-        default: false
   # Nightly: the fast suite runs dmi-api (checked out at main) against real MySQL/Mongo/ActiveMQ and
   # regression-tests its migrations and the tenant-isolation guards — dmi-api moves on its own, so
-  # this surfaces a main that broke without a dmi-e2e PR to trigger it. The demo full-stack job stays
-  # gated to workflow_dispatch, so the nightly runs the fast suite only.
+  # this surfaces a main that broke without a dmi-e2e PR to trigger it. Each full-system loop has a
+  # nightly of its own, in its own workflow.
   schedule:
     - cron: '17 3 * * *'  # 03:17 UTC; off the hour, where GitHub's scheduler is least backed up
 
@@ -104,31 +99,7 @@ jobs:
         working-directory: dmi-e2e
         run: docker compose logs --no-color --tail=200
 
-  # Full-system suite (HARNESS_FULL_STACK=1): dmi-api + redis + demo-provider-api + demo integration.
-  # Intentionally DISABLED. Phase 0's demo scenario is blocked upstream (the demo integration on
-  # `main` is not compatible with the current dmi-api, so the order->result->report loop cannot
-  # close). There is nothing for this job to run green yet, so it does not check out or build the demo
-  # repos, and the `dmi-ci` app is not provisioned on them. It runs only on a manual dispatch with
-  # run_full_stack=true, and only prints the checklist to enable it.
-  full-stack:
-    name: Full-stack harness (disabled — blocked upstream)
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_full_stack }}
-    steps:
-      - name: Explain why this job is disabled, and how to enable it
-        run: |
-          echo "Full-stack CI is disabled: the Phase 0 demo scenario is blocked upstream."
-          echo "The demo integration must first be made compatible with the current dmi-api."
-          echo "Enabling this job is a follow-up bundled with that upstream fix:"
-          echo "  1) Install the dmi-ci GitHub App on nominal-systems/dmi-demo-provider-api and"
-          echo "     nominal-systems/dmi-engine-demo-provider-integration, with Packages: read."
-          echo "  2) Add both repos to the create-github-app-token 'repositories:' list."
-          echo "  3) Check out both repos, then 'docker compose --profile full-stack build' with"
-          echo "     GHP_TOKEN from the app token (GitHub Packages read), as the fast job does for dmi-api."
-          echo "  4) Run 'npm run test:harness' with HARNESS_FULL_STACK=1 HARNESS_STACK=demo and DMI_API_DIR set."
-          echo "  5) Un-skip the completion suite in scenarios/full-stack-smoke.e2e.ts and delete the"
-          echo "     CONFIRMED test."
-
-  # The idexx full-stack suite lives in its own workflow (.github/workflows/e2e-idexx.yml): it needs a
-  # `paths:` filter on pull_request, and those filters are per-workflow — applying one here would also
-  # gate the fast `harness` job above, which must run on every PR.
+  # Each full-system loop lives in its own workflow (.github/workflows/e2e-<key>.yml, one per key of
+  # the stack registry in src/stacks.js, which refuses a loop without one): it needs a `paths:` filter
+  # on pull_request, and those filters are per-workflow — applying one here would also gate the fast
+  # `harness` job above, which must run on every PR.

@@ -41,9 +41,10 @@ const path = require('path')
 const { stacks } = require('./stacks')
 /* eslint-enable @typescript-eslint/no-var-requires */
 
-/* Ports move in steps of ten. The 30xx group (dmi-api and the mocks) is 3010–3016 today, so a new
- * mock takes the next free port below 3020; verifySlots() refuses a table where any two ports meet
- * in any pair of slots up to MAX_SLOT, which is what "the step is wide enough" actually means. */
+/* Ports move in steps of ten. The 30xx group (dmi-api and the mocks) uses 3010 and 3012–3016
+ * today, so a new mock takes a free port below 3020; verifySlots() refuses a table where any two
+ * ports meet in any pair of slots up to MAX_SLOT, which is what "the step is wide enough" actually
+ * means. */
 const STRIDE = 10
 const MAX_SLOT = 99
 const BASE_PROJECT = 'dmi-e2e'
@@ -58,7 +59,6 @@ const basePorts = [
   { variable: 'HARNESS_MONGO_PORT', defaultPort: 27018, label: 'Mongo' },
   { variable: 'HARNESS_ACTIVEMQ_PORT', defaultPort: 1884, label: 'MQTT broker' },
   { variable: 'HARNESS_REDIS_PORT', defaultPort: 6380, label: 'Redis' },
-  { variable: 'HARNESS_DEMO_MYSQL_PORT', defaultPort: 3308, label: 'demo-provider MySQL' },
 ]
 
 /* The whole table: the base ports, then one per registry mock. */

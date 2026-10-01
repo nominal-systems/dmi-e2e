@@ -85,8 +85,8 @@ module.exports = {
     }],
     ['<rootDir>/src/report/summary-reporter.js', { outputDir: reportDir }],
   ],
-  /* Fast scenarios are quick; the full loop is ~6s provider auto-complete + up to 10s poll + boot
-   * slack. Individual full-stack tests set tighter per-test timeouts where they wait on the engine.
+  /* Fast scenarios are quick; a full-stack test waits on the engine's polls, plus boot slack.
+   * Individual full-stack tests set tighter per-test timeouts where they wait on the engine.
    * A loop whose integration hardcodes its poll interval (the registry's `slowPoll`) can leave a
    * result waiting a full tick, so its default budget absorbs a missed one. */
   testTimeout: fullStack ? (stacks[stack].slowPoll ? 240_000 : 120_000) : 60_000,

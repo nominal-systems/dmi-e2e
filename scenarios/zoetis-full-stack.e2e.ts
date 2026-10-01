@@ -5,7 +5,7 @@ import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
 
-/* Phase 1 full-system gate for Zoetis (HARNESS_FULL_STACK=1, HARNESS_STACK=zoetis): dmi-api under a
+/* Full-system gate for Zoetis (HARNESS_FULL_STACK=1, HARNESS_STACK=zoetis): dmi-api under a
  * NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine-zoetis-integration`
  * container (provider id `zoetis`) and a Zoetis mock provider (src/zoetis-mock). It drives the whole
  * loop as an integrator would — configure the zoetis provider pointed at the mock, create an

@@ -84,14 +84,6 @@ export interface HarnessEnv {
    * the index THERE over every suite it holds, so publishing one suite never hides another's latest
    * run. Off by default so a developer's run never writes outside the repo. */
   report: { dir: string, publish: boolean, publishDir: string }
-  demoProvider: {
-    /* Host-facing base URL (published port), used by the harness to mint an API key. Includes the
-     * demo-provider-api's `/demo` global prefix. */
-    baseUrl: string
-    /* Compose-network base URL the integration container uses to reach the provider. Stored verbatim
-     * in the dmi-api provider configuration, so it must resolve inside the compose network. */
-    internalUrl: string
-  }
   idexx: {
     /* Host-facing base URL of the VetConnect Plus mock (published port). Tests drive the mock's
      * control plane (/__control__/*) and readiness (/status) through this. */
@@ -238,7 +230,7 @@ const stack = resolveStack(process.env.HARNESS_STACK)
  * below and the stack-agnostic readiness wait in containers.ts cannot disagree. */
 export function mockBaseUrlFor (stackName: StackName): string {
   const { mock } = stacks[stackName]
-  return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}${mock.pathPrefix}`)
+  return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}`)
 }
 
 function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?: string }> {
@@ -290,10 +282,6 @@ export const env: HarnessEnv = {
     dir: path.resolve(str('HARNESS_REPORT_DIR', path.join(harnessRoot, 'reports'))),
     publish: flag('HARNESS_PUBLISH_REPORT', false),
     publishDir: path.resolve(str('HARNESS_REPORT_PUBLISH_DIR', '/opt/homebrew/var/www/dmi-e2e')),
-  },
-  demoProvider: {
-    baseUrl: mockBaseUrlFor('demo'),
-    internalUrl: str('HARNESS_DEMO_PROVIDER_INTERNAL_URL', 'http://dmi-demo-provider-api:3000/demo'),
   },
   idexx: {
     mockBaseUrl: mockBaseUrlFor('idexx'),
