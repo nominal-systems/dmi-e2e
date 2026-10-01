@@ -200,7 +200,7 @@ describe('tenant isolation', () => {
 
   /* Kept last: these mutate state on success, and on success they are the vulnerability. */
   describe('cross-tenant writes', () => {
-    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — orders.controller.ts `createOrder` takes no `@Organization()`, and
+    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #341) — orders.controller.ts `createOrder` takes no `@Organization()`, and
      * orders.service.ts resolves `createOrderDto.integrationId` with no ownership check. ApiGuard
      * authenticates the caller but nothing authorizes the integration being referenced. */
     it('POST /orders rejects org B targeting org A\'s integration', async () => {
@@ -209,7 +209,7 @@ describe('tenant isolation', () => {
       expect([403, 404]).toContain(response.status)
     })
 
-    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — integrations.controller.ts `createIntegration` likewise takes no
+    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #341) — integrations.controller.ts `createIntegration` likewise takes no
      * `@Organization()`; `providerConfigurationId` is never checked for ownership. On success,
      * org B has bound its own practice to org A's provider configuration — meaning org B's
      * subsequent orders would be placed against org A's lab account. */
@@ -223,7 +223,7 @@ describe('tenant isolation', () => {
       expect([403, 404]).toContain(response.status)
     })
 
-    /* Fixed in dmi-api #361 (issue #340) — regression guard. `PUT /providers/:providerId/
+    /* Fixed in dmi-api #361 (issue #341) — regression guard. `PUT /providers/:providerId/
      * configurations/:configId` overwrote ANY config's encrypted credentials and reassigned its
      * `organization` FK, with no ownership check — so org B, knowing org A's config id, could both
      * repoint org A's provider credentials and steal the config into its own org. The body is

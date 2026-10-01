@@ -51,8 +51,8 @@ describe('smoke', () => {
    * 500 "Unknown authentication strategy 'basic'" before any auth logic runs. A correct app
    * rejects an unauthenticated create with 401. This blocks the documented user-provisioning
    * flow; the seeder works around it with a direct SQL insert (see src/sql.ts). The existing
-   * dmi-api "e2e" specs stub the guard, which is why this went unnoticed. Remove `.failing`
-   * once Basic auth is registered. */
+   * dmi-api "e2e" specs stub the guard, which is why this went unnoticed. Tracked in
+   * nominal-systems/dmi-api#379; remove `.failing` once Basic auth is registered. */
   it.failing('rejects an unauthenticated POST /users', async () => {
     const response = await api.post('/users', { email: 'nobody@example.test', password: 'nope' })
     expect(response.status).toBe(401)
