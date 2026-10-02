@@ -279,6 +279,11 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
   let orderSeq = 0
 
+  /* Every integration this scenario creates, collected as each is made, so the credential scan at
+   * the bottom reads the request store of all of them — the foreign-clinic one included. */
+  const integrationIds: string[] = []
+  let foreignIntegrationId = ''
+
   /* A patient built on the harness's defaults, with the ref codes the mapping will transform and a
    * unique PIMS identifier per order.
    *
@@ -423,6 +428,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       },
     })
 
+    integrationIds.push(org.integrationId)
     admin = await adminLogin(root)
 
     /* Start the integration FIRST: the ref sync RPCs the engine, and the engine only answers for a
@@ -1003,7 +1009,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   })
 
   describe('the pre-order path: a reference-lab order is a draft until the clinic completes it', () => {
-    it('POST /orders pre-orders: WAITING_FOR_INPUT, with a submissionUri carrying a token the mock issued', async () => {
+    it('POST /orders pre-orders: WAITING_FOR_INPUT, with a submissionUri', async () => {
       /* A reference-lab code, so the integration's POC rule sends this down the pre-order path even
        * though auto-submit is requested and enabled. That is the whole reason the catalogue's flags
        * are load-bearing: the same request with a POC code becomes a real order. */
@@ -1021,30 +1027,14 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(created.externalId).toBe(draftRequisitionId)
 
       /* The submissionUri is string-built by the integration from the provider configuration's
-       * uiBaseUrl and the token the placement login returned. Pinning its exact shape matters
-       * because it is the only thing a human is given to finish the draft with — and because it
-       * carries a LIVE access token, which is worth being able to see change.
-       *
-       * The token half of this pin — from `const token` to the mock's confirmation below — pins a
-       * defect: https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/85. When
-       * the fix ships, that half is removed and the tripwire "the pre-order's submissionUri carries
-       * no token, …" at the bottom of this file loses its `.failing`, in the same change; the exact
-       * prefix check stays (ending at the ClinicAccessionID, if the fix drops the parameter rather
-       * than masking it). */
-      const expectedPrefix = `${env.antechV6.uiBaseUrl}/testGuide?ClinicAccessionID=${draftRequisitionId}&accessToken=`
-      expect(created.submissionUri.startsWith(expectedPrefix)).toBe(true)
-
-      const token = created.submissionUri.slice(expectedPrefix.length)
-      expect(token).not.toBe('')
-      /* Not merely "a non-empty string": the mock confirms it MINTED this token. That is what
-       * distinguishes a token that came out of a real login from one invented anywhere in the
-       * chain. */
-      const tokenState = expectOk<{ issued: boolean, userId: number | null }>(
-        await mock.get(`/__control__/tokens/${encodeURIComponent(token)}`),
-        'check the submissionUri token against the mock',
-      )
-      expect(tokenState.issued).toBe(true)
-      expect(tokenState.userId).toBeGreaterThan(0)
+       * uiBaseUrl, and it is the only thing a human is given to finish the draft with, so its
+       * identity is pinned exactly: the test guide, for this draft, and nothing after the
+       * ClinicAccessionID but further parameters. Whether one of those parameters is the engine's
+       * login token is the tripwire "the pre-order's submissionUri carries no token, …" at the
+       * bottom of this file — it is, today — so this test holds both before and after that fix. */
+      const identity = `${env.antechV6.uiBaseUrl}/testGuide?ClinicAccessionID=${draftRequisitionId}`
+      expect(created.submissionUri.slice(0, identity.length)).toBe(identity)
+      expect(created.submissionUri.slice(identity.length)).toMatch(/^(&|$)/)
 
       /* The mock recorded it at the PRE-ORDER endpoint, with the same ref-mapped patient — the
        * draft path forwards exactly what the order path does. */
@@ -1356,6 +1346,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         }),
         'create an integration for a clinic the account does not own',
       )
+      integrationIds.push(integration.id)
+      foreignIntegrationId = integration.id
 
       const payload = orderPayload(integration.id, {
         patient: patientFor(),
@@ -1720,42 +1712,40 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
    * The engine is handed the clinic's Antech password (integration options) and logs in for a token
    * — sent as an `accessToken` header on most calls, and in the query string of the test guide's.
    * Neither should outlive the request that used it, and after this loop has run its course both
-   * do, in three places: the pre-order's order record, dmi-api's provider request store and the
-   * engine containers' stdout. So this block reads them back, last, when the whole run's traffic is
-   * in them, and asserts no credential is there (src/secrets.ts: this loop's password, a token of
-   * the shape its mock mints, and the shapes any credential takes on the wire).
+   * do: in the pre-order's order record and its events, in dmi-api's provider request store, and
+   * in the engine containers' stdout. So this block reads them back, last, when the whole run's
+   * traffic is in them, and asserts no credential is there (src/secrets.ts: this loop's password, a
+   * token of the shape its mock mints, and the shapes any credential takes on the wire).
    *
-   * The pre-order's URI reaches the log too: the integration logs it once per pre-order
-   * ("Finalize it at: …"), token and all. That line is the URI's defect, not the logging's, so it
-   * is scanned with the order record and kept out of the log tripwire — or neither tripwire could
-   * flip until both fixes had shipped.
+   * The integration also logs the pre-order's link, token included. Those log lines are scanned
+   * with the order record rather than with the rest of the log, so that the link's tripwire and
+   * the log's each flip with their own fix.
    *
-   * One tripwire per place and issue, so each flips when its own fix ships, and one guard for the
-   * stored headers, bodies and payloads, which hold no credential in this loop today. An
-   * `it.failing` also passes when the test throws for any OTHER reason — the store answering
-   * nothing, the logs empty — so the inputs are proven first by plain tests of their own, and the
-   * scan logs what it found, since jest keeps a failing tripwire's message to itself. */
+   * One tripwire per place and issue, so each flips when its fix ships. An `it.failing` also passes
+   * when the test throws for any OTHER reason — the store answering nothing, the logs empty — so
+   * the inputs are proven first by plain tests of their own, and the scan logs what it found, since
+   * jest keeps a failing tripwire's message to itself. */
   describe('no credential leaves the stack', () => {
     let needles: SecretNeedle[] = []
-    let draft: OrderRecordRead = { orders: [], manifests: [], text: '' }
+    let draft: OrderRecordRead = { orders: [], manifests: [], events: [], text: '' }
     let store: RequestStoreRead = { records: [], details: [], urls: '', headers: '', bodies: '' }
     let logs = ''
-    /* The log split in two: the lines that print a pre-order's URI, and the rest. */
+    /* The log split in two: the lines that print a pre-order's link, and the rest. */
     let preOrderUriLogLines = ''
     let otherLogLines = ''
 
     beforeAll(async () => {
       needles = secretNeedles('antech-v6')
-      store = await readRequestStore(admin, { provider: 'antech-v6', integrationId: org.integrationId })
+      store = await readRequestStore(admin, { provider: 'antech-v6', integrationIds })
       logs = await composeLogs(stacks['antech-v6'].logServices)
       const preOrderUri = `${env.antechV6.uiBaseUrl}/testGuide?`
       const lines = logs.split('\n')
       preOrderUriLogLines = lines.filter((line) => line.includes(preOrderUri)).join('\n')
       otherLogLines = lines.filter((line) => !line.includes(preOrderUri)).join('\n')
-      /* The order record only: a pre-order has no requisition form of its own, and the one the
-       * promoted order was later given is fetched by the engine from the API host, without a token
-       * in its uri. Read only if the draft was placed, so that a run that never placed it fails
-       * the draft's precondition below rather than every test in this block. */
+      /* The order record and its events, not its manifest: a pre-order has no requisition form of
+       * its own, and the one the promoted order was later given is fetched from the API host, with
+       * no token in its uri. Read only if the draft was placed, so that a run that never placed it
+       * fails the draft's precondition below rather than every test in this block. */
       if (draftOrderId !== '') draft = await readOrderRecords(org.api, [draftOrderId], { manifests: false })
     }, 120_000)
 
@@ -1767,18 +1757,20 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(findSecrets('{"Password":"***","accessToken":"***"} /Tests/v6?accesstoken=***&userId=1', needles)).toEqual([])
     })
 
-    it('the pre-order\'s order record was read back, submissionUri included', () => {
+    it('the pre-order\'s order record and its events were read back, submissionUri included', () => {
       /* The positive twin of the submissionUri tripwire: the draft placed above, read back as the
-       * PIMS reads it, still carries the URI the integration built for it. */
+       * PIMS reads it, still carries the link the integration built for it, and its events were
+       * found. */
       expect(draft.orders).toHaveLength(1)
       expect(draft.orders[0].id).toBe(draftOrderId)
-      const prefix = `${env.antechV6.uiBaseUrl}/testGuide?ClinicAccessionID=${draftRequisitionId}`
-      expect(String(draft.orders[0].submissionUri).slice(0, prefix.length)).toBe(prefix)
+      const identity = `${env.antechV6.uiBaseUrl}/testGuide?ClinicAccessionID=${draftRequisitionId}`
+      expect(String(draft.orders[0].submissionUri).slice(0, identity.length)).toBe(identity)
+      expect(draft.events.map((event) => event.type)).toContain('order:created')
     })
 
     it('the request store holds this integration\'s traffic, and a record\'s detail carries its body and payload', () => {
-      /* The positive twin of the two store checks below: the point-of-care placement is in the
-       * store under this integration, and its detail came back with the request payload — the
+      /* The positive twin of the store tripwires: the point-of-care placement is in the store under
+       * this integration, and its detail came back with the request payload — the
        * ClinicAccessionID is in it — so the scan reads real records rather than an empty page. */
       expect(store.records.length).toBeGreaterThan(0)
       expect(store.details).toHaveLength(store.records.length)
@@ -1792,6 +1784,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(placement.body).toBeDefined()
     })
 
+    it('the request store was read for the foreign-clinic integration too', () => {
+      /* The precondition of the stored-bodies tripwire: the integration made to provoke a refused
+       * login is one this scenario created, and its records are among those read. */
+      expect(foreignIntegrationId).not.toBe('')
+      expect(store.records.filter((record) => record.integrationId === foreignIntegrationId).length).toBeGreaterThan(0)
+    })
+
     it('the engine containers\' logs were read, from both processes\' start', () => {
       /* The positive twin of the log tripwire. `Engine starting with role …` is the line the
        * engine's bootstrap always prints, once per process. */
@@ -1802,44 +1801,57 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       }
     })
 
-    it.failing('the pre-order\'s submissionUri carries no token, in the order record or the engine log', () => {
+    it.failing('the pre-order\'s submissionUri carries no token, in the order record, its events or the engine log', async () => {
       /* https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/85 — the
-       * integration builds `…/testGuide?ClinicAccessionID=…&accessToken=<the login token>`, and dmi
-       * stores it on the order; the integration also logs it. Flips when the token is dropped from
-       * the URI; the same change removes the token half of the pin in "POST /orders pre-orders"
-       * above. */
+       * integration writes its login token into the pre-order's link, which dmi stores on the order
+       * and in its events, and which the integration also logs. Flips when the link stops carrying
+       * the token. */
       if (draft.orders.length === 0) throw new Error('precondition: the draft order was not read back')
-      expectNoSecrets(`${draft.text}\n${preOrderUriLogLines}`, needles, `the pre-order's order record (${draftOrderId}) and the log lines that print its URI`)
+      /* A token in the link must be one the mock minted, so that a token invented anywhere in the
+       * chain is reported as that rather than as this defect. */
+      const token = new URL(String(draft.orders[0].submissionUri)).searchParams.get('accessToken')
+      if (token != null && token !== '' && !/^\*+$/.test(token)) {
+        const state = expectOk<{ issued: boolean }>(
+          await mock.get(`/__control__/tokens/${encodeURIComponent(token)}`),
+          'check the submissionUri token against the mock',
+        )
+        if (!state.issued) throw new Error('the submissionUri carries an accessToken the mock never issued — not the login token, something invented it')
+      }
+      expectNoSecrets(
+        `${draft.text}\n${preOrderUriLogLines}`,
+        needles,
+        `the pre-order's order record and events (${draftOrderId}) and the log lines that print its link`,
+      )
     })
 
     it.failing('no stored URL carries a credential', () => {
-      /* https://github.com/nominal-systems/dmi-engine-common/issues/31 — the shared interceptor
-       * emits each request's URL with its query string as sent, and the test guide is fetched with
-       * `?accesstoken=<token>`. Flips when the interceptor redacts credential parameters. */
+      /* https://github.com/nominal-systems/dmi-engine-common/issues/31 and
+       * https://github.com/nominal-systems/dmi-api/issues/376 — the shared interceptor emits each
+       * request's URL as sent, test guide's `?accesstoken=` included, and dmi-api stores it as it
+       * comes; whichever lands first flips this. */
       if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
       expectNoSecrets(store.urls, needles, 'the antech-v6 request store (urls)')
     })
 
-    it('no stored header, body or payload carries a credential', () => {
-      /* A guard, not a tripwire: this holds today. dmi-api stores the body and payload an engine
-       * emits verbatim (https://github.com/nominal-systems/dmi-api/issues/376), but the stored
-       * records carry no request headers at all — so not the `accessToken` header every antech-v6
-       * call sends — and this integration's interceptor excludes its login, the one call whose body
-       * and payload carry a credential. Until dmi-api redacts what it stores, this is what notices
-       * an engine that starts emitting its request headers, or stops excluding its login. */
+    it.failing('no stored header, body or payload carries a credential', () => {
+      /* https://github.com/nominal-systems/dmi-api/issues/376 — dmi-api stores the payload an engine
+       * emits as it comes, and a refused login is emitted with its body: the foreign-clinic test's
+       * login, password included. Flips when the store masks `password`. The engine side is the
+       * comment thread on https://github.com/nominal-systems/dmi-engine-common/issues/29: a login
+       * is kept out of the audit only when it succeeds. Headers are scanned too, though no stored
+       * record carries any today. */
       if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
       expectNoSecrets(`${store.headers}\n${store.bodies}`, needles, 'the antech-v6 request store (headers, bodies, payloads)')
     })
 
     it.failing('the engine containers\' logs carry no credential', () => {
       /* https://github.com/nominal-systems/dmi-engine-common/issues/31 (and its comment) — the
-       * shared interceptor logs each URL as sent, test-guide token included, and with
-       * `HTTP_DEBUG=true`, which this harness sets on the engine, the shared base API service prints
-       * every request's headers and every POST's body: each login prints the password, every call
-       * its token. Flips when both are redacted. The lines that print a pre-order's URI are the
-       * tripwire above's, not this one's. */
+       * shared interceptor logs each URL as sent, and with `HTTP_DEBUG=true`, which this harness
+       * sets on the engine, the shared base API service prints every request's headers and every
+       * POST's body. Flips when both are redacted, in the common release the engine's lockfile
+       * picks up. The lines that print a pre-order's link are the tripwire above's. */
       if (logs === '') throw new Error('precondition: the engine logs read returned nothing')
-      expectNoSecrets(otherLogLines, needles, `the logs of ${stacks['antech-v6'].logServices.join(', ')}, less the pre-order URI lines`)
+      expectNoSecrets(otherLogLines, needles, `the logs of ${stacks['antech-v6'].logServices.join(', ')}, less the pre-order link lines`)
     })
   })
 })

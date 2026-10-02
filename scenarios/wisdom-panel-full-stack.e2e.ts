@@ -2048,7 +2048,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
     beforeAll(async () => {
       needles = secretNeedles('wisdom-panel')
-      store = await readRequestStore(admin, { provider: 'wisdom-panel', integrationId: org.integrationId })
+      store = await readRequestStore(admin, { provider: 'wisdom-panel', integrationIds: [org.integrationId] })
       logs = await composeLogs(stacks['wisdom-panel'].logServices)
     }, 120_000)
 
@@ -2088,10 +2088,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
     it.failing('the token exchange is not in the request store', () => {
       /* https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/45 — the
-       * integration's interceptor excludes no endpoint, so every `POST /oauth/token` is emitted and
-       * stored: the request payload holds the clinic's password, the response body the token.
-       * Flips when the exclusion ships (a refused grant must not be stored either, hence "any
-       * status"). */
+       * integration sends its token exchange, password and token included, to the request store.
+       * Flips when it stops; a refused grant must not be stored either, hence any status. */
       if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
       const exchanges = store.records.filter((record) => record.url.includes('/oauth/token'))
       expect(exchanges.map((record) => `${record.method} ${new URL(record.url).pathname} ${record.status}`)).toEqual([])
@@ -2099,11 +2097,13 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
     it.failing('no stored header, body or payload carries a credential', () => {
       /* https://github.com/nominal-systems/dmi-api/issues/376 — dmi-api stores the body and payload
-       * an engine emits verbatim, so the token exchange above keeps the password (payload) and the
-       * token (body). Flips when dmi-api redacts what it stores — or when #45 keeps the exchange out
-       * of the store, since it is the only record that carries a credential today: the stored
-       * records carry no request headers at all, so the bearer header every other call sends is
-       * not among them. Headers are scanned all the same, for the day they are stored. */
+       * an engine emits as they come, so the token exchange above keeps the password (payload) and
+       * the token (body). Flips when the store masks them — or when #45 keeps the exchange out of
+       * the store, since it is the only record that carries a credential here: no stored record
+       * carries request headers, and this loop provokes no refused login, which would be stored
+       * with its password too (the comment thread on
+       * https://github.com/nominal-systems/dmi-engine-common/issues/29). Headers are scanned all
+       * the same. */
       if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
       expectNoSecrets(`${store.headers}\n${store.bodies}`, needles, 'the wisdom-panel request store (headers, bodies, payloads)')
     })
@@ -2112,7 +2112,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       /* https://github.com/nominal-systems/dmi-engine-common/issues/31 (and its comment) — with
        * `HTTP_DEBUG=true`, which this harness sets on the engine, the shared base API service prints
        * every request's headers and every POST's body, so each login prints the password and every
-       * call its bearer token. Flips when that dump is redacted. */
+       * call its bearer token. Flips when that dump is redacted, in the common release the engine's
+       * lockfile picks up. */
       if (logs === '') throw new Error('precondition: the engine logs read returned nothing')
       expectNoSecrets(logs, needles, `the logs of ${stacks['wisdom-panel'].logServices.join(', ')}`)
     })
