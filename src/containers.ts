@@ -67,6 +67,35 @@ async function run (command: string, args: string[], options: RunOptions): Promi
   })
 }
 
+/* Like run(), but for a command whose output is the point: stdout is collected whole and returned.
+ * stderr is kept apart — compose writes its own warnings there, and they must not be mistaken for
+ * what a container printed — and shown only if the command fails. */
+async function runCapturing (command: string, args: string[], options: RunOptions): Promise<string> {
+  const { cwd, environment, timeoutMs } = options
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: environment ?? process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: timeoutMs,
+    })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk))
+    child.on('error', reject)
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve(Buffer.concat(stdout).toString('utf8'))
+        return
+      }
+      const how = code == null ? `signal ${String(signal)} (likely the ${String(timeoutMs)}ms timeout)` : `code ${String(code)}`
+      const detail = Buffer.concat(stderr).toString('utf8').trim().split(/\r?\n/).slice(-20).join('\n')
+      reject(new Error(`${command} ${args.join(' ')} exited with ${how}${detail !== '' ? `:\n${detail}` : ''}`))
+    })
+  })
+}
+
 async function waitForTcp (
   host: string,
   port: number,
@@ -164,6 +193,21 @@ export async function composeDown (removeVolumes: boolean): Promise<void> {
   const args = [...composeBaseArgs(), 'down']
   if (removeVolumes) args.push('-v')
   await run('docker', args, { cwd: env.harnessRoot, timeoutMs: 120_000 })
+}
+
+/* Everything the named services of this run's stack have printed so far, as one string, each line
+ * prefixed with its container as compose prints it. Read by the full-stack scenarios' credential
+ * scan (src/secrets.ts), which takes the services from the loop's `logServices` in the stack
+ * registry: an engine's stdout is a place a credential can outlive the request that used it.
+ * `--no-color` drops compose's colours; the Nest logger's own are stripped here, so a colour code
+ * can neither run into a value the scan reads nor land in a failure message. */
+export async function composeLogs (services: string[]): Promise<string> {
+  if (services.length === 0) throw new Error('composeLogs: name at least one service')
+  const logs = await runCapturing('docker', [...composeBaseArgs(), 'logs', '--no-color', ...services], {
+    cwd: env.harnessRoot,
+    timeoutMs: 120_000,
+  })
+  return logs.replace(/\u001b\[[0-9;]*m/g, '')
 }
 
 /* Poll an HTTP endpoint until it answers 2xx. Used for the selected loop's mock, whose /status
