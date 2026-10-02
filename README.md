@@ -636,7 +636,7 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
-  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
+  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class, and `logServices` — the compose services whose logs the scenario's credential scan reads); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
