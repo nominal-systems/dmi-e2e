@@ -28,7 +28,7 @@ assertions that no HTTP route exposes — to MySQL directly via `mysql2`. That b
 point: the harness must survive dmi-api refactors and stay reusable as a conformance suite. Two
 setup steps could go over HTTP and do not, each because the route that exists for it is broken and
 pinned by a tripwire (see "Tripwires"): the shared seeder inserts each user over SQL, because
-`POST /users` answers 500 (F6), and the two engine loops insert their provider's reference data,
+`POST /users` answers 500, and the two engine loops insert their provider's reference data,
 because `POST /admin/refs/sync/<provider>` stores nothing. Everything after that, from login to
 orders, is real HTTP.
 
@@ -698,8 +698,8 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 
 | Suite | Test | Correct behaviour — and today | Tracked in |
 |---|---|---|---|
-| fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP (F6) | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
-| fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause (F6) | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
 | zoetis | `the dmi order's local test list shrinks to the remaining code` | Cancelling one test removes it from the dmi order's test list. Today the provider-side cancel happens, but dmi-api appends the cancelled test to the order's list instead of removing it | not yet filed |
 | antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | antech-v6 | `the orders channel completes an order whose provider status has reached Final` | COMPLETED. Today it stays SUBMITTED: the integration's status enum is numeric and the provider sends strings, so every completion assertion in the loop rests on the results channel | [dmi-engine-antech-v6-integration#84](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/84) |

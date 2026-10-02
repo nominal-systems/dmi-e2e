@@ -55,9 +55,9 @@ export async function insertReport (orderId: string, status = 'REGISTERED'): Pro
   return id
 }
 
-/* F6 workaround. dmi-api's `POST /users` is non-functional — `BasicStrategy` is defined but
- * registered with Passport nowhere, so the endpoint 500s "Unknown authentication strategy basic"
- * (the README's "Tripwires", F6; tracked in nominal-systems/dmi-api#379). Creating a user is the
+/* Workaround for nominal-systems/dmi-api#379. dmi-api's `POST /users` is non-functional —
+ * `BasicStrategy` is defined but registered with Passport nowhere, so the endpoint 500s "Unknown
+ * authentication strategy basic" (the smoke suite's tripwire; the README's "Tripwires"). Creating a user is the
  * one step of the documented seed flow the harness cannot drive over HTTP, so it inserts the row
  * directly; everything downstream (login, org, keys, provider config, practice, integration,
  * orders) stays real HTTP.

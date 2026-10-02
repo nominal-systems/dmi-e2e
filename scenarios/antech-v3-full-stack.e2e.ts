@@ -416,8 +416,8 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
         'list events',
       )
 
-      /* Scope to this order/report (a cold run has just this one; F1 means /events isn't tenant-
-       * scoped, so filter explicitly rather than assume). */
+      /* Scope to this order/report: a cold run has just this one, but filter explicitly rather than
+       * assume the stream is ours alone (/events was once unscoped across tenants, dmi-api#339). */
       const mine = events.data.filter(
         (event) => event.data?.orderId === orderId || event.data?.reportId === reportId,
       )

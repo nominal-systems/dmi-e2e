@@ -86,8 +86,8 @@ export async function seedOrganization (
   const configuration = options.configuration ?? { url: DEMO_LAB_URL }
   const integrationOptions = options.integrationOptions ?? { apiKey: `demo-key-${suffix}` }
 
-  /* F6: dmi-api's POST /users is broken (see sql.insertUser). Insert the user row directly; the
-   * rest of the flow below is real HTTP. */
+  /* dmi-api's POST /users is broken (dmi-api#379; see sql.insertUser). Insert the user row
+   * directly; the rest of the flow below is real HTTP. */
   await insertUser(email)
 
   const auth = expectOk<{ token: string }>(

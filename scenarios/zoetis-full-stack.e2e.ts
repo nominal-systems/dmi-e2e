@@ -600,8 +600,8 @@ describe('zoetis full-stack (Zoetis mock)', () => {
         'list events',
       )
 
-      /* Scope to this order/report (a cold run has just this one; F1 means /events isn't tenant-
-       * scoped, so filter explicitly rather than assume). */
+      /* Scope to this order/report: a cold run has just this one, but filter explicitly rather than
+       * assume the stream is ours alone (/events was once unscoped across tenants, dmi-api#339). */
       const mine = events.data.filter(
         (event) => event.data?.orderId === orderId || event.data?.reportId === reportId,
       )
@@ -1012,9 +1012,9 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(received.testCodes).toEqual([serviceCode])
     }, 30_000)
 
-    /* DEFECT tripwire, on the tenant-isolation.e2e.ts pattern: this asserts the CORRECT expectation
-     * and is marked `failing` while dmi-api behaves otherwise — it passes CI as long as the defect
-     * exists and goes red the moment someone fixes it, forcing the marker off. Mechanically:
+    /* Tripwire (no issue filed yet; see the README's "Tripwires"): this asserts the CORRECT
+     * expectation and is marked `failing` while dmi-api behaves otherwise — it passes CI as long as
+     * the defect exists and goes red the moment someone fixes it, forcing the marker off. Mechanically:
      * dmi-api's cancelOrderTests (orders.service.ts) re-saves the order with
      * `tests: [...order.tests, ...tests]` — the cancelled test is appended to the local list, never
      * removed — so the list still carries the cancelled code even though the provider-side
