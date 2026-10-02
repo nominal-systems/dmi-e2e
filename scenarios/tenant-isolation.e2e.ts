@@ -3,17 +3,11 @@ import { orderPayload, seed, SeededContext } from '../src/seed'
 import { closePool, insertReport } from '../src/sql'
 
 /* Two organizations, no relationship between them. Every test below asserts what a correct
- * multi-tenant API must do — reject, or omit. Where dmi-api does not do that today, the test is
- * marked `it.failing`, which means:
- *
- *   - it passes CI while the defect exists (the assertion throws, as `failing` expects), and
- *   - it FAILS the moment someone fixes the defect, forcing the marker to be removed.
- *
- * That is deliberate. These are not snapshots of current behaviour; they are the expectations,
- * with a tripwire attached. Each one names the defect. Once a defect is fixed upstream the marker
- * comes off and the test stays as a plain regression guard (the reports and cross-tenant-write
- * tests below, fixed in dmi-api #361, are the first). See README.md — do not "fix" a red build
- * here by relaxing an assertion. */
+ * multi-tenant API must do — reject, or omit. Each started life as an `it.failing` tripwire for a
+ * defect this suite found in dmi-api; every one of those defects is fixed, so every test here is now
+ * a plain regression guard, and its comment names the issue and the mechanism it guards. A red
+ * here means something the suite guards has broken again: fix the break. See README.md — do not
+ * "fix" a red build here by relaxing an assertion. */
 
 /* `orderPayload` takes no default test code — every provider rejects codes outside its own catalogue,
  * so a shared default is wrong for all but one provider. This suite runs under NODE_ENV=seed, where
@@ -133,11 +127,11 @@ describe('tenant isolation', () => {
   })
 
   describe('events', () => {
-    /* Was DEFECT F1 (cross-tenant event exposure): `getEventsForOrganization` ignored its
-     * `organization` argument — the Mongo filter was `{ seq: { $gt: seq } }` and nothing more — so
-     * any valid API key read every tenant's events, and `event.data` for `order:created` embeds the
-     * full order (patient, client, veterinarian names). FIXED: events are now scoped to the
-     * requesting org's practices (`practiceId: { $in: ... }`). Kept as a plain regression guard. */
+    /* Regression guard (dmi-api#339): `getEventsForOrganization` ignored its `organization`
+     * argument — the Mongo filter was `{ seq: { $gt: seq } }` and nothing more — so any valid API
+     * key read every tenant's events, and `event.data` for `order:created` embeds the full order
+     * (patient, client, veterinarian names). Events are now scoped to the requesting org's
+     * practices (`practiceId: { $in: ... }`). */
     it('GET /events does not expose another organization\'s events', async () => {
       const response = await ctx.orgB.api.get('/events', { start_seq: 0 })
 
@@ -146,10 +140,9 @@ describe('tenant isolation', () => {
       expect(practiceIds).not.toContain(ctx.orgA.practiceId)
     })
 
-    /* Was DEFECT F1 (same root cause): the controller computed `total` from an unscoped
-     * `count(query)`, so the count leaked even when the data didn't. FIXED alongside the data query
-     * (both now run the practice-scoped filter). Org A owns one order:created event; org B owns
-     * none. Regression guard. */
+    /* Regression guard (dmi-api#339, same root cause): the controller computed `total` from an
+     * unscoped `count(query)`, so the count leaked even when the data didn't; both now run the
+     * practice-scoped filter. Org A owns one order:created event; org B owns none. */
     it('GET /events does not count another organization\'s events', async () => {
       const forA = await ctx.orgA.api.get('/events', { start_seq: 0 })
       const forB = await ctx.orgB.api.get('/events', { start_seq: 0 })
@@ -161,36 +154,38 @@ describe('tenant isolation', () => {
   })
 
   describe('reports', () => {
-    /* Was DEFECT F2, FIXED in dmi-api #361 (issue #340) — reports.controller.ts has no `@UseGuards(ApiGuard)` at class or method level,
-     * and there is no global guard (no APP_GUARD, no useGlobalGuards anywhere in dmi-api's src/).
-     * All three /reports routes appear to be reachable with no credentials at all, despite
-     * dmi-api's README "Mapped Routes" table listing them as API Key. */
+    /* Regression guard (dmi-api#340): reports.controller.ts had no `@UseGuards(ApiGuard)` at class
+     * or method level, and there is no global guard (no APP_GUARD, no useGlobalGuards anywhere in
+     * dmi-api's src/), so all three /reports routes were reachable with no credentials at all,
+     * despite dmi-api's README "Mapped Routes" table listing them as API Key. */
     it('GET /reports/:id rejects a caller with no API key', async () => {
       const response = await ctx.anonymous.get(`/reports/${aReportId}`)
 
       expect([401, 403]).toContain(response.status)
     })
 
-    /* Was DEFECT F3, FIXED in dmi-api #361 (issue #340) — reports.service.ts `getReport(id, _organization)` carries a literal
-     * "TODO(gb): actually check the user can access this report" and ignores the organization.
-     * Independent of F2: adding a guard alone would not fix this. */
+    /* Regression guard (dmi-api#340): reports.service.ts `getReport(id, _organization)` carried a
+     * literal "TODO(gb): actually check the user can access this report" and ignored the
+     * organization. Independent of the guard above: adding a guard alone would not have fixed it. */
     it('GET /reports/:id denies org B', async () => {
       const response = await ctx.orgB.api.get(`/reports/${aReportId}`)
 
       expect([403, 404]).toContain(response.status)
     })
 
-    /* Was DEFECT F2, FIXED in dmi-api #361 (issue #340) — `getPresentedForm(reportId)` does not even take an organization. This report
-     * has no attachments, so an unguarded app answers 404 ("presented form not found") rather
-     * than 401; either way, a guarded app would answer 401 before reaching the service. */
+    /* Regression guard (dmi-api#340): `getPresentedForm(reportId)` does not even take an
+     * organization. This report has no attachments, so an unguarded app answers 404 ("presented
+     * form not found") rather than 401; either way, a guarded app answers 401 before reaching the
+     * service. */
     it('GET /reports/:id/presentedForm rejects a caller with no API key', async () => {
       const response = await ctx.anonymous.get(`/reports/${aReportId}/presentedForm`)
 
       expect([401, 403]).toContain(response.status)
     })
 
-    /* Was DEFECT F5, FIXED in dmi-api #361 (issue #340) — orders.service.ts `getOrderReport(organization, orderId)` ignores its
-     * `organization` argument and returns `reportsService.findForOrder(orderId)` outright. */
+    /* Regression guard (fixed in dmi-api#361): orders.service.ts `getOrderReport(organization,
+     * orderId)` ignored its `organization` argument and returned
+     * `reportsService.findForOrder(orderId)` outright. */
     it('GET /orders/:id/report denies org B', async () => {
       const response = await ctx.orgB.api.get(`/orders/${aOrderId}/report`)
 
@@ -200,19 +195,19 @@ describe('tenant isolation', () => {
 
   /* Kept last: these mutate state on success, and on success they are the vulnerability. */
   describe('cross-tenant writes', () => {
-    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — orders.controller.ts `createOrder` takes no `@Organization()`, and
-     * orders.service.ts resolves `createOrderDto.integrationId` with no ownership check. ApiGuard
-     * authenticates the caller but nothing authorizes the integration being referenced. */
+    /* Regression guard (dmi-api#341): orders.controller.ts `createOrder` took no `@Organization()`,
+     * and orders.service.ts resolved `createOrderDto.integrationId` with no ownership check —
+     * ApiGuard authenticated the caller, but nothing authorized the integration being referenced. */
     it('POST /orders rejects org B targeting org A\'s integration', async () => {
       const response = await ctx.orgB.api.post('/orders', orderPayload(ctx.orgA.integrationId, { testCodes: ANY_TEST_CODE }))
 
       expect([403, 404]).toContain(response.status)
     })
 
-    /* Was DEFECT F4, FIXED in dmi-api #361 (issue #340) — integrations.controller.ts `createIntegration` likewise takes no
-     * `@Organization()`; `providerConfigurationId` is never checked for ownership. On success,
-     * org B has bound its own practice to org A's provider configuration — meaning org B's
-     * subsequent orders would be placed against org A's lab account. */
+    /* Regression guard (dmi-api#341): integrations.controller.ts `createIntegration` likewise took
+     * no `@Organization()`, and `providerConfigurationId` was never checked for ownership. On
+     * success, org B had bound its own practice to org A's provider configuration — so org B's
+     * subsequent orders would have been placed against org A's lab account. */
     it('POST /integrations rejects org B targeting org A\'s provider configuration', async () => {
       const response = await ctx.orgB.api.post('/integrations', {
         practiceId: ctx.orgB.practiceId,
@@ -223,8 +218,8 @@ describe('tenant isolation', () => {
       expect([403, 404]).toContain(response.status)
     })
 
-    /* Fixed in dmi-api #361 (issue #340) — regression guard. `PUT /providers/:providerId/
-     * configurations/:configId` overwrote ANY config's encrypted credentials and reassigned its
+    /* Regression guard (dmi-api#341): `PUT /providers/:providerId/configurations/:configId`
+     * overwrote ANY config's encrypted credentials and reassigned its
      * `organization` FK, with no ownership check — so org B, knowing org A's config id, could both
      * repoint org A's provider credentials and steal the config into its own org. The body is
      * untyped, and ownership is checked before validation, so this reaches the authorization path.

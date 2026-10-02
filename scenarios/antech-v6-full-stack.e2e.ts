@@ -31,7 +31,7 @@ import { closePool, query } from '../src/sql'
  *
  * 3. ONLY THE RESULTS CHANNEL CAN COMPLETE AN ORDER TODAY, and that is not a property of this
  *    harness — it is a defect in the integration, pinned by a tripwire at the bottom of this file
- *    and not yet filed upstream. `OrderStatus` is a STRING on
+ *    and filed as nominal-systems/dmi-engine-antech-v6-integration#84. `OrderStatus` is a STRING on
  *    the wire (`"Submitted"`, `"Received"`, `"Final"`, …) while the integration's status enum is a
  *    bare numeric one, so its `mapOrderStatus` switch never matches a wire value and every polled
  *    status falls to its default, dmi SUBMITTED. The orders channel can therefore move an order
@@ -1513,8 +1513,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
    * passed even though it was supposed to fail", and the only correct response is to delete the
    * marker, not to relax the assertion.
    *
-   * None of the four is filed upstream yet (as of 2026-09-18); each comment states the mechanism so
-   * a fix can be matched to its tripwire. */
+   * Each comment names the issue that tracks its defect and states the mechanism, so a fix can be
+   * matched to its tripwire. */
   describe('tripwires: behaviours the loop should have and does not', () => {
     it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
@@ -1528,7 +1528,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * `RefsService.syncProviderRefs` passes that whole entity as a relation condition —
        * `findOne({ where: { code, type, provider } })` — which TypeORM expands over the entity's
        * properties and refuses at the first computed one:
-       * `Property "integrationOptions" was not found in "Provider"`. Not yet filed upstream.
+       * `Property "integrationOptions" was not found in "Provider"`. Filed as
+       * nominal-systems/dmi-api#378.
        *
        * It is why this scenario seeds the provider_ref rows itself, from the catalogue the engine
        * returned, rather than through the route that exists to do it. This test carries no
@@ -1557,7 +1558,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        *
        * This is why every completion assertion in this file rests on the results channel, and why
        * the mock serves the strings: emitting the integers the enum declares would make this test
-       * pass against behaviour the live endpoint does not produce. */
+       * pass against behaviour the live endpoint does not produce. Filed as
+       * nominal-systems/dmi-engine-antech-v6-integration#84. */
       const payload = payloadFor([KIDNEY_PANEL_CODE])
       const requisitionId = payload.requisitionId as string
       const created = expectOk<{ id: string }>(
@@ -1612,7 +1614,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * guard, and the handler dereferences `body.LabOrders` / `body.LabResults` — keys an error
        * body does not have. It throws a TypeError before emitting anything, so the provider's own
        * explanation is discarded and the audit record is never written. The success path is safe
-       * because the endpoint always returns both keys.
+       * because the endpoint always returns both keys. Reported in a comment on
+       * nominal-systems/dmi-engine-common#29, whose shared interceptor owns the rejection path.
        *
        * Scoped to GetStatus specifically: placement rejections elsewhere in this file DO produce
        * 4xx audit records (their accession-id extraction is guarded), so an unscoped "is there a
@@ -1661,7 +1664,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * exactly one breed, 648 — so the pair is invalid at Antech and the placement is rejected
        * before the order exists. A patient whose species resolves but whose breed does not gets
        * 41 + 370, which IS valid, so this is not every order: it is every order for a fully
-       * unmapped patient.
+       * unmapped patient. Filed as nominal-systems/dmi-engine-antech-v6-integration#88.
        *
        * The mock refuses it from the same species tree the provider publishes, which is why this
        * reproduces rather than merely asserts. The test below pins that the refusal at least

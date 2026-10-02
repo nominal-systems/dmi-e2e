@@ -1870,7 +1870,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * It is why this scenario seeds the provider_ref rows itself, from the lists the engine
        * returned, rather than through the route that exists to do it. This test carries no fallback
        * of its own: it reports what the setup observed. The same tripwire stands in the antech-v6
-       * scenario, because the defect is dmi-api's rather than any provider's. */
+       * scenario, because the defect is dmi-api's rather than any provider's. Filed as
+       * nominal-systems/dmi-api#378. */
       expect({
         status: syncResponse.status,
         speciesRefsStoredBySync: speciesRefsAfterSync,
@@ -1894,7 +1895,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * `min_size` / `max_size` / `pred_size` off it unguarded and emits three items whose
        * `valueQuantity.value` is `undefined`. JSON drops the undefined on the way to dmi-api, which
        * stores the quantity as `{units: 'kg'}` and shows the operator three ideal weights with no
-       * numbers in them.
+       * numbers in them. Filed as nominal-systems/dmi-engine-wisdom-panel-integration#46.
        *
        * The positive twin is the test that seeded this result set: the report reached FINAL and its
        * breed percentages are exact, so the batch itself is demonstrably healthy — and it is the
@@ -1922,7 +1923,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * a body whose only key is `errors`. The TypeError is thrown from inside the LOGGING
        * interceptor, so the audit record is never written and the exception that finally reaches
        * `getKits`' catch is the TypeError rather than the provider's 401. Same family as
-       * nominal-systems/dmi-engine-common#29.
+       * nominal-systems/dmi-engine-common#29, and reported there in a comment.
        *
        * The positive twin is the audit test in the activation section, which finds the 200 kits
        * page recorded with its accession id — so the interceptor demonstrably works on the success
