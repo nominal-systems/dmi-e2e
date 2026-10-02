@@ -3,9 +3,9 @@
 /* The stack registry — the one place that knows what each full-system loop is made of. Every
  * consumer derives from it: jest.config.js (which scenario file to run, the poll-budget class, the
  * report suite name), src/env.ts (validation of HARNESS_STACK, the checkouts the run report
- * records, the mock's host-facing URL), src/containers.ts (compose profile, readiness),
- * src/report/report.ts (suite order) and scripts/nightly.sh (which checkouts to pull, via the CLI
- * at the bottom). Adding a loop is one entry here plus its compose profile, scenario and workflow
+ * records, the mock's host-facing URL), src/containers.ts (compose profile, readiness), the
+ * scenarios' credential scan (which containers' logs to read), src/report/report.ts (suite order)
+ * and scripts/nightly.sh (which checkouts to pull, via the CLI at the bottom). Adding a loop is one entry here plus its compose profile, scenario and workflow
  * — never another if/else keyed on the stack name — and `verifyStacks()` below checks that the
  * entry and those three artefacts agree, every time the harness starts.
  *
@@ -53,6 +53,12 @@ const stacks = {
     },
     /* idexx exposes IDEXX_*_POLLING_INTERVAL_MS, which the harness dials down to ~3s. */
     slowPoll: false,
+    /* The compose services that run this loop's engine code — the containers whose output can hold
+     * a credential the engine was handed or minted. A scenario's credential scan reads their logs
+     * (`composeLogs` in src/containers.ts); `verifyStacks()` requires each to be a service the
+     * loop's compose profile starts. The mock is not listed: it is the provider, and its logs are
+     * the provider's business. */
+    logServices: ['dmi-engine-idexx-integration'],
   },
   'antech-v3': {
     /* Classic Antech. dmi-api's id for the provider is the bare `antech` (it predates V6); the
@@ -72,6 +78,7 @@ const stacks = {
      * for a full tick before the engine picks it up, so the per-test budget absorbs a missed one
      * rather than reading a healthy-but-slow loop as a hang. */
     slowPoll: true,
+    logServices: ['dmi-engine-antech-integration'],
   },
   zoetis: {
     providerId: 'zoetis',
@@ -86,6 +93,7 @@ const stacks = {
     },
     /* Hardcoded 30s poll, as antech-v3. */
     slowPoll: true,
+    logServices: ['dmi-engine-zoetis-integration'],
   },
   'antech-v6': {
     /* Antech's newer API generation — a different provider in dmi-api (`antech-v6`, next to the
@@ -110,6 +118,8 @@ const stacks = {
     },
     /* ANTECH_V6_POLLING_INTERVAL_MS is env-configurable; the compose profile dials it to ~3s. */
     slowPoll: false,
+    /* Both engine processes: the api process logs in to place orders, the worker to poll. */
+    logServices: ['dmi-engine-api', 'dmi-engine-worker'],
   },
   'wisdom-panel': {
     /* Wisdom Panel (Mars pet DNA; dmi-api provider id `wisdom-panel`) — the second loop hosted by
@@ -136,6 +146,8 @@ const stacks = {
     /* WISDOM_PANEL_POLLING_INTERVAL_MS is env-configurable (the engine's default is 10 minutes);
      * the compose profile dials it to ~3s. */
     slowPoll: false,
+    /* The same two engine processes as antech-v6, each of which takes its own token. */
+    logServices: ['dmi-engine-api', 'dmi-engine-worker'],
   },
 }
 
@@ -163,6 +175,38 @@ function suiteName (fullStack, stack) {
   return fullStack ? stack : 'fast'
 }
 
+/* Every service docker-compose.yml declares, with the profiles it is started under — an empty set
+ * meaning every run starts it. Read by indentation, not by a YAML parser (this module has no
+ * dependencies), so it relies on the file's layout: a service is a key two spaces in under the
+ * top-level `services:`, and its `profiles: [...]` is one line four spaces in.
+ * @param {string} compose
+ * @returns {Map<string, Set<string>>} */
+function composeServices (compose) {
+  const services = new Map()
+  let inServices = false
+  let current = null
+  for (const line of compose.split(/\r?\n/)) {
+    if (/^\s*(#.*)?$/.test(line)) continue
+    if (/^\S/.test(line)) {
+      inServices = /^services:\s*$/.test(line)
+      current = null
+      continue
+    }
+    if (!inServices) continue
+    const service = /^  ([A-Za-z0-9][A-Za-z0-9._-]*):\s*$/.exec(line)
+    if (service != null) {
+      current = new Set()
+      services.set(service[1], current)
+      continue
+    }
+    const profiles = /^    profiles:\s*\[([^\]]*)\]/.exec(line)
+    if (profiles != null && current != null) {
+      for (const name of profiles[1].matchAll(/'([^']+)'/g)) current.add(name[1])
+    }
+  }
+  return services
+}
+
 /* Checks that every entry agrees with the artefacts it points at, and throws naming the loop and
  * the field otherwise. A registry key can be validated when HARNESS_STACK is read, but a wrong
  * field inside an entry fails late and misleadingly without this: a scenario path that does not
@@ -183,6 +227,7 @@ function verifyStacks () {
   for (const list of compose.matchAll(/profiles:\s*\[([^\]]*)\]/g)) {
     for (const name of list[1].matchAll(/'([^']+)'/g)) declaredProfiles.add(name[1])
   }
+  const services = composeServices(compose)
 
   for (const [key, entry] of Object.entries(stacks)) {
     /* Keys are used as env-var suffixes only through `dirVariable`, never derived, so hyphens are
@@ -216,6 +261,25 @@ function verifyStacks () {
     }
     if (!Number.isInteger(entry.mock?.defaultPort)) fail(key, 'mock.defaultPort', 'must be an integer')
     if (typeof entry.slowPoll !== 'boolean') fail(key, 'slowPoll', 'must be a boolean')
+
+    /* The containers a scenario's credential scan reads the logs of. A name compose does not know,
+     * or a service this loop's profile does not start, would make `docker compose logs` fail — or,
+     * worse, read nothing from the container that matters and call the empty output clean. */
+    if (!Array.isArray(entry.logServices) || entry.logServices.length === 0) {
+      fail(key, 'logServices', 'must name at least one compose service — the containers that run this loop\'s engine code')
+    } else {
+      const seen = new Set()
+      entry.logServices.forEach((service, i) => {
+        const profiles = typeof service === 'string' ? services.get(service) : undefined
+        if (profiles == null) {
+          fail(key, `logServices[${i}]`, `'${service}' is not a service in docker-compose.yml`)
+        } else if (profiles.size > 0 && !profiles.has(entry.composeProfile)) {
+          fail(key, `logServices[${i}]`, `'${service}' is not started under the '${entry.composeProfile}' profile (its profiles: ${[...profiles].join(', ')})`)
+        }
+        if (seen.has(service)) fail(key, 'logServices', `'${service}' is listed twice`)
+        seen.add(service)
+      })
+    }
 
     /* Every loop runs in CI from its own workflow, `.github/workflows/e2e-<key>.yml` (its own
      * because `paths:` filters are per workflow), and must keep its scenario inside that

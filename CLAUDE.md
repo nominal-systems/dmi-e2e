@@ -138,9 +138,10 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 - Reuse the shared foundation (`HARNESS_STACK` selector, compose profiles, `src/seed.ts`,
   `src/poll.ts`, `src/containers.ts`, `src/env.ts`) rather than forking it per provider. **A new
   loop is one entry in `src/stacks.js`** (stack key → provider id, scenario, compose profile, the
-  checkouts it is built from, mock endpoint, poll class) plus its compose profile, scenario and
-  workflow — never another `if (env.stack === …)`; everything that varies by stack reads the
-  registry. The key is the harness's name, not dmi-api's provider id: where a provider has several
+  checkouts it is built from, mock endpoint, poll class, log services) plus its compose profile,
+  scenario and workflow — never another `if (env.stack === …)`; everything that varies by stack
+  reads the registry.
+  The key is the harness's name, not dmi-api's provider id: where a provider has several
   API generations the key carries the generation (`antech-v3`, `antech-v6`; dmi-api's ids are
   `antech` and `antech-v6`), and no key may be a prefix of another — the workflow `paths:` globs
   are `scenarios/<key>*.e2e.ts`, so `antech` next to `antech-v6` would fire on both.
