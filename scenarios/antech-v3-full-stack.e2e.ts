@@ -1,9 +1,12 @@
 import { ApiClient, expectOk } from '../src/api-client'
+import { composeLogs } from '../src/containers'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
+import { expectNoSecrets, findSecrets, OrderRecordRead, readOrderRecords, readRequestStore, RequestStoreRead, SecretNeedle, secretNeedles } from '../src/secrets'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool } from '../src/sql'
+import { stacks } from '../src/stacks'
 
 /* Full-system gate for classic Antech, V3 (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
@@ -468,5 +471,116 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       expect(response.text).toMatch(/Tests is required by antech/)
       expect(response.text).not.toMatch(/failed with \d+ status code/)
     }, 30_000)
+  })
+
+  /* ---- no credential leaves the stack ----
+   *
+   * The integration is handed the clinic's Antech password (integration options), logs in before
+   * every request, and sends the token it gets back as `?accessToken=` on every call. Neither should
+   * outlive the request that used it, and after this loop has run its course the token does, in
+   * three places: the order record, dmi-api's provider request store and the integration
+   * container's stdout. So this block reads them back, last, when the whole run's traffic is in
+   * them, and asserts no credential is there (src/secrets.ts: this loop's password, the token its
+   * mock mints, and the shapes any credential takes on the wire).
+   *
+   * One tripwire per place and issue, so each flips when its own fix ships, and one guard for the
+   * stored headers, bodies and payloads, which hold no credential in this loop today. An
+   * `it.failing` also passes when the test throws for any OTHER reason — the store answering
+   * nothing, the logs empty — so the inputs are proven first by plain tests of their own, and the
+   * scan logs what it found, since jest keeps a failing tripwire's message to itself. */
+  describe('no credential leaves the stack', () => {
+    let needles: SecretNeedle[] = []
+    let order: OrderRecordRead = { orders: [], manifests: [], text: '' }
+    let store: RequestStoreRead = { records: [], details: [], urls: '', headers: '', bodies: '' }
+    let logs = ''
+
+    beforeAll(async () => {
+      needles = secretNeedles('antech-v3')
+      store = await readRequestStore(admin, { provider: 'antech', integrationId: org.integrationId })
+      logs = await composeLogs(stacks['antech-v3'].logServices)
+      /* Read only if the order was placed, so that a run that never placed it fails the order's
+       * precondition below rather than every test in this block. */
+      if (orderId != null) order = await readOrderRecords(org.api, [orderId])
+    }, 120_000)
+
+    it('the scan is armed: this loop\'s password and the minted token are found, and their masked forms are not', () => {
+      /* Without this, a scan that matched nothing at all would pass every guard below once the
+       * tripwires are flipped. */
+      expect(findSecrets(`{"Password":"${env.antechV3.password}"}`, needles)).not.toEqual([])
+      expect(findSecrets('/views/order.html?accessToken=antech-v3-mock-token&ClinicAccessionID=1', needles)).not.toEqual([])
+      expect(findSecrets('{"Password":"***"} /views/order.html?accessToken=***&ClinicAccessionID=1', needles)).toEqual([])
+    })
+
+    it('the order record and its manifest were read back', () => {
+      /* The positive twin of the order-record tripwire: the order the loop completed, and the
+       * manifest dmi-api serves for it, as the PIMS reads them. */
+      expect(order.orders).toHaveLength(1)
+      expect(order.orders[0].id).toBe(orderId)
+      expect(order.orders[0].requisitionId).toBe(requisitionId)
+      expect(order.manifests).toHaveLength(1)
+      expect(order.manifests[0]).toEqual(expect.any(Object))
+    })
+
+    it('the request store holds this integration\'s traffic, and a record\'s detail carries its body and payload', () => {
+      /* The positive twin of the two store checks below: the placement is in the store under this
+       * integration, and its detail came back with the request payload — the ClinicAccessionID is
+       * in it — so the scan reads real records rather than an empty page. */
+      expect(store.records.length).toBeGreaterThan(0)
+      expect(store.details).toHaveLength(store.records.length)
+      const placement = store.details.find(
+        (detail) => detail.method === 'POST' && detail.url.includes('External/OrderPlacement') && (detail.accessionIds ?? []).includes(requisitionId),
+      )
+      if (placement === undefined) {
+        throw new Error(`no placement of ${requisitionId} among the ${store.records.length} stored records: ${JSON.stringify(store.records.map((record) => `${record.method} ${new URL(record.url).pathname}`))}`)
+      }
+      expect(String(placement.payload)).toContain(`"ClinicAccessionID":"${requisitionId}"`)
+      expect(placement.body).toBeDefined()
+    })
+
+    it('the integration container\'s logs were read, from its start', () => {
+      /* The positive twin of the log tripwire. Nest prints this line once the application is up. */
+      expect(logs).toContain('Nest application successfully started')
+      for (const service of stacks['antech-v3'].logServices) {
+        expect(logs).toMatch(new RegExp(`^${service}-\\d+\\s+\\|`, 'm'))
+      }
+    })
+
+    it.failing('the order\'s submissionUri and manifest carry no token', () => {
+      /* https://github.com/nominal-systems/dmi-engine-antech-integration/issues/57 — the
+       * integration writes its login token into the URIs it hands dmi. Here it is the manifest the
+       * integration fetches at placement, whose `uri` keeps `accessToken=<the token>`: dmi stores it
+       * on the order and serves it at `GET /orders/:id/manifest`. The order mapper builds
+       * `submissionUri` and `manifest.uri` the same way. Flips when the integration stops writing
+       * the token into them. */
+      if (order.orders.length === 0) throw new Error('precondition: the order was not read back')
+      expectNoSecrets(order.text, needles, `the order record and manifest of ${orderId}`)
+    })
+
+    it.failing('no stored URL carries a credential', () => {
+      /* https://github.com/nominal-systems/dmi-engine-common/issues/31 — the shared interceptor
+       * emits each request's URL as sent, and this integration sends its token as `?accessToken=`
+       * on every call. Flips when the interceptor redacts credential parameters. */
+      if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
+      expectNoSecrets(store.urls, needles, 'the antech request store (urls)')
+    })
+
+    it('no stored header, body or payload carries a credential', () => {
+      /* A guard, not a tripwire: this holds today. dmi-api stores the body and payload an engine
+       * emits verbatim (https://github.com/nominal-systems/dmi-api/issues/376), but the stored
+       * records carry no request headers at all, this integration sends its token in the URL (the
+       * tripwire above) rather than in a header, and its interceptor excludes its login, the one
+       * call whose body and payload carry a credential. Until dmi-api redacts what it stores, this
+       * is what notices an engine that starts emitting its request headers, or stops excluding its
+       * login. */
+      if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
+      expectNoSecrets(`${store.headers}\n${store.bodies}`, needles, 'the antech request store (headers, bodies, payloads)')
+    })
+
+    it.failing('the integration container\'s logs carry no credential', () => {
+      /* https://github.com/nominal-systems/dmi-engine-common/issues/31 — the shared interceptor logs
+       * each request's URL as sent, token included. Flips when it redacts credential parameters. */
+      if (logs === '') throw new Error('precondition: the integration logs read returned nothing')
+      expectNoSecrets(logs, needles, `the logs of ${stacks['antech-v3'].logServices.join(', ')}`)
+    })
   })
 })
