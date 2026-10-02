@@ -364,6 +364,37 @@ touches a live Zoetis host. What differs from the other two:
   and breed. Why it takes a value assertion: the *Ref-mapped fields need value assertions* rule in
   [CLAUDE.md](CLAUDE.md).
 
+### The credential scan
+
+The antech-v6, wisdom-panel and antech-v3 loops end with a block, `no credential leaves the stack`,
+that reads back what the run left behind and asserts that no provider credential is in it
+(`src/secrets.ts`). It looks for the loop's dummy password, the tokens its mock mints, and the
+shapes a credential takes on the wire whatever its value: a query parameter, a JSON member, an
+`Authorization` header, a bearer token. Each shape is written so that the masked `***` a fix writes
+does not match. A hit is reported as an excerpt with every secret in it masked, and is also logged,
+because an `it.failing` test keeps its message to itself.
+
+What it reads:
+
+- dmi-api's provider request store, `GET /admin/external-requests`: the list and every record's
+  detail, for every integration the loop created (the antech-v6 loop makes a second one to provoke
+  a refused login);
+- the order records it names, `GET /orders/:id` (and, for classic Antech, `GET /orders/:id/manifest`),
+  with the organization's `GET /events` that concern them;
+- the logs of the loop's `logServices` containers (`src/stacks.js`), through `docker compose logs`.
+
+What it does not read: dmi-api's own stdout, the mocks' logs (the provider's side), and the
+wisdom-panel loop's stored URLs on their own (that provider takes no credential in a URL). The
+idexx and zoetis loops have no scan yet.
+
+On today's engines most of those places hold a credential, so each check is an `it.failing`
+tripwire, one per place and issue, whose comment names the issue whose fix flips it. Classic
+Antech's stored bodies and payloads hold none, because that loop provokes no refused login, so
+there the check is a plain guard. The `dmi-engine-common` tripwires flip only once an engine's
+lockfile picks up a `dmi-engine-common` release carrying the fix: the harness builds each engine
+from its checkout, but installs `dmi-engine-common` from the registry, and today `dmi-engine` and
+the antech and wisdom-panel integrations lock 1.6.0, the antech-v6 integration 1.7.0.
+
 ### The idexx mock (VetConnect Plus)
 
 `src/idexx-mock/server.js` is a small, zero-dependency Node HTTP server that stands in for IDEXX (its VetConnect Plus API). It speaks IDEXX's **public, documented dialect** (developer.vetconnectplus.com)
@@ -649,6 +680,7 @@ src/
   antech-v6-mock/server.js    the antech-v6 mock provider (zero-dependency Node HTTP server)
   wisdom-panel-mock/server.js the wisdom-panel mock provider (zero-dependency Node HTTP server)
   poll.ts                     pollUntil, shared by the full-system scenarios
+  secrets.ts                  the credential scan: needles, masked excerpts, and readers for the request store, order records and events (see "The credential scan")
   report/summary-reporter.js  jest reporter: writes reports/<suite>/summary.json when the run ends
   report/report.ts            run.json at setup, the run index, publishing to the nginx directory
   report/publish.ts           `npm run report:publish`
@@ -665,7 +697,7 @@ scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
-  antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
+  antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end, four tripwires red by design (the credential scan's)
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
