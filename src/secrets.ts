@@ -62,7 +62,8 @@ function literal (name: string, value: string, variable: string): SecretNeedle {
         'to tell it from benign text — give the harness a longer dummy credential',
     )
   }
-  return { name, pattern: new RegExp(escapeRegExp(value), 'g') }
+  /* Bounded on both sides, so `harness-pass` is not found inside `harness-password`. */
+  return { name, pattern: new RegExp(`(?<![\\w-])${escapeRegExp(value)}(?![\\w-])`, 'g') }
 }
 
 /* The shapes, shared by every loop. Each value class excludes `*`, so `***` never matches, and stops
@@ -250,21 +251,23 @@ export interface RequestStoreRead {
 const STORE_PAGE = 200
 const STORE_MAX_PAGES = 50
 
-/* Everything dmi-api's request store holds for one integration. The list is paged until it runs
- * out — the engine is still polling while it is read, so rows can shift a page and are
- * de-duplicated by id — and every row's detail is fetched, because only the detail carries the
- * body and the payload. */
+/* Everything dmi-api's request store holds for the integrations a scenario made — all of them, so
+ * that one made to provoke a failure is scanned too. The list is paged until it runs out — the
+ * engine is still polling while it is read, so rows can shift a page and are de-duplicated by id —
+ * and every row's detail is fetched, because only the detail carries the body and the payload. */
 export async function readRequestStore (
   admin: ApiClient,
-  { provider, integrationId }: { provider: string, integrationId: string },
+  { provider, integrationIds }: { provider: string, integrationIds: string[] },
 ): Promise<RequestStoreRead> {
+  if (integrationIds.length === 0) throw new Error('readRequestStore: name at least one integration')
   const byId = new Map<string, StoredRequest>()
   for (let page = 1; ; page += 1) {
     if (page > STORE_MAX_PAGES) {
-      throw new Error(`the ${provider} request store has more than ${STORE_MAX_PAGES * STORE_PAGE} records for one integration; raise the scan's page cap`)
+      throw new Error(`the ${provider} request store has more than ${STORE_MAX_PAGES * STORE_PAGE} records for these integrations; raise the scan's page cap`)
     }
     const listing = expectOk<{ total: number, data: StoredRequest[] }>(
-      await admin.get('/admin/external-requests', { providers: provider, integrationId, page, limit: STORE_PAGE }),
+      /* The route splits `integrationId` on commas and matches any of them. */
+      await admin.get('/admin/external-requests', { providers: provider, integrationId: integrationIds.join(','), page, limit: STORE_PAGE }),
       `list the ${provider} request store, page ${page}`,
     )
     for (const record of listing.data) byId.set(record._id, record)
@@ -292,32 +295,54 @@ export async function readRequestStore (
 export interface OrderRecordRead {
   orders: any[]
   manifests: any[]
+  /* The organization's events that concern these orders: each embeds the order as it stood. */
+  events: any[]
   text: string
 }
 
-/* A manifest's `data` is the base64 PDF itself: kilobytes of noise to the scan, and nothing an
- * engine string-builds. */
-function withoutData (attachment: any): any {
-  if (attachment == null || typeof attachment !== 'object') return attachment
-  const { data: _data, ...rest } = attachment
-  return rest
+/* An attachment's `data` is the base64 PDF itself: kilobytes of noise to the scan, and nothing an
+ * engine string-builds. Dropped wherever an attachment appears — a manifest, an order's embedded
+ * manifest, an event's embedded order. */
+function withoutAttachmentData (value: any): any {
+  if (Array.isArray(value)) return value.map(withoutAttachmentData)
+  if (value == null || typeof value !== 'object') return value
+  const isAttachment = typeof value.contentType === 'string' && 'data' in value
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !(isAttachment && key === 'data'))
+      .map(([key, entry]) => [key, withoutAttachmentData(entry)]),
+  )
 }
 
-/* The DMI order records — `GET /orders/:id` and, unless told otherwise, `GET /orders/:id/manifest`
- * — as the PIMS reads them. */
+const EVENTS_PAGE = 200
+const EVENTS_MAX_PAGES = 50
+
+/* The DMI order records as the PIMS reads them: `GET /orders/:id`, unless told otherwise
+ * `GET /orders/:id/manifest`, and the events of `GET /events` that concern these orders. */
 export async function readOrderRecords (
   api: ApiClient,
   orderIds: string[],
   { manifests = true }: { manifests?: boolean } = {},
 ): Promise<OrderRecordRead> {
-  const read: OrderRecordRead = { orders: [], manifests: [], text: '' }
+  const read: OrderRecordRead = { orders: [], manifests: [], events: [], text: '' }
   for (const id of orderIds) {
-    const order = expectOk<any>(await api.get(`/orders/${encodeURIComponent(id)}`), `read order ${id}`)
-    read.orders.push({ ...order, manifest: withoutData(order.manifest) })
+    read.orders.push(withoutAttachmentData(expectOk<any>(await api.get(`/orders/${encodeURIComponent(id)}`), `read order ${id}`)))
     if (manifests) {
-      read.manifests.push(withoutData(expectOk<any>(await api.get(`/orders/${encodeURIComponent(id)}/manifest`), `read the manifest of order ${id}`)))
+      read.manifests.push(withoutAttachmentData(expectOk<any>(await api.get(`/orders/${encodeURIComponent(id)}/manifest`), `read the manifest of order ${id}`)))
     }
   }
-  read.text = [...read.orders, ...read.manifests].map((record) => JSON.stringify(record)).join('\n')
+  for (let page = 1; ; page += 1) {
+    if (page > EVENTS_MAX_PAGES) throw new Error(`more than ${EVENTS_MAX_PAGES * EVENTS_PAGE} events; raise the scan's page cap`)
+    const listing = expectOk<{ data: any[] }>(
+      await api.get('/events', { start_seq: 0, page, limit: EVENTS_PAGE }),
+      `list the organization's events, page ${page}`,
+    )
+    for (const event of listing.data) {
+      const text = JSON.stringify(event)
+      if (orderIds.some((id) => text.includes(id))) read.events.push(withoutAttachmentData(event))
+    }
+    if (listing.data.length < EVENTS_PAGE) break
+  }
+  read.text = [...read.orders, ...read.manifests, ...read.events].map((record) => JSON.stringify(record)).join('\n')
   return read
 }
