@@ -104,6 +104,11 @@ const UNMAPPED_BREED = 'Ragdoll'
 const DEFAULT_PET_SPECIES = 49
 const DEFAULT_PET_BREED = 370
 
+/* Antech's ids are numbers sent as strings; `.sort()` alone would put '119' before '41'. */
+function byNumber (a: string, b: string): number {
+  return Number(a) - Number(b)
+}
+
 /* A clinic the seeded account does not own. The mock refuses the login, and the refusal surfaces
  * end to end as the provider's own bare-text body. */
 const FOREIGN_CLINIC_ID = '999000'
@@ -569,7 +574,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * `getBreeds` FLATTENS the tree, tagging each breed with `species: String(species.id)` — so
        * this also pins that the flattening kept the parentage, which is the only thing that makes
        * the 49 + 370 pairing detectable further down. */
-      expect(liveSpecies.map((item) => item.code).sort()).toEqual(['41', '42', '49'])
+      expect(liveSpecies.map((item) => item.code).sort(byNumber)).toEqual(['41', '42', '49', '53', '119'])
       expect(liveSpecies.find((item) => item.code === '41')?.name).toBe('Canine')
       expect(liveSpecies.find((item) => item.code === '49')?.name).toBe('Other species')
 
@@ -597,7 +602,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       const breeds = await providerRefs('breed')
       const sexes = await providerRefs('sex')
 
-      expect(species.map((ref) => ref.code).sort()).toEqual(['41', '42', '49'])
+      expect(species.map((ref) => ref.code).sort(byNumber)).toEqual(['41', '42', '49', '53', '119'])
       expect(species.find((ref) => ref.code === '41')?.name).toBe('Canine')
 
       expect(breeds.map((ref) => ref.code)).toContain(String(EXPECTED_BREED_ID))
