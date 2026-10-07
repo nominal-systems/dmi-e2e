@@ -13,7 +13,8 @@
  * client, doctor and clinic data is SYNTHETIC — invented values shaped like Antech responses, never
  * captured clinic or patient data. What IS genuine is Antech's published CATALOGUE vocabulary: the
  * test mnemonics (`HDC-3`, `HHEM-1`, `HTR-1`, `SA804`, `ACTH2`), the species ids (41 Canine,
- * 42 Feline, 49 Other species), the breed ids (130 Labrador Retriever, 370 Other, 648 Giraffe, …)
+ * 42 Feline, 49 Other species, 53 Psittacine, 119 Raptor), the breed ids (130 Labrador Retriever,
+ * 370 Other, 648 Giraffe, 796 Parrot, 834 Raptor Red Tail Hawk, …)
  * and the CBC analyte names. Those are provider identifiers published to integrators; every price,
  * value, range, name and id attached to a *person* or an *accession* here is invented.
  *
@@ -187,7 +188,7 @@ const ABNORMAL_FLAG_VALUES = ['H', 'L', '*', 'P', '']
 /* ---- SYNTHETIC / CATALOGUE data ---- */
 
 /* Antech's species and breed catalogue, as `Master/v6/GetSpeciesBreed` serves it. The ids and names
- * are GENUINE Antech catalogue identifiers; the tree is trimmed to three species (the live one has
+ * are GENUINE Antech catalogue identifiers; the tree is trimmed to five species (the live one has
  * 42 species and 758 breeds) and to a handful of breeds each.
  *
  * Species 41 and 49 are kept WHOLE in the sense that matters: 41 contains 370 "Other", and 49's
@@ -195,8 +196,15 @@ const ABNORMAL_FLAG_VALUES = ['H', 'L', '*', 'P', '']
  * integration's own `49 + 370` fallback pair exactly as the live endpoint does (load-bearing
  * detail 7). Do not add 370 to species 49 to "make the defaults work".
  *
- * `breedExtId`/`speciesExtId` are the provider's short mnemonics. The canine and "other species"
- * ones are catalogue values; the three FELINE mnemonics are INVENTED, because the trimmed capture
+ * The two BIRD species are there because the live catalogue has no `Avian` species at all: it
+ * splits birds into 12 species, each with its own breeds, while dmi has the one `Avian`. Two of the
+ * 12 are enough to send a bird whose breed belongs to a different species from the one `Avian` is
+ * mapped to — a red-tailed hawk (834, a breed of 119 Raptor) under `Avian` -> 53 Psittacine — and
+ * the breed-belongs-to-species refusal below then decides whether the pair is valid, as it does
+ * live.
+ *
+ * `breedExtId`/`speciesExtId` are the provider's short mnemonics. The canine, "other species" and
+ * bird ones are catalogue values; the three FELINE mnemonics are INVENTED, because the trimmed capture
  * this tree is derived from carried no feline branch — the feline breed ids and names themselves
  * (23, 24, 33) are genuine Antech catalogue identifiers. Nothing in the integration reads either
  * ext id: `getSpecies` reads `value.data[].{id,name}` and `getBreeds` flattens
@@ -229,6 +237,25 @@ const SPECIES_TREE = [
     id: 49,
     name: 'Other species',
     breed: [{ id: 648, name: 'Giraffe', breedExtId: 'GIR', speciesExtId: 'O' }],
+  },
+  {
+    id: 53,
+    name: 'Psittacine',
+    breed: [
+      { id: 270, name: 'Budgie', breedExtId: 'BU', speciesExtId: 'PSS' },
+      { id: 277, name: 'Cockatiel', breedExtId: 'COTL', speciesExtId: 'PSS' },
+      { id: 736, name: 'African Grey', breedExtId: 'AG', speciesExtId: 'PSM' },
+      { id: 796, name: 'Parrot', breedExtId: 'PA', speciesExtId: 'PSM' },
+    ],
+  },
+  {
+    id: 119,
+    name: 'Raptor',
+    breed: [
+      { id: 832, name: 'Raptor Hawk', breedExtId: 'HA', speciesExtId: 'RAPHA' },
+      { id: 834, name: 'Raptor Red Tail Hawk', breedExtId: 'RTHA', speciesExtId: 'RAPHA' },
+      { id: 841, name: 'Raptor Owl', breedExtId: 'OW', speciesExtId: 'RAPOW' },
+    ],
   },
 ]
 
