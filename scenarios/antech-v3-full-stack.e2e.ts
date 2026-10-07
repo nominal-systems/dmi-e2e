@@ -3,7 +3,7 @@ import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
-import { closePool } from '../src/sql'
+import { closePool, countOrdersForOrganization } from '../src/sql'
 
 /* Full-system gate for classic Antech, V3 (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
@@ -215,7 +215,8 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
        * SUBMITTED forever. Omitting it leaves both sides without a patient id, which the guard
        * treats as compatible, and reconciliation falls back to patient name + client last name (both
        * echoed by the mock). This is the mirror image of the idexx scenario, which must SUPPLY the
-       * identifier to work around dmi-api#334.
+       * identifier to work around dmi-api#334. The tripwire at the bottom of this file places an
+       * order WITH the identifier, and pins the fix.
        *
        * autoSubmitOrder is not passed: it drives idexx's confirmOrder handshake and antech has no
        * equivalent — placement is a single POST and the order is SUBMITTED once it lands.
@@ -468,5 +469,83 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       expect(response.text).toMatch(/Tests is required by antech/)
       expect(response.text).not.toMatch(/failed with \d+ status code/)
     }, 30_000)
+  })
+
+  /* ---- tripwires ----
+   *
+   * Each asserts the CORRECT behaviour and is marked `failing` while the platform does not have it.
+   * That keeps CI green while the defect stands, and turns the test red the moment someone fixes it
+   * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
+   * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
+   * even though it was supposed to fail", and the only correct response is to delete the marker, not
+   * to relax the assertion. */
+  describe('tripwires: behaviours the loop should have and does not', () => {
+    it.failing('an order placed with a pims:patient:id is completed by its own result, with no duplicate order', async () => {
+      /* EXPECTED: an order whose patient carries a `pims:patient:id` — what an integrator's PIMS
+       * would normally send, and what orderPayload() supplies by default — is completed by its result
+       * like any other: the order reaches COMPLETED, and the organization holds no more orders after
+       * the result than before it. ACTUAL: the order stays SUBMITTED, and the result is filed under a
+       * second, new order.
+       *
+       * The integration sends Antech the order's `pims:patient:id` as the PetID, and the result
+       * echoes it back — but the integration's result mapper tags the echoed id with its own
+       * `antech:pet:id` system, so the result carries no `pims:patient:id` at all while the order
+       * dmi-api holds does. dmi-api's matching guard (ProviderResultUtils.isMatchingOrder) rejects a
+       * `pims:patient:id` present on ONE side, not only two that differ. Both result handlers then
+       * refuse the order the result belongs to: the one that completes orders skips it ("Skipping
+       * order update ... patient/client mismatch"), and the one that files reports creates a new
+       * orphan order for the result instead. Tracked in nominal-systems/dmi-api#334 — the mirror of
+       * the idexx scenario's tripwire, where the identifier is missing from the order instead.
+       *
+       * It is why the loop's own order deliberately carries no identifier. That order is the positive
+       * twin: the same patient WITHOUT the identifier, completed by the same seeded result — so the
+       * results channel demonstrably delivers, and it is the identifier alone that strands this
+       * order. A separate order (its own requisitionId), and nothing after it reads what it leaves
+       * behind. */
+      const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
+      /* The ref codes are MERGED into the default patient rather than passed as a `patient:`
+       * override, which would replace it whole and drop the `pims:patient:id` this test is about. */
+      payload.patient = {
+        ...(payload.patient as Record<string, unknown>),
+        sex: sexRefCode,
+        species: speciesRefCode,
+        breed: breedRefCode,
+      }
+      const withIdentifierRequisitionId = payload.requisitionId as string
+
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload),
+        'place an antech order whose patient carries a pims:patient:id',
+      )
+      const ordersBefore = await countOrdersForOrganization(org.organizationId)
+
+      expectOk(
+        await mock.post(`/__control__/orders/${withIdentifierRequisitionId}/results`, {}),
+        'seed a result at the mock for the order with a pims:patient:id',
+      )
+
+      const response = await pollUntil(
+        async () => await org.api.get(`/orders/${created.id}`),
+        (r) => r.body?.status === 'COMPLETED',
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(response.body.status).toBe('COMPLETED')
+
+      /* The result reaches dmi-api as two messages: the one that completes the order, and — sent
+       * after it — the one that files the report, which is where a duplicate order would be created.
+       * Count only once that second one has run (this order's report is FINAL, or a new order has
+       * appeared), so that a fix to the first handler alone cannot pass here on timing. */
+      const settled = await pollUntil(
+        async () => ({
+          orders: await countOrdersForOrganization(org.organizationId),
+          reportStatus: (await org.api.get(`/orders/${created.id}/report`)).body?.status,
+        }),
+        (state) => state.orders !== ordersBefore || state.reportStatus === 'FINAL',
+        30_000,
+        1_000,
+      )
+      expect(settled.orders).toBe(ordersBefore)
+    }, 60_000 + COMPLETION_WAIT_MS + 30_000 + 30_000)
   })
 })
