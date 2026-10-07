@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
@@ -478,13 +479,83 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
    * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
    * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
    * even though it was supposed to fail", and the only correct response is to delete the marker, not
-   * to relax the assertion. */
+   * to relax the assertion. A tripwire's preconditions run as a plain test in front of it, chained
+   * through the describe's own `let`s as the loop's tests are: see the first test below for why. */
   describe('tripwires: behaviours the loop should have and does not', () => {
+    /* The PIMS patient id this block's order is placed with — its own, explicitly, rather than
+     * orderPayload()'s default, which is a workaround for the very defect the tripwire pins and may
+     * be dropped once that is fixed. */
+    const withIdentifierPatientId = `pat-${randomUUID().slice(0, 8)}`
+    let withIdentifierOrderId: string
+    let withIdentifierRequisitionId: string
+    let ordersBefore: number
+
+    it('the orders poll acknowledges an order placed with a pims:patient:id, and dmi-api stores the identifier', async () => {
+      /* The setup half of the tripwire below, split out and deliberately NOT marked `failing`. Inside
+       * `it.failing` every throw counts as "failed as expected", so a precondition living there is
+       * silent: if the orders poll stopped acknowledging, or dmi-api stopped storing the identifier,
+       * the tripwire would keep passing on main for the wrong reason and could never fire when the
+       * fix lands. Here a broken precondition is a red run.
+       *
+       * Two preconditions. First, the order really carries a `pims:patient:id`: the tripwire is about
+       * an identifier present on the order's side only, so the stored order must hold it, and the
+       * provider must have been sent it as the PetID it echoes back on the result.
+       *
+       * Second, the results channel must be the ONLY route to COMPLETED, or the tripwire's status
+       * assertion proves nothing. Seeding a result also flips the mock's order status to completed,
+       * and an order the orders poll has not yet acknowledged is still on that feed — so a result
+       * seeded before the poll's first tick lets the orders channel complete the order, past the
+       * guard the tripwire is about (observed: COMPLETED within one tick, while the result was still
+       * filed under a new order). So the orders poll must see and acknowledge the order at SUBMITTED
+       * first; after that the mock never offers it on the orders feed again. */
+      const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
+      /* The ref codes and the identifier are MERGED into the default patient rather than passed as a
+       * `patient:` override, the way the idexx scenario's refMappedOrderPayload does it. */
+      payload.patient = {
+        ...(payload.patient as Record<string, unknown>),
+        sex: sexRefCode,
+        species: speciesRefCode,
+        breed: breedRefCode,
+        identifier: [{ system: 'pims:patient:id', value: withIdentifierPatientId }],
+      }
+      withIdentifierRequisitionId = payload.requisitionId as string
+
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload),
+        'place an antech order whose patient carries a pims:patient:id',
+      )
+      withIdentifierOrderId = created.id
+
+      const stored = expectOk<{ patient: { identifier: Array<{ system: string, value: string }> } }>(
+        await org.api.get(`/orders/${withIdentifierOrderId}`),
+        'read the stored order',
+      )
+      expect(stored.patient.identifier).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ system: 'pims:patient:id', value: withIdentifierPatientId }),
+        ]),
+      )
+
+      const acked = await pollUntil(
+        async () => expectOk<{ orderAcked: boolean, petId: string | null }>(
+          await mock.get(`/__control__/orders/${withIdentifierRequisitionId}`),
+          'read the order from the mock control plane',
+        ),
+        (order) => order.orderAcked,
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(acked.petId).toBe(withIdentifierPatientId)
+      expect(acked.orderAcked).toBe(true)
+
+      ordersBefore = await countOrdersForOrganization(org.organizationId)
+    }, 60_000 + COMPLETION_WAIT_MS + 30_000)
+
     it.failing('an order placed with a pims:patient:id is completed by its own result, with no duplicate order', async () => {
       /* EXPECTED: an order whose patient carries a `pims:patient:id` — what an integrator's PIMS
-       * would normally send, and what orderPayload() supplies by default — is completed by its result
-       * like any other: the order reaches COMPLETED, and the organization holds no more orders after
-       * the result than before it. ACTUAL: the order stays SUBMITTED, and the result is filed under a
+       * would normally send — is completed by its result like any other: the order reaches
+       * COMPLETED, its own report is filled, and the organization holds no more orders after the
+       * result than before it. ACTUAL: the order stays SUBMITTED, and the result is filed under a
        * second, new order.
        *
        * The integration sends Antech the order's `pims:patient:id` as the PetID, and the result
@@ -500,54 +571,15 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
        * It is why the loop's own order deliberately carries no identifier. That order is the positive
        * twin: the same patient WITHOUT the identifier, whose report the same seeded result fills —
        * so the results channel demonstrably delivers, and it is the identifier alone that strands
-       * this order. A separate order (its own requisitionId), and nothing after it reads what it
-       * leaves behind. */
-      const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
-      /* The ref codes are MERGED into the default patient rather than passed as a `patient:`
-       * override, which would replace it whole and drop the `pims:patient:id` this test is about. */
-      payload.patient = {
-        ...(payload.patient as Record<string, unknown>),
-        sex: sexRefCode,
-        species: speciesRefCode,
-        breed: breedRefCode,
-      }
-      const withIdentifierRequisitionId = payload.requisitionId as string
-
-      const created = expectOk<{ id: string }>(
-        await org.api.post('/orders', payload),
-        'place an antech order whose patient carries a pims:patient:id',
-      )
-
-      /* The results channel must be the ONLY route to COMPLETED, or the status assertion below
-       * proves nothing. Seeding a result also flips the mock's order status to completed, and an
-       * order the orders poll has not yet acknowledged is still on that feed — so a result seeded
-       * before the poll's first tick lets the orders channel complete the order, past the guard this
-       * test is about (observed: COMPLETED within one tick, while the result was still filed under a
-       * new order). Let the orders poll see and acknowledge the order at SUBMITTED first; after that
-       * the mock never offers it on the orders feed again. */
-      const acked = await pollUntil(
-        async () => expectOk<{ orderAcked: boolean }>(
-          await mock.get(`/__control__/orders/${withIdentifierRequisitionId}`),
-          'read the order from the mock control plane',
-        ),
-        (order) => order.orderAcked,
-        COMPLETION_WAIT_MS,
-        2_000,
-      )
-      if (!acked.orderAcked) {
-        throw new Error(
-          `precondition: the orders poll did not acknowledge the order within ${COMPLETION_WAIT_MS}ms, so the orders channel could still complete it and this tripwire would say nothing`,
-        )
-      }
-      const ordersBefore = await countOrdersForOrganization(org.organizationId)
-
+       * this order. The order is the one the test above placed and saw acknowledged; nothing after
+       * this test reads what it leaves behind. */
       expectOk(
         await mock.post(`/__control__/orders/${withIdentifierRequisitionId}/results`, {}),
         'seed a result at the mock for the order with a pims:patient:id',
       )
 
       const response = await pollUntil(
-        async () => await org.api.get(`/orders/${created.id}`),
+        async () => await org.api.get(`/orders/${withIdentifierOrderId}`),
         (r) => r.body?.status === 'COMPLETED',
         COMPLETION_WAIT_MS,
         2_000,
@@ -561,13 +593,14 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       const settled = await pollUntil(
         async () => ({
           orders: await countOrdersForOrganization(org.organizationId),
-          reportStatus: (await org.api.get(`/orders/${created.id}/report`)).body?.status,
+          reportStatus: (await org.api.get(`/orders/${withIdentifierOrderId}/report`)).body?.status,
         }),
         (state) => state.orders !== ordersBefore || state.reportStatus === 'FINAL',
         30_000,
         1_000,
       )
-      expect(settled.orders).toBe(ordersBefore)
-    }, 60_000 + COMPLETION_WAIT_MS * 2 + 30_000 + 30_000)
+      expect(settled.reportStatus).toBe('FINAL')
+      expect({ newOrdersForTheResult: settled.orders - ordersBefore }).toEqual({ newOrdersForTheResult: 0 })
+    }, COMPLETION_WAIT_MS + 30_000 + 30_000)
   })
 })
