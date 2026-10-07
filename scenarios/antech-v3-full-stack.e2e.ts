@@ -305,6 +305,26 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       )
       seqBeforeSeed = before.data.reduce((max, event) => Math.max(max, event.seq ?? 0), 0)
 
+      /* The results channel must be the ONLY route to COMPLETED, or this test proves nothing about
+       * reconciliation and the two tests after it race the results poll. Seeding a result also flips
+       * the mock's order status to completed, and an order the orders poll has not yet acknowledged
+       * is still on the orders feed — so a result seeded before the poll's first tick lets the orders
+       * channel (which applies no identity guard and files no report) complete the order in that
+       * tick, while the report is filed only when the results poll fires, up to 30 s later. CI bit on
+       * exactly that: COMPLETED after 16 s, the report still REGISTERED and no report:updated event
+       * when the next two tests read them. Wait for the orders poll to see and acknowledge the order
+       * at SUBMITTED first; after the ack the mock never offers it on the orders feed again. */
+      const acked = await pollUntil(
+        async () => expectOk<{ orderAcked: boolean }>(
+          await mock.get(`/__control__/orders/${requisitionId}`),
+          'read the order from the mock control plane',
+        ),
+        (order) => order.orderAcked,
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(acked.orderAcked).toBe(true)
+
       /* Deterministic completion: the mock holds no results until a test seeds one, so the labResult
        * poll stays empty until this point. Seed a synthetic final ('F') result for this order; the
        * integration's next results poll then pulls the XML, maps it and pushes it back to dmi-api.
@@ -322,7 +342,7 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       )
 
       expect(response.body.status).toBe('COMPLETED')
-    }, COMPLETION_WAIT_MS + 30_000)
+    }, COMPLETION_WAIT_MS * 2 + 30_000)
 
     it('the integration acknowledged the result batch', async () => {
       /* The results processor acks by LabAccessionID after emitting. Asserting it proves the poll ran
@@ -338,6 +358,15 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
     })
 
     it('a report with test results is readable over HTTP', async () => {
+      /* COMPLETED above came from the integration's order-results message; the report is filed by the
+       * results message it sends right after. Give that second message its moment rather than read
+       * the report in the gap between the two. */
+      await pollUntil(
+        async () => await org.api.get(`/orders/${orderId}/report`),
+        (r) => r.body?.status === 'FINAL',
+        30_000,
+        1_000,
+      )
       const report = expectOk<{
         id: string
         status: string
