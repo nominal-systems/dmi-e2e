@@ -976,12 +976,43 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     }, ORDER_ACK_WAIT_MS + 30_000)
   })
 
-  describe('a bird is sent as the species its mapping and default breed name', () => {
-    /* The live half of the bird tripwire at the bottom (dmi-api#377): the `Avian` mapping and its
-     * default breed reach the mock, on the auto-submit path, so the mock's breed-belongs-to-species
-     * check judges the pair at the real ORDER endpoint. What the tripwire asserts on top — that a
-     * bird whose BREED is mapped goes out as that breed's own species — is what dmi-api does not do
-     * today. */
+  describe('a bird goes out as its mapped breed\'s species, else as the Avian mapping and its default breed', () => {
+    /* dmi has one species for birds, `Avian`; Antech has twelve, each with its own breeds, and
+     * refuses a breed sent under another species. So the breed is what names a bird's species:
+     * when it resolves to a provider breed, dmi-api sends that breed's own species; when it does
+     * not, the species mapping and its default breed decide. All three orders go on the
+     * auto-submit path, so the mock's breed-belongs-to-species check judges each pair at the real
+     * ORDER endpoint, as the provider does. */
+    it('a hawk whose breed is mapped to Antech\'s red-tailed hawk goes out as 119 Raptor / 834, not as the species Avian maps to', async () => {
+      /* The breed decides the species. The hawk's breed ref is mapped to 834, a breed of 119
+       * Raptor, so 119 / 834 is the only pair the provider accepts for it — and dmi-api sends it,
+       * whatever `Avian` is mapped to (53 Psittacine here). Was an `it.failing` tripwire until
+       * nominal-systems/dmi-api#383 (for #377): before it, dmi-api mapped species and breed
+       * independently and sent 53 / 834, which the provider refused with `Invalid BreedId 834`.
+       * The refs guard below pins that 834 really is filed under 119 in the catalogue the engine
+       * returned, so this cannot pass by the mock's tree drifting. */
+      const payload = payloadFor([KIDNEY_PANEL_CODE], {
+        patient: patientFor({ name: 'Talon', species: avianSpeciesRefCode, breed: hawkBreedRefCode }),
+        requisitionId: `hrn-v6-hawk-${randomUUID().slice(0, 8)}`,
+      })
+      const requisitionId = payload.requisitionId as string
+
+      const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
+      /* Status and refusal together, so a refused placement fails naming the provider's reason. */
+      expect({ status: response.status, refusal: response.ok ? '' : response.text.slice(0, 300) }).toEqual({
+        status: 201,
+        refusal: '',
+      })
+      expect(response.body.status).toBe('SUBMITTED')
+
+      const received = await mockOrder(requisitionId)
+      expect(received.kind).toBe('order')
+      expect({ speciesId: received.speciesId, breedId: received.breedId }).toEqual({
+        speciesId: HAWK_SPECIES_ID,
+        breedId: HAWK_BREED_ID,
+      })
+    }, 60_000)
+
     it('an Avian patient with no breed goes out as the species mapping and its default breed: 53 / 796', async () => {
       /* `breed: undefined` drops the key from the JSON body: the order carries no breed at all. */
       const payload = payloadFor([KIDNEY_PANEL_CODE], {
@@ -1007,8 +1038,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
     it('an Avian patient with an unmapped breed takes the same fallback: 53 / 796', async () => {
       /* A plain descriptive string resolves to nothing for any provider, as `Ragdoll` does in the
-       * unmapped-patient tripwire; here the species IS mapped, so its default breed is what goes.
-       * Pinned as a plain test because the fix for dmi-api#377 must leave this path alone. */
+       * unmapped-patient tripwire; here the species IS mapped, so its default breed is what goes —
+       * the fix for dmi-api#377 left this path alone, and this pins that it stays so. */
       const payload = payloadFor([KIDNEY_PANEL_CODE], {
         patient: patientFor({ name: 'Scout', species: avianSpeciesRefCode, breed: 'Red-tailed Hawk' }),
         requisitionId: `hrn-v6-unmapped-bird-${randomUUID().slice(0, 8)}`,
@@ -1038,9 +1069,9 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         expect(hawkBreedRefCode).not.toBe(antechCode)
       }
 
-      /* And the pairing the tripwire is about, read from the provider's catalogue as the engine
+      /* And the pairing the hawk test is about, read from the provider's catalogue as the engine
        * returned it: 834 is a breed of 119, not of the 53 `Avian` is mapped to, and 796 is a breed
-       * of 53. Were 834 filed under 53, the hawk order would pass with or without the fix. */
+       * of 53. Were 834 filed under 53, the hawk order would be accepted with or without the fix. */
       expect(liveBreeds.find((item) => item.code === String(HAWK_BREED_ID))?.species).toBe(String(HAWK_SPECIES_ID))
       expect(liveBreeds.find((item) => item.code === String(AVIAN_DEFAULT_BREED_ID))?.species).toBe(
         String(AVIAN_MAPPED_SPECIES_ID),
@@ -1784,44 +1815,6 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         `[antech-v6-scenario] unmapped-patient response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
       )
       expect(response.ok).toBe(true)
-    }, 60_000)
-
-    it.failing('a hawk whose breed is mapped to Antech\'s red-tailed hawk goes out as 119 Raptor / 834, not as the species Avian maps to', async () => {
-      /* EXPECTED: the order is placed and the mock receives SpeciesID 119 / BreedID 834 — the hawk's
-       * breed ref is mapped to 834, a breed of 119 Raptor, so that is the only valid pair for it.
-       * ACTUAL: the provider refuses it, `Invalid BreedId 834`, because dmi-api sends 53 / 834.
-       *
-       * dmi-api maps species and breed independently: the species is whatever single provider
-       * species the dmi species is mapped to (`Avian` -> 53 Psittacine here, the one configuration
-       * that lets any bird order through, with a default breed), and the breed never moves it. dmi
-       * has one species for birds; Antech has twelve, and refuses a breed under another species. So
-       * with the breed correctly mapped the order is refused, and with it unmapped every bird goes
-       * out as the default parrot (the block above pins that half). The fix — the mapped breed's own
-       * species is what gets sent — is dmi-api#377 (nominal-systems/dmi-api#377).
-       *
-       * The two plain tests above are the live half: the same mapping and default reach the mock.
-       * The refs guard above pins that 834 really is filed under 119 in the catalogue the engine
-       * returned, so this cannot pass by the mock's tree drifting. */
-      const payload = payloadFor([KIDNEY_PANEL_CODE], {
-        patient: patientFor({ name: 'Talon', species: avianSpeciesRefCode, breed: hawkBreedRefCode }),
-        requisitionId: `hrn-v6-hawk-${randomUUID().slice(0, 8)}`,
-      })
-      const requisitionId = payload.requisitionId as string
-
-      const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
-      /* Status and refusal together, so the failure names the provider's reason. */
-      expect({ status: response.status, refusal: response.ok ? '' : response.text.slice(0, 300) }).toEqual({
-        status: 201,
-        refusal: '',
-      })
-      expect(response.body.status).toBe('SUBMITTED')
-
-      const received = await mockOrder(requisitionId)
-      expect(received.kind).toBe('order')
-      expect({ speciesId: received.speciesId, breedId: received.breedId }).toEqual({
-        speciesId: HAWK_SPECIES_ID,
-        breedId: HAWK_BREED_ID,
-      })
     }, 60_000)
 
     it('the unmapped-patient refusal reaches the operator with the provider\'s own wording', async () => {
