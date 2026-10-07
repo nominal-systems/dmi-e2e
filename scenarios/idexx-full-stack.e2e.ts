@@ -3,7 +3,7 @@ import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
-import { closePool } from '../src/sql'
+import { closePool, countOrdersForOrganization } from '../src/sql'
 
 /* Full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
@@ -72,7 +72,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * whole default and silently drop the `pims:patient:id` identifier this loop's reconciliation
    * depends on (see orderPayload). Without it dmi-api's matching guard sees a different patient id
    * on the result, reconciles it into a fresh orphan order, and this one stays SUBMITTED: a red
-   * that looks like a broken result loop but is a broken payload. */
+   * that looks like a broken result loop but is a broken payload. The tripwire at the bottom of
+   * this file places exactly such an order, and pins the fix (dmi-api#334). */
   function refMappedOrderPayload (overrides: OrderPayloadOverrides): Record<string, unknown> {
     const payload = orderPayload(org.integrationId, overrides)
     payload.patient = {
@@ -467,5 +468,80 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         'MISSING_TESTS',
       ])
     })
+  })
+
+  /* ---- tripwires ----
+   *
+   * Each asserts the CORRECT behaviour and is marked `failing` while the platform does not have it.
+   * That keeps CI green while the defect stands, and turns the test red the moment someone fixes it
+   * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
+   * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
+   * even though it was supposed to fail", and the only correct response is to delete the marker, not
+   * to relax the assertion. */
+  describe('tripwires: behaviours the loop should have and does not', () => {
+    it.failing('an order placed without a pims:patient:id is completed by its own result, with no duplicate order', async () => {
+      /* EXPECTED: an order whose patient carries no `identifier` at all — which dmi-api's contract
+       * allows, `patient.identifier` being optional — is completed by its result like any other: the
+       * order reaches COMPLETED, and the organization holds no more orders after the result than
+       * before it. ACTUAL: the order stays SUBMITTED, and the result is filed under a second, new
+       * order.
+       *
+       * The integration always sends IDEXX a patient id: the order's `pims:patient:id` when it has
+       * one, and otherwise dmi-api's own internal patient id. The result echoes that id back, and the
+       * integration's result mapper reports it as the result's `pims:patient:id`. dmi-api never stored
+       * its internal id as an identifier, so the order it holds has none — and its matching guard
+       * (ProviderResultUtils.isMatchingOrder) rejects a `pims:patient:id` present on ONE side, not
+       * only two that differ. Both result handlers then refuse the order the result belongs to: the
+       * one that completes orders skips it, and the one that files reports creates a new orphan order
+       * for the result instead. Tracked in nominal-systems/dmi-api#334.
+       *
+       * It is why orderPayload() gives every patient a `pims:patient:id`, and why refMappedOrderPayload
+       * keeps it. The positive twin is the loop's own completion test above: the same order, placed
+       * WITH the identifier, completed by the same seeded result — so the results channel
+       * demonstrably delivers, and it is the missing identifier alone that strands this order. A
+       * separate order (its own requisitionId), and nothing after it reads what it leaves behind. */
+      const payload = orderPayload(org.integrationId, {
+        /* A `patient:` override replaces the default patient WHOLE, identifier included — the very
+         * thing refMappedOrderPayload exists to avoid, and here the point of the test. */
+        patient: { name: 'Bramble', sex: sexRefCode, species: speciesRefCode, breed: breedRefCode },
+        testCodes: [{ code: serviceCode }],
+        devices: [deviceSerial],
+      })
+      const noIdentifierRequisitionId = payload.requisitionId as string
+
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place an idexx order whose patient carries no identifier',
+      )
+      const ordersBefore = await countOrdersForOrganization(org.organizationId)
+
+      expectOk(
+        await mock.post(`/__control__/orders/${noIdentifierRequisitionId}/results`, {}),
+        'seed a result at the mock for the order without an identifier',
+      )
+
+      const response = await pollUntil(
+        async () => await org.api.get(`/orders/${created.id}`),
+        (r) => r.body?.status === 'COMPLETED',
+        90_000,
+        2_000,
+      )
+      expect(response.body.status).toBe('COMPLETED')
+
+      /* The result reaches dmi-api as two messages: the one that completes the order, and — sent
+       * after it — the one that files the report, which is where a duplicate order would be created.
+       * Count only once that second one has run (this order's report is FINAL, or a new order has
+       * appeared), so that a fix to the first handler alone cannot pass here on timing. */
+      const settled = await pollUntil(
+        async () => ({
+          orders: await countOrdersForOrganization(org.organizationId),
+          reportStatus: (await org.api.get(`/orders/${created.id}/report`)).body?.status,
+        }),
+        (state) => state.orders !== ordersBefore || state.reportStatus === 'FINAL',
+        30_000,
+        1_000,
+      )
+      expect(settled.orders).toBe(ordersBefore)
+    }, 30_000 + 90_000 + 30_000 + 20_000)
   })
 })
