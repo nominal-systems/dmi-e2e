@@ -233,6 +233,9 @@ const INVENTORY = [
   { code: 'WPKIT-0006', organizationIdentity: 'HARNESS-KIT-0006', currentStage: 'shipped' },
   { code: 'WPKIT-0007', organizationIdentity: null, currentStage: 'shipped' },
   { code: 'WPKIT-0008', organizationIdentity: 'HARNESS-KIT-0008', currentStage: null },
+  { code: 'WPKIT-0009', organizationIdentity: null, currentStage: 'shipped' },
+  { code: 'WPKIT-0010', organizationIdentity: 'HARNESS-KIT-0010', currentStage: null },
+  { code: 'WPKIT-0011', organizationIdentity: null, currentStage: 'shipped' },
 ]
 
 /* The filter vocabulary each feed accepts. OBSERVED: an unknown key is a 400 naming it, not a

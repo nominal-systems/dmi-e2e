@@ -120,6 +120,12 @@ const KIT_BATCH_HEALTHY = 'WPKIT-0005'
 const KIT_BATCH_PDF_FAILS = 'WPKIT-0006'
 const KIT_EMPTY_SECTIONS = 'WPKIT-0007'
 const KIT_PDF_NOT_GENERATED = 'WPKIT-0008'
+/* The three kits of the report-readiness describe: a result set released while its kit is still
+ * generating the report, a ready one released beside it in the same feed, and a kit that carries
+ * two result sets. The first is followed through two tests, pending and then ready. */
+const KIT_REPORT_PENDING = 'WPKIT-0009'
+const KIT_REPORT_READY_BESIDE = 'WPKIT-0010'
+const KIT_TWO_RESULT_SETS = 'WPKIT-0011'
 
 /* Provider-side kits, provisioned through the mock's control plane rather than activated through
  * dmi — the clinic activating a kit in the vendor's own UI, which is what the integration's status
@@ -129,12 +135,13 @@ const KIT_PROVIDER_FAILED = 'WPKIT-P002'
 const KIT_PROVIDER_FOREIGN = 'WPKIT-P003'
 const KIT_PROVIDER_RESUMED = 'WPKIT-P004'
 const KIT_PETLESS = 'WPKIT-P005'
+const KIT_PROBE_PENDING = 'WPKIT-P006'
 
 /* A hospital the seeded integration is not configured for. The mock holds its kits and its feeds
  * scope them away, which is what the negative below proves. */
 const FOREIGN_HOSPITAL_NUMBER = '700002'
-/* A third hospital, used only for a direct probe of the pet-less page shape, so that page can never
- * reach the engine's own poll. */
+/* A third hospital, used only for direct probes of the mock (the pet-less page shape, a pending
+ * report's answers), so nothing they provision can ever reach the engine's own poll. */
 const PROBE_HOSPITAL_NUMBER = '700003'
 
 /* ---- seeded result content ----
@@ -221,6 +228,7 @@ interface MockKit {
   activated: boolean
   currentStage: string | null
   currentFailure: string | null
+  reportReadyAt: string | null
   acknowledged: boolean
   hospitalNumber: string | null
   hospitalName: string | null
@@ -229,6 +237,7 @@ interface MockKit {
   pdfFailure: string | null
   pet: MockPet | null
   resultSetId: string | null
+  resultSetIds: string[]
   simplifiedFetches: number
   pdfFetches: number
 }
@@ -379,6 +388,50 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       'list the organization\'s orders',
     )
     return orders.find((order) => order.externalId === externalId)
+  }
+
+  async function mockResultSets (what: string): Promise<Array<{ id: string, kitCode: string, acknowledged: boolean }>> {
+    return expectOk<{ resultSets: Array<{ id: string, kitCode: string, acknowledged: boolean }> }>(
+      await mock.get('/__control__/result-sets'),
+      `read the mock result sets ${what}`,
+    ).resultSets
+  }
+
+  /* The engine's results polls since a point in the mock's call log: its requests for the
+   * unacknowledged result sets of the seeded hospital, one per poll. The scenario's own probes
+   * carry the probe bearer and are left out, so a probe can never be counted as a poll. */
+  async function resultsPollsSince (since: number): Promise<MockCall[]> {
+    const log = await mockCalls({ path: '/api/v1/result-sets', method: 'GET', since })
+    return log.calls.filter(
+      (call) =>
+        call.authorization !== `Bearer ${probeToken}` &&
+        call.query['filter[hospital_number]'] === env.wisdomPanel.hospitalNumber,
+    )
+  }
+
+  /* Every acknowledge-result-sets call since a point in the log that names any of these ids. */
+  async function resultSetAcksSince (since: number, ids: string[]): Promise<MockCall[]> {
+    const log = await mockCalls({ path: '/api/voyager/acknowledge-result-sets', method: 'POST', since })
+    return log.calls.filter((call) =>
+      ((call.body?.data?.result_set_ids ?? []) as string[]).some((id) => ids.includes(id)),
+    )
+  }
+
+  /* Activate a kit through POST /orders and wait until the ORDERS poll has delivered and
+   * acknowledged it, so that the orders channel is finished with the kit before a test changes its
+   * stage: the mock does not model re-notification, so an acknowledged kit stays off that feed. */
+  async function activateAndSettle (kitCode: string, patientName: string): Promise<{ orderId: string, kitId: string }> {
+    const kit = await mockKit(kitCode)
+    const created = expectOk<{ id: string, externalId: string, status: string }>(
+      await org.api.post('/orders', payloadFor(kitCode, { patient: patientFor({ name: patientName }) })),
+      `activate kit ${kitCode}`,
+    )
+    expect(created.externalId).toBe(kit.id)
+    const settled = await pollUntil(async () => await mockKit(kitCode), (entry) => entry.acknowledged, ORDER_WAIT_MS, 1_000)
+    if (!settled.acknowledged) {
+      throw new Error(`the orders poll did not acknowledge kit ${kitCode} within ${ORDER_WAIT_MS}ms`)
+    }
+    return { orderId: created.id, kitId: kit.id }
   }
 
   async function services (): Promise<Array<{ code: string, name: string | null }>> {
@@ -1836,6 +1889,291 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         )
       }
     }, 3 * COMPLETION_WAIT_MS + 60_000)
+  })
+
+  describe('a result set released while its kit is still generating the report', () => {
+    /* What Wisdom Panel changed on 2026-09-22. Until then a result set reached the unacknowledged
+     * feed in the same minute as its kit's report became ready; since that evening every one has
+     * reached it about twelve hours EARLIER, while the kit `include`d with it still reads
+     * `current-stage: 'generating-report'` with both readiness keys null. In that window the
+     * simplified endpoint answers 200 with a message and no data, and the PDF generator 404. Some
+     * kits never leave it, and some carry two result sets. (The measurements and their provenance
+     * are in the mock's header, load-bearing detail 9.)
+     *
+     * What the integration does about it: it reads the readiness off the kit it already has, makes
+     * NO request for a set whose kit is not ready, and leaves that set unacknowledged; the set is
+     * delivered on the first poll after the kit turns ready; a kit with several sets is fetched and
+     * delivered once and all its sets acknowledged in one call. An integration without that gate
+     * asks for the simplified result of every pending set on every poll, which is what the first
+     * engine test below goes red on. Its once-a-day warning for a kit pending past its threshold
+     * (36 h by default) is a log line, and is not asserted here.
+     *
+     * The first test pins the mock's own answers at a hospital the engine does not poll; the three
+     * after it drive the engine. */
+    let pendingOrderId = ''
+    let pendingResultSetId = ''
+
+    it('the mock answers for such a set from its kit\'s state: no data and no PDF while pending, both once the report is ready', async () => {
+      /* A direct probe, so that what the engine tests below rest on is pinned in its own right:
+       * the integration under test never asks for a pending kit's results, so nothing it does would
+       * notice these two answers changing. */
+      const kit = await provisionKit({
+        code: KIT_PROBE_PENDING,
+        hospitalNumber: PROBE_HOSPITAL_NUMBER,
+        hospitalName: 'Probe Animal Hospital',
+        veterinarianName: 'Lee Vet',
+        activated: true,
+        stage: 'analyzing',
+        acknowledged: false,
+        pet: { name: 'Fennel', sex: 'female', species: 'cat', ownerFirstName: 'Robin', ownerLastName: 'Vale' },
+      })
+      const auth = { authorization: `Bearer ${probeToken}` }
+      const base = env.wisdomPanel.mockBaseUrl
+
+      /* The kit as the engine's own results poll receives it: `include`d once in the feed. */
+      const feedKit = async (): Promise<{ stage: unknown, at: unknown, on: unknown, sets: number }> => {
+        const response = await fetch(
+          `${base}/api/v1/result-sets` +
+            `?filter%5Bunacknowledged%5D=true&filter%5Bhospital_number%5D=${PROBE_HOSPITAL_NUMBER}&include=kit`,
+          { headers: { ...auth, accept: '*/*' } },
+        )
+        expect(response.status).toBe(200)
+        const body = (await response.json()) as { data: unknown[], included?: Array<{ id: string, attributes: Record<string, unknown> }> }
+        const included = (body.included ?? []).filter((entry) => entry.id === kit.id)
+        expect(included).toHaveLength(1)
+        const attributes = included[0].attributes
+        return { stage: attributes['current-stage'], at: attributes['report-ready-at'], on: attributes['report-ready-on'], sets: body.data.length }
+      }
+
+      try {
+        await seedResultSet(KIT_PROBE_PENDING, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE, reportPending: true })
+
+        /* Pending: the stage, and BOTH readiness keys null — the gate an integration can read. */
+        expect(await feedKit()).toEqual({ stage: 'generating-report', at: null, on: null, sets: 1 })
+
+        /* 200, not an error status, and the message is the WHOLE body: no `data` key at all. */
+        const pendingSimplified = await fetch(`${base}/api/voyager/banfield-results-retrieval/${kit.id}`, { headers: auth })
+        expect({ status: pendingSimplified.status, body: await pendingSimplified.json() }).toEqual({
+          status: 200,
+          body: { message: `WIS_VOY__107: Results for kit with id ${kit.id} are not ready yet.` },
+        })
+        const pendingPdf = await fetch(`${base}/pdf-generator/vet-report/${kit.id}`, { headers: auth })
+        expect({
+          status: pendingPdf.status,
+          contentType: pendingPdf.headers.get('content-type'),
+          body: await pendingPdf.text(),
+        }).toEqual({ status: 404, contentType: 'text/html; charset=utf-8', body: 'Result set not found.' })
+
+        /* The vendor finishes the report. */
+        expectOk(await mock.post(`/__control__/kits/${KIT_PROBE_PENDING}/report-ready`), 'make the probe kit\'s report ready')
+
+        /* Ready: both keys carry the same timestamp. */
+        const ready = await feedKit()
+        expect({ stage: ready.stage, sets: ready.sets }).toEqual({ stage: 'report-ready', sets: 1 })
+        expect(typeof ready.at).toBe('string')
+        expect(Number.isNaN(Date.parse(String(ready.at)))).toBe(false)
+        expect(ready.on).toBe(ready.at)
+
+        const readySimplified = await fetch(`${base}/api/voyager/banfield-results-retrieval/${kit.id}`, { headers: auth })
+        const readyBody = (await readySimplified.json()) as { message: string, data?: Record<string, unknown> }
+        expect({ status: readySimplified.status, message: readyBody.message, keys: Object.keys(readyBody.data ?? {}) }).toEqual({
+          status: 200,
+          message: 'success',
+          keys: ['breed_percentages', 'ideal_weight_result', 'notable_and_at_risk_health_test_results'],
+        })
+        const readyPdf = await fetch(`${base}/pdf-generator/vet-report/${kit.id}`, { headers: auth })
+        expect(readyPdf.status).toBe(200)
+        expect(readyPdf.headers.get('content-type')).toBe('application/pdf')
+        expect(Buffer.from(await readyPdf.arrayBuffer()).subarray(0, 8).toString('latin1')).toBe('%PDF-1.7')
+      } finally {
+        await mock.delete(`/__control__/kits/${KIT_PROBE_PENDING}`)
+      }
+    }, 30_000)
+
+    it('is left alone while the report is pending: no request for it, no acknowledgement, no FINAL report, over several polls', async () => {
+      /* A ready set is released BESIDE the pending one, after it, so every poll that lists the
+       * ready set has met the pending one first; the ready set's acknowledgement is then the
+       * positive evidence that a poll with the pending set in it ran to completion. Without it,
+       * "no request was made" would hold just as well of a poll that died before reaching any set. */
+      const pending = await activateAndSettle(KIT_REPORT_PENDING, 'Rosemary')
+      const beside = await activateAndSettle(KIT_REPORT_READY_BESIDE, 'Basil')
+      pendingOrderId = pending.orderId
+
+      pendingResultSetId = (await seedResultSet(KIT_REPORT_PENDING, {
+        breeds: BREEDS,
+        idealWeight: IDEAL_WEIGHT,
+        notable: NOTABLE_NONE,
+        reportPending: true,
+      })).id
+      await seedResultSet(KIT_REPORT_READY_BESIDE, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE })
+
+      const besideLabel = 'the ready set released beside the pending one'
+      const besideReport = await pollUntil(
+        async () => await org.api.get(`/orders/${beside.orderId}/report`),
+        (response) => response.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      expect({ label: besideLabel, status: besideReport.body?.status }).toEqual({ label: besideLabel, status: 'FINAL' })
+      const besideSets = await pollUntil(
+        async () => await mockResultSets('while the pending set waits'),
+        (sets) => sets.find((set) => set.kitCode === KIT_REPORT_READY_BESIDE)?.acknowledged === true,
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      expect({ label: besideLabel, acknowledged: besideSets.find((set) => set.kitCode === KIT_REPORT_READY_BESIDE)?.acknowledged })
+        .toEqual({ label: besideLabel, acknowledged: true })
+
+      /* Two more polls after that one have run to completion once a third has started: the
+       * results job runs one poll at a time. */
+      const seqAtBesideAck = (await mockCalls()).lastSeq
+      const later = await pollUntil(
+        async () => await resultsPollsSince(seqAtBesideAck),
+        (polls) => polls.length >= 3,
+        POLL_MS * 10,
+        500,
+      )
+      expect(later.length).toBeGreaterThanOrEqual(3)
+
+      /* The pending kit: never asked for, at either per-kit endpoint, in any of those polls. */
+      const label = 'a result set whose kit is still generating its report'
+      const kit = await mockKit(KIT_REPORT_PENDING)
+      expect({ label, simplifiedFetches: kit.simplifiedFetches, pdfFetches: kit.pdfFetches })
+        .toEqual({ label, simplifiedFetches: 0, pdfFetches: 0 })
+      /* ...while the mock still holds it pending, which is what made those polls skip it. */
+      expect({ label, stage: kit.currentStage, reportReadyAt: kit.reportReadyAt })
+        .toEqual({ label, stage: 'generating-report', reportReadyAt: null })
+
+      /* Not acknowledged — by no call at all, not merely "not yet". */
+      const sets = await mockResultSets('while the report is pending')
+      expect({ label, acknowledged: sets.find((set) => set.id === pendingResultSetId)?.acknowledged })
+        .toEqual({ label, acknowledged: false })
+      expect(await resultSetAcksSince(0, [pendingResultSetId])).toEqual([])
+
+      /* And nothing reached dmi-api for it. */
+      const report = await reportFor(pending.orderId)
+      expect({ label, status: report.status }).not.toEqual({ label, status: 'FINAL' })
+
+      /* The positive twin, in the same polls: the ready set's kit was asked for exactly once each. */
+      const besideKit = await mockKit(KIT_REPORT_READY_BESIDE)
+      expect({ label: besideLabel, simplifiedFetches: besideKit.simplifiedFetches, pdfFetches: besideKit.pdfFetches })
+        .toEqual({ label: besideLabel, simplifiedFetches: 1, pdfFetches: 1 })
+    }, 2 * ORDER_WAIT_MS + 2 * COMPLETION_WAIT_MS + POLL_MS * 10 + 30_000)
+
+    it('is delivered on the first poll after the report is ready: FINAL with its PDF, acknowledged once, each per-kit endpoint asked once', async () => {
+      const label = 'the result set once its kit\'s report is ready'
+      if (pendingOrderId === '' || pendingResultSetId === '') {
+        throw new Error('precondition: the pending result set was not seeded — see the test before this one')
+      }
+
+      const flipSeq = (await mockCalls()).lastSeq
+      expectOk(await mock.post(`/__control__/kits/${KIT_REPORT_PENDING}/report-ready`), 'make the pending kit\'s report ready')
+
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${pendingOrderId}/report`),
+        (response) => response.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      expect({ label, status: report.body?.status }).toEqual({ label, status: 'FINAL' })
+
+      /* With its PDF, decoded rather than merely present. */
+      const attachments = expectOk<Array<{ contentType: string, data: string }>>(
+        await org.api.get(`/reports/${report.body.id}/presentedForm`),
+        'read the formerly pending report\'s presented form',
+      )
+      expect(attachments.map((attachment) => attachment.contentType)).toEqual(['application/pdf'])
+      expect(Buffer.from(attachments[0].data, 'base64').subarray(0, 8).toString('latin1')).toBe('%PDF-1.7')
+
+      const order = await org.api.get(`/orders/${pendingOrderId}`)
+      expect({ label, status: order.body.status }).toEqual({ label, status: 'COMPLETED' })
+
+      /* The ack follows the emit, so it is waited for; then several more polls, so "once" means
+       * "and not again". */
+      await pollUntil(
+        async () => await mockResultSets('after the report was made ready'),
+        (sets) => sets.find((set) => set.id === pendingResultSetId)?.acknowledged === true,
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS * 4))
+
+      const acks = await resultSetAcksSince(flipSeq, [pendingResultSetId])
+      expect({ label, acks: acks.map((call) => call.body) })
+        .toEqual({ label, acks: [{ data: { result_set_ids: [pendingResultSetId] } }] })
+
+      /* Each per-kit endpoint asked exactly once over the kit's whole life — the poll that
+       * delivered it, and none of the polls before it. */
+      const kit = await mockKit(KIT_REPORT_PENDING)
+      expect({ label, simplifiedFetches: kit.simplifiedFetches, pdfFetches: kit.pdfFetches })
+        .toEqual({ label, simplifiedFetches: 1, pdfFetches: 1 })
+
+      /* Nothing is delayed: the first results poll to begin after the report became ready is the
+       * one that delivered it. A poll already running when it became ready had listed the kit as
+       * pending, and its request precedes the flip. */
+      const polls = await resultsPollsSince(flipSeq)
+      const pollsUpToTheAck = polls.filter((call) => call.seq < acks[0].seq)
+      expect({ label: 'results polls from report-ready to delivery', polls: pollsUpToTheAck.length })
+        .toEqual({ label: 'results polls from report-ready to delivery', polls: 1 })
+    }, 2 * COMPLETION_WAIT_MS + POLL_MS * 4 + 30_000)
+
+    it('a kit with two unacknowledged result sets is delivered once, and both sets are acknowledged in one call', async () => {
+      /* Some kits carry two unacknowledged result sets. Both are released here while the report is
+       * pending, so that the poll which first finds the kit ready lists both. The counts are taken
+       * from the moment the report is ready: whether a pending kit is asked for at all is the
+       * previous two tests' question; this one is what happens to two sets of one ready kit. */
+      const { orderId } = await activateAndSettle(KIT_TWO_RESULT_SETS, 'Sage')
+      const first = await seedResultSet(KIT_TWO_RESULT_SETS, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE, reportPending: true })
+      const second = await seedResultSet(KIT_TWO_RESULT_SETS, {
+        breeds: BREEDS,
+        idealWeight: IDEAL_WEIGHT,
+        notable: NOTABLE_NONE,
+        reportPending: true,
+        additional: true,
+      })
+      const bothIds = [first.id, second.id].sort()
+      const held = await mockKit(KIT_TWO_RESULT_SETS)
+      expect([...held.resultSetIds].sort()).toEqual(bothIds)
+
+      const flipSeq = (await mockCalls()).lastSeq
+      expectOk(await mock.post(`/__control__/kits/${KIT_TWO_RESULT_SETS}/report-ready`), 'make the two-set kit\'s report ready')
+
+      const label = 'one kit, two result sets'
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${orderId}/report`),
+        (response) => response.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      expect({ label, status: report.body?.status }).toEqual({ label, status: 'FINAL' })
+      await pollUntil(
+        async () => await mockResultSets('after the two-set kit was made ready'),
+        (sets) => bothIds.every((id) => sets.find((set) => set.id === id)?.acknowledged === true),
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS * 4))
+
+      /* BOTH ids, in ONE call. Sorted, because which of the two leads is the integration's choice. */
+      const acks = await resultSetAcksSince(flipSeq, bothIds)
+      expect({ label, acks: acks.map((call) => [...(call.body.data.result_set_ids as string[])].sort()) })
+        .toEqual({ label, acks: [bothIds] })
+
+      /* Fetched once, for the kit, not once per set. */
+      const kit = await mockKit(KIT_TWO_RESULT_SETS)
+      expect({ label, simplifiedFetches: kit.simplifiedFetches - held.simplifiedFetches, pdfFetches: kit.pdfFetches - held.pdfFetches })
+        .toEqual({ label, simplifiedFetches: 1, pdfFetches: 1 })
+
+      /* And delivered once: one report whose panels are the three of one result, each breed once. */
+      const panels = await panelsFor(orderId)
+      expect({ label, panels: panels.map((panel) => panel.code) }).toEqual({
+        label,
+        panels: ['breed_percentages', 'ideal_weight_result', 'notable_and_at_risk_health_test_results'],
+      })
+      const breeds = panels.find((panel) => panel.code === 'breed_percentages')?.observations ?? []
+      expect({ label, breeds: breeds.map((observation) => observation.code) })
+        .toEqual({ label, breeds: BREEDS.map((breed) => breed.slug) })
+    }, ORDER_WAIT_MS + 2 * COMPLETION_WAIT_MS + POLL_MS * 4 + 30_000)
   })
 
   /* ---- tripwires ----
