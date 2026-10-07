@@ -178,7 +178,9 @@ export function orderPayload (
        * when their `pims:patient:id` matches (ProviderResultUtils.isMatchingOrder); without one, the
        * result lands as a duplicate orphan order while the original stays SUBMITTED — a dmi-api
        * reconciliation bug tracked as nominal-systems/dmi-api#334. Supplying one (the mock echoes it
-       * back in the result) is the workaround so the loop closes; it can be dropped once #334 lands. */
+       * back in the result) is the workaround so the loop closes; it can be dropped once #334 lands.
+       * The tripwires at the bottom of the idexx and antech-v3 scenarios pin the fix, one from each
+       * side: an idexx order without the identifier, an antech-v3 order with it. */
       identifier: [{ system: 'pims:patient:id', value: unique('pat') }],
     },
     client: { firstName: 'Jane', lastName: 'Doe' },
