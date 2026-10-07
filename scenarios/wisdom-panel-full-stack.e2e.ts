@@ -1691,8 +1691,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * not the batch: the healthy set in the same feed completes and is acknowledged, and the
        * failing set is left unacknowledged and asked for again on the next tick. The provider's PDF
        * generator does answer 500 for a sizeable minority of real result sets, in two different
-       * bodies; it also answers 404 for a report not generated yet, which the last test of this
-       * block covers.
+       * bodies. A 404 for a kit that says its report is ready is the last test of this block; the
+       * ordinary 404, for a set released before its kit's report, has a describe of its own below.
        *
        * A reaching FINAL is only half the proof: it would hold just as well of a mock that never
        * failed B's PDF at all. So, with B's flag still set, the test also asserts that B's report
@@ -1802,11 +1802,15 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     }, COMPLETION_WAIT_MS + 60_000)
 
     it('a report that is not generated yet is retried each poll and delivered once it appears', async () => {
-      /* The production shape behind the isolation above: Wisdom Panel answers 404 for the vet
-       * report of a freshly released kit until the report is generated, which takes hours. The
-       * status is OBSERVED in production; the body is the one the development endpoint gives any kit
-       * without a report-ready result set, INFERRED for the pending case (the `not-generated` flag). The integration reads a 404 on the PDF call as "not generated
-       * yet": it warns, leaves the set unacknowledged and asks again on the next poll.
+      /* A kit that says its report is READY — `current-stage: 'report-ready'`, both readiness keys
+       * set — while the PDF generator still answers 404 for it (the mock's `not-generated` flag:
+       * the generator's observed 404, served where the kit says the report exists, a combination
+       * nobody has seen the vendor produce). This test was written for the vendor's ordinary
+       * pending report, before it was known that the KIT says when its report is pending; that
+       * case is the describe after this one, where an integration that reads the kit makes no
+       * request at all. What is left here is the anomaly path: the kit is ready, so the integration
+       * does ask, and a 404 must still cost only this set — warned about, left unacknowledged, and
+       * asked for again on the next poll — rather than drop the result or fail the batch.
        *
        * What this can prove from outside is narrower than what the integration does. A 404 and a
        * 500 end the same way here (the set unacknowledged, the report not FINAL, the PDF asked for
@@ -1815,7 +1819,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
        * is that the real HTTP stack hands the 404 to the path that leaves the set for the next
        * poll, and that nothing retries it inside the request: the engine's HTTP layer retries a
        * 5xx once but never a 4xx, so each poll asks for the simplified result once and then the
-       * PDF once, and the PDF count can never get ahead of the simplified one. Then the report
+       * PDF once, and the PDF count can never get ahead of the simplified one. Then the PDF
        * appears (the flag is cleared) and the set is delivered and acknowledged, which shows
        * nothing else was holding it back. */
       const kit = await mockKit(KIT_PDF_NOT_GENERATED)
