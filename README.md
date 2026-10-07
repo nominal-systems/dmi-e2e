@@ -298,6 +298,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   nothing while the report is pending and leaves the set unacknowledged, delivers it on the first
   poll after the report is ready, and delivers a kit with two sets once, acknowledging both in one
   call. The mock's header comment (load-bearing detail 9) has the measurements and their sources.
+  What it asserts is the integration's answer in
+  [dmi-engine-wisdom-panel-integration#51](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/pull/51).
+  `e2e-wisdom-panel.yml` builds the integration at its `main`, so the loop's job is red on those
+  tests until that change merges.
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
@@ -552,13 +556,6 @@ loop workflow's header comment carries its reasoning.
   at `main` and move without a pull request here to trigger a run, so the nightly is what surfaces
   their drift within a day.
 - **On demand**: `workflow_dispatch`, every workflow.
-
-The loop workflows build dmi-api, the engine and the integrations at their `main`. So a pull request
-here that pins behaviour an integration change introduces — a mock that now models a vendor change,
-and a scenario that asserts the integration's answer to it — is red in its loop's job until that
-integration change merges. That red is the dependency, not a defect: such a pull request says in its
-body which integration change it waits for, and the workflow's ref is not pointed at the
-integration's branch to turn it green.
 
 ## Environment
 

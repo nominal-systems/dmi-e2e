@@ -128,6 +128,11 @@
  *    their own: the control plane's `reportPending` seeds a result set whose kit is still
  *    generating its report, and `POST /__control__/kits/{key}/report-ready` is the vendor
  *    finishing it.
+ *    Two result sets on one kit were seen only while its report was PENDING. A kit whose report is
+ *    READY with two sets listed — what finishing such a kit's report through the control plane
+ *    produces here, and what the scenario's two-set test delivers — is INFERRED: the reading is
+ *    that a listed set stays listed until it is acknowledged (detail 6), whatever its kit does
+ *    meanwhile.
  *    The readiness itself travels under TWO keys with the same value, `report-ready-at` and
  *    `report-ready-on` (OBSERVED on every kit of the staging captures of 2026-09-11; the public API
  *    spec names only `-on`). The mock keeps one field and sends it under both, so the two cannot
@@ -164,6 +169,21 @@
  * - **`voyager_kits`.** What the vendor means by it is unknown; OBSERVED only that
  *   `filter[activated]=false&filter[voyager_kits]=true` returns a clinic's unused inventory. Here it
  *   is a per-kit flag, enforced like every other filter.
+ *
+ * And three limits of detail 9, which are choices rather than gaps in the evidence:
+ *
+ * - **The length of the pending window.** The ~12 hours have no duration here. Nothing advances a
+ *   kit on a clock: its report is pending until a scenario calls
+ *   `POST /__control__/kits/{key}/report-ready`. The loop proves what the integration does on
+ *   either side of that step, and nothing about how long it waits.
+ * - **A result set's age.** Its `created-at` is the moment the control plane seeded it, so it is
+ *   always "now". The integration's warning for a kit pending past its threshold (36 h by default,
+ *   measured from that `created-at`) therefore cannot fire here; it is a log line, and the scenario
+ *   would not assert it anyway.
+ * - **A pending kit that carries a failure.** One of the stuck kits of detail 9 read
+ *   `current-failure: 'sample-failed'` while generating its report. The mock can serve that
+ *   (provision the kit with `failure`, then seed with `reportPending`), but no scenario exercises
+ *   it.
  */
 
 const http = require('http')
@@ -716,7 +736,8 @@ function matchesBoolean (value, actual) {
 /* ---- the kit's report state ---- */
 
 /* A kit's result sets, in the order they were seeded (a Map keeps insertion order). Usually one;
- * two is OBSERVED (load-bearing detail 9). */
+ * two is OBSERVED on a kit whose report is pending and INFERRED on one whose report is ready
+ * (load-bearing detail 9). */
 function resultSetsOfKit (kitId) {
   return [...state.resultSets.values()].filter((entry) => entry.kitId === kitId)
 }
@@ -827,9 +848,10 @@ function handleResultSets (req, res, params, query) {
   })
 
   /* Each kit ONCE, however many of its sets the page lists. A kit can carry two unacknowledged
-   * sets (load-bearing detail 9), and JSON:API forbids a compound document from including one
-   * resource twice; the vendor implements JSON:API strictly (detail 4), so a duplicate would be the
-   * mock's invention. INFERRED: no page with two sets of one kit was captured. */
+   * sets (load-bearing detail 9: OBSERVED while its report is pending, INFERRED once it is ready),
+   * and JSON:API forbids a compound document from including one resource twice; the vendor
+   * implements JSON:API strictly (detail 4), so a duplicate would be the mock's invention.
+   * INFERRED: no page with two sets of one kit was captured. */
   const includeAsked = String(query.get('include') || '').split(',').includes('kit')
   const included = includeAsked
     ? [...new Set(sets.map((resultSet) => resultSet.kitId))]
@@ -962,7 +984,10 @@ async function handleAcknowledgeKits (req, res) {
       return sendVoyagerError(res, 422, `WIS_VOY__121: Failed: Kit ${id} could not be found.`, `acknowledge-kits for unknown id ${id}`)
     }
     if (kit.acknowledgedAt === null) kit.acknowledgedAt = nowIso()
-    const resultSet = [...state.resultSets.values()].find((entry) => entry.kitId === kit.id)
+    /* The counterpart id. For a kit with two result sets (load-bearing detail 9), which one the
+     * vendor names here, or whether it names both, was not observed: naming the first is INVENTED,
+     * and the integration discards this body. */
+    const resultSet = resultSetsOfKit(kit.id)[0]
     acknowledged.push({ acknowledged_kit_id: kit.id, related_result_set_id: resultSet?.id ?? null })
   }
   log(`acknowledged ${acknowledged.length} kit(s): ${ids.join(', ')}`)
@@ -1136,9 +1161,12 @@ function handleGetPet (req, res, params, query) {
   }
   if (kit.voyagerPetId !== voyagerPetId) {
     /* INVENTED: the "activated for a different patient" refusal was never captured. Its code is
-     * the mock's own and must not be one the vendor is known to use: `WIS_VOY__107` is OBSERVED, as
-     * the simplified endpoint's "not ready yet" (see handleSimplifiedResults). */
-    return sendVoyagerError(res, 422, `WIS_VOY__108: Failed: Kit ${kitCode} is activated for a different pet.`, `pet lookup mismatch for '${kitCode}'`)
+     * the mock's own and must not be one the vendor is known to use: `WIS_VOY__107` is the
+     * simplified endpoint's "not ready yet" (OBSERVED, see handleSimplifiedResults) and
+     * `WIS_VOY__108` its "Kit analysis has resulted in a failure…" (documented by the
+     * integration). So it follows the mock's other invented codes, 140 and 141, at that
+     * endpoint. */
+    return sendVoyagerError(res, 422, `WIS_VOY__142: Failed: Kit ${kitCode} is activated for a different pet.`, `pet lookup mismatch for '${kitCode}'`)
   }
 
   const pet = state.pets.get(kit.petId)
@@ -1340,8 +1368,10 @@ async function handleControlSetPdfFailure (req, res, params) {
  *     `POST /__control__/kits/{key}/report-ready`. Without it the set is released with its report
  *     ready, as every set was before that date.
  *   - `additional: true` releases a further set for a kit that already has one, as the vendor did
- *     for some of the kits stuck pending. Without it a second seed is refused, so a scenario cannot
- *     double-seed by accident. */
+ *     for some of the kits stuck pending (OBSERVED, with the report pending). Two sets on a kit
+ *     whose report is ready — after `report-ready`, or seeded without `reportPending` — are
+ *     INFERRED (detail 9). Without it a second seed is refused, so a scenario cannot double-seed by
+ *     accident. */
 async function handleControlSeedResultSet (req, res, params) {
   const kit = findKit(params.key)
   if (kit === undefined) return controlError(res, `no kit '${params.key}'`)
@@ -1530,7 +1560,14 @@ function markReportReady (kit) {
  * kit. Whether the kit then returns to the unacknowledged kits feed was not observed and is not
  * modelled (see "Re-notification" in the header), so an order the orders poll has already
  * acknowledged stays where it was. Refused for a kit with no result set, or one already ready: a
- * scenario that thinks it is finishing a pending report and is not must hear about it. */
+ * scenario that thinks it is finishing a pending report and is not must hear about it.
+ *
+ * The answer is the kit plus `seq`: the call log's sequence number at the moment of the flip,
+ * taken in the same tick as it. The result-sets feed is answered in the tick its request is
+ * recorded, so every feed request logged at or below `seq` saw the kit pending and every one above
+ * it saw the kit ready. A scenario that counts polls "after the report became ready" counts from
+ * this; reading `lastSeq` from the call log first and flipping in a second request would count a
+ * poll that slipped in between, which saw the kit pending, as one that came after. */
 function handleControlReportReady (req, res, params) {
   const kit = findKit(params.key)
   if (kit === undefined) return controlError(res, `no kit '${params.key}'`)
@@ -1539,8 +1576,9 @@ function handleControlReportReady (req, res, params) {
   }
   if (reportIsReady(kit)) return controlError(res, `kit '${kit.code}' already has its report ready`)
   markReportReady(kit)
-  log(`kit ${kit.code}: report ready`)
-  sendJson(res, 200, publicKit(kit))
+  const seq = state.nextCallSeq
+  log(`kit ${kit.code}: report ready (call log at seq ${seq})`)
+  sendJson(res, 200, { ...publicKit(kit), seq })
 }
 
 async function handleControlBearer (req, res) {

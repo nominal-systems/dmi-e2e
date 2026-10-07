@@ -409,6 +409,20 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     )
   }
 
+  /* The vendor finishes a kit's report, through the mock's report-ready control. Returns the call
+   * log's sequence number at the moment of the flip, which the mock takes in the same tick: every
+   * results poll logged at or below it saw the kit pending, every one above it saw the kit ready.
+   * Reading `lastSeq` first and flipping in a second request would leave a gap between the two, and
+   * a poll that landed in it would be counted as after the flip though it saw the kit pending. */
+  async function makeReportReady (kitCode: string, what: string): Promise<number> {
+    const { seq } = expectOk<MockKit & { seq: unknown }>(
+      await mock.post(`/__control__/kits/${encodeURIComponent(kitCode)}/report-ready`),
+      what,
+    )
+    if (typeof seq !== 'number') throw new Error(`${what}: the mock's answer carries no call-log seq (got ${String(seq)})`)
+    return seq
+  }
+
   /* Every acknowledge-result-sets call since a point in the log that names any of these ids. */
   async function resultSetAcksSince (since: number, ids: string[]): Promise<MockCall[]> {
     const log = await mockCalls({ path: '/api/voyager/acknowledge-result-sets', method: 'POST', since })
@@ -1969,7 +1983,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         }).toEqual({ status: 404, contentType: 'text/html; charset=utf-8', body: 'Result set not found.' })
 
         /* The vendor finishes the report. */
-        expectOk(await mock.post(`/__control__/kits/${KIT_PROBE_PENDING}/report-ready`), 'make the probe kit\'s report ready')
+        await makeReportReady(KIT_PROBE_PENDING, 'make the probe kit\'s report ready')
 
         /* Ready: both keys carry the same timestamp. */
         const ready = await feedKit()
@@ -2070,8 +2084,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         throw new Error('precondition: the pending result set was not seeded — see the test before this one')
       }
 
-      const flipSeq = (await mockCalls()).lastSeq
-      expectOk(await mock.post(`/__control__/kits/${KIT_REPORT_PENDING}/report-ready`), 'make the pending kit\'s report ready')
+      const flipSeq = await makeReportReady(KIT_REPORT_PENDING, 'make the pending kit\'s report ready')
 
       const report = await pollUntil(
         async () => await org.api.get(`/orders/${pendingOrderId}/report`),
@@ -2113,8 +2126,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         .toEqual({ label, simplifiedFetches: 1, pdfFetches: 1 })
 
       /* Nothing is delayed: the first results poll to begin after the report became ready is the
-       * one that delivered it. A poll already running when it became ready had listed the kit as
-       * pending, and its request precedes the flip. */
+       * one that delivered it. Counted from the mock's own sequence number at the flip, so a poll
+       * that listed the kit while it was still pending — one already running at the flip, or one
+       * that began just before it — is never counted as after it. */
       const polls = await resultsPollsSince(flipSeq)
       const pollsUpToTheAck = polls.filter((call) => call.seq < acks[0].seq)
       expect({ label: 'results polls from report-ready to delivery', polls: pollsUpToTheAck.length })
@@ -2139,8 +2153,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       const held = await mockKit(KIT_TWO_RESULT_SETS)
       expect([...held.resultSetIds].sort()).toEqual(bothIds)
 
-      const flipSeq = (await mockCalls()).lastSeq
-      expectOk(await mock.post(`/__control__/kits/${KIT_TWO_RESULT_SETS}/report-ready`), 'make the two-set kit\'s report ready')
+      const flipSeq = await makeReportReady(KIT_TWO_RESULT_SETS, 'make the two-set kit\'s report ready')
 
       const label = 'one kit, two result sets'
       const report = await pollUntil(
