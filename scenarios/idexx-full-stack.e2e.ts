@@ -544,8 +544,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * for the result instead. Tracked in nominal-systems/dmi-api#334.
        *
        * It is why orderPayload() gives every patient a `pims:patient:id`, and why refMappedOrderPayload
-       * keeps it. The positive twin is the loop's own completion test above: the same order, placed
-       * WITH the identifier, completed by the same seeded result — so the results channel
+       * keeps it. The positive twin is the loop's own completion test above: an order of the same
+       * shape placed WITH the identifier, completed by the same kind of seeded result — so the results channel
        * demonstrably delivers, and it is the missing identifier alone that strands this order. The
        * order is the one the test above placed and seeded a result for; nothing after this test
        * reads what it leaves behind. */
