@@ -288,6 +288,16 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   `included` that is omitted rather than empty, kit activation, both acknowledge channels, the
   simplified genetic result, a binary vet report). Plus dmi-api + ActiveMQ + Redis, behind the
   `wisdom-panel` compose profile. Runs `scenarios/wisdom-panel-full-stack.e2e.ts`.
+  Since 2026-09-22 Wisdom Panel lists a result set about twelve hours before its kit's report is
+  ready, and the mock models that window from the kit's state, the way the vendor shows it: the kit
+  reads `generating-report` with both of its readiness keys (`report-ready-at`, `report-ready-on`)
+  null, the simplified result answers 200 with no data, and the vet report 404. A scenario seeds
+  such a set with `reportPending: true` on `POST /__control__/kits/<kit>/result-sets` (with
+  `additional: true` for a kit's second set), and the vendor finishes the report with
+  `POST /__control__/kits/<kit>/report-ready`. The loop asserts that the integration asks for
+  nothing while the report is pending and leaves the set unacknowledged, delivers it on the first
+  poll after the report is ready, and delivers a kit with two sets once, acknowledging both in one
+  call. The mock's header comment (load-bearing detail 9) has the measurements and their sources.
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
@@ -542,6 +552,13 @@ loop workflow's header comment carries its reasoning.
   at `main` and move without a pull request here to trigger a run, so the nightly is what surfaces
   their drift within a day.
 - **On demand**: `workflow_dispatch`, every workflow.
+
+The loop workflows build dmi-api, the engine and the integrations at their `main`. So a pull request
+here that pins behaviour an integration change introduces — a mock that now models a vendor change,
+and a scenario that asserts the integration's answer to it — is red in its loop's job until that
+integration change merges. That red is the dependency, not a defect: such a pull request says in its
+body which integration change it waits for, and the workflow's ref is not pointed at the
+integration's branch to turn it green.
 
 ## Environment
 
