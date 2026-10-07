@@ -300,7 +300,7 @@ function seedInventory () {
       labOrderNumber: null,
       inboundTrackingCode: null,
       outboundTrackingCode: null,
-      reportReadyOn: null,
+      reportReadyAt: null,
       sampleReceivedOn: null,
       profilingResultPresent: false,
       petId: null,
@@ -565,7 +565,12 @@ function kitItem (req, kit) {
       'inbound-tracking-code': kit.inboundTrackingCode,
       'outbound-tracking-code': kit.outboundTrackingCode,
       'stage-updated-at': kit.stageUpdatedAt,
-      'report-ready-on': kit.reportReadyOn,
+      /* The readiness travels under TWO keys with the same value, `report-ready-at` and
+       * `report-ready-on` (OBSERVED on every kit of the staging captures of 2026-09-11; the public
+       * API spec names only `-on`). One field, sent under both, so the two cannot disagree here and
+       * an integration that reads either one meets the vendor's value. */
+      'report-ready-at': kit.reportReadyAt,
+      'report-ready-on': kit.reportReadyAt,
       'sample-received-on': kit.sampleReceivedOn,
       'relative-counts': {},
       'profiling-result-present': kit.profilingResultPresent,
@@ -1210,7 +1215,7 @@ async function handleControlProvisionKit (req, res) {
     labOrderNumber: body.labOrderNumber ?? null,
     inboundTrackingCode: null,
     outboundTrackingCode: null,
-    reportReadyOn: (body.stage ?? null) === 'report-ready' ? nowIso() : null,
+    reportReadyAt: (body.stage ?? null) === 'report-ready' ? nowIso() : null,
     sampleReceivedOn: null,
     profilingResultPresent: body.activated === true,
     petId,
@@ -1401,7 +1406,7 @@ async function handleControlSeedResultSet (req, res, params) {
    * the REPORT rather than on the order: see the scenario's header. */
   kit.currentStage = 'report-ready'
   kit.stageUpdatedAt = nowIso()
-  kit.reportReadyOn = nowIso()
+  kit.reportReadyAt = nowIso()
   kit.profilingResultPresent = true
   log(`seeded result set ${id} for kit ${kit.code}`)
 
