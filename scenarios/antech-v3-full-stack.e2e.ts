@@ -498,10 +498,10 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
        * the idexx scenario's tripwire, where the identifier is missing from the order instead.
        *
        * It is why the loop's own order deliberately carries no identifier. That order is the positive
-       * twin: the same patient WITHOUT the identifier, completed by the same seeded result — so the
-       * results channel demonstrably delivers, and it is the identifier alone that strands this
-       * order. A separate order (its own requisitionId), and nothing after it reads what it leaves
-       * behind. */
+       * twin: the same patient WITHOUT the identifier, whose report the same seeded result fills —
+       * so the results channel demonstrably delivers, and it is the identifier alone that strands
+       * this order. A separate order (its own requisitionId), and nothing after it reads what it
+       * leaves behind. */
       const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
       /* The ref codes are MERGED into the default patient rather than passed as a `patient:`
        * override, which would replace it whole and drop the `pims:patient:id` this test is about. */
@@ -517,6 +517,28 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
         await org.api.post('/orders', payload),
         'place an antech order whose patient carries a pims:patient:id',
       )
+
+      /* The results channel must be the ONLY route to COMPLETED, or the status assertion below
+       * proves nothing. Seeding a result also flips the mock's order status to completed, and an
+       * order the orders poll has not yet acknowledged is still on that feed — so a result seeded
+       * before the poll's first tick lets the orders channel complete the order, past the guard this
+       * test is about (observed: COMPLETED within one tick, while the result was still filed under a
+       * new order). Let the orders poll see and acknowledge the order at SUBMITTED first; after that
+       * the mock never offers it on the orders feed again. */
+      const acked = await pollUntil(
+        async () => expectOk<{ orderAcked: boolean }>(
+          await mock.get(`/__control__/orders/${withIdentifierRequisitionId}`),
+          'read the order from the mock control plane',
+        ),
+        (order) => order.orderAcked,
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      if (!acked.orderAcked) {
+        throw new Error(
+          `precondition: the orders poll did not acknowledge the order within ${COMPLETION_WAIT_MS}ms, so the orders channel could still complete it and this tripwire would say nothing`,
+        )
+      }
       const ordersBefore = await countOrdersForOrganization(org.organizationId)
 
       expectOk(
@@ -546,6 +568,6 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
         1_000,
       )
       expect(settled.orders).toBe(ordersBefore)
-    }, 60_000 + COMPLETION_WAIT_MS + 30_000 + 30_000)
+    }, 60_000 + COMPLETION_WAIT_MS * 2 + 30_000 + 30_000)
   })
 })
