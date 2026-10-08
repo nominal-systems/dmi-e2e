@@ -339,8 +339,9 @@ function isBlank (value) {
  * A refused order is answered the way the live endpoint answers one — observed on IDEXX's
  * development endpoint and in the integration's captured fixtures: a leading INVALID_ORDER entry
  * ("see data for field level details"), then one entry per problem, the field-level ones carrying
- * `index` (the position in the array the field belongs to). The mapper branches on `index`, so the
- * shape, not just the codes, is what it gets exercised against. */
+ * `index` (the position in the array the field belongs to). The mapper words each entry from its
+ * code's family (MISSING_* is required, INVALID_* is invalid) and reports `index` as a position, so
+ * the codes and the shape are both what it gets exercised against. */
 const INVALID_ORDER = { errorCode: 'INVALID_ORDER', message: 'Invalid order, see data for field level details' }
 
 function sendInvalidOrder (res, problems) {
