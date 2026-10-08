@@ -1,10 +1,13 @@
 import { randomUUID } from 'crypto'
 import { ApiClient, expectOk } from '../src/api-client'
+import { composeLogs } from '../src/containers'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
+import { expectNoSecrets, findSecrets, readRequestStore, RequestStoreRead, SecretNeedle, secretNeedles } from '../src/secrets'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
 import { closePool, query } from '../src/sql'
+import { stacks } from '../src/stacks'
 
 /* Full-system gate for Wisdom Panel (HARNESS_FULL_STACK=1, HARNESS_STACK=wisdom-panel): dmi-api
  * under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL `dmi-engine` container —
@@ -1852,7 +1855,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
    * making the mock refuse the engine's tokens, and a failed Bull job is retried three times with
    * exponential backoff, so that backlog has to drain before anything else can be believed: the
    * audit tripwire is followed by the test that proves the polls resume, and the
-   * re-authentication tripwire, which has nothing after it, comes LAST. */
+   * re-authentication tripwire comes LAST of the tests that need the polls: only the credential
+   * scan follows it, and that reads back what the run left behind without waiting on a poll. */
   describe('tripwires: behaviours the loop should have and does not', () => {
     it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
@@ -2021,5 +2025,97 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         expectOk(await mock.post('/__control__/bearer', { accept: true }), 'restore bearer acceptance at the mock')
       }
     }, NEGATIVE_WAIT_MS + 60_000)
+  })
+
+  /* ---- no credential leaves the stack ----
+   *
+   * The engine is handed the clinic's Wisdom Panel password (provider configuration) and trades it
+   * for a bearer token that lives forty days. Neither should outlive the request that used it, and
+   * after this loop has run its course both do, in two places: dmi-api's provider request store
+   * and the engine containers' stdout. So this block reads both back, last, when the whole run's
+   * traffic is in them, and asserts no credential is there (src/secrets.ts: this loop's password,
+   * the tokens its mock mints, and the shapes any credential takes on the wire).
+   *
+   * One tripwire per upstream issue, each flipped by its own fix — the stored bodies' one by the
+   * token exchange's fix as well, as its comment says. An `it.failing` also passes when the test
+   * throws for any OTHER reason — the store answering nothing, the logs empty — so the inputs are
+   * proven first by plain tests of their own, and the scan logs what it found, since jest keeps a
+   * failing tripwire's message to itself. */
+  describe('no credential leaves the stack', () => {
+    let needles: SecretNeedle[] = []
+    let store: RequestStoreRead = { records: [], details: [], urls: '', headers: '', bodies: '' }
+    let logs = ''
+
+    beforeAll(async () => {
+      needles = secretNeedles('wisdom-panel')
+      store = await readRequestStore(admin, { provider: 'wisdom-panel', integrationIds: [org.integrationId] })
+      logs = await composeLogs(stacks['wisdom-panel'].logServices)
+    }, 120_000)
+
+    it('the scan is armed: this loop\'s password and a minted token are found, and their masked forms are not', () => {
+      /* Without this, a scan that matched nothing at all would pass every guard below once the
+       * tripwires are flipped. The planted token has the mock's shape but is not one it issued. */
+      expect(findSecrets(`{"password":"${env.wisdomPanel.password}"}`, needles)).not.toEqual([])
+      expect(findSecrets('Authorization: Bearer wp-mock-00000000-0000-4000-8000-000000000000', needles)).not.toEqual([])
+      expect(findSecrets('{"password":"***"} Authorization: Bearer ***', needles)).toEqual([])
+    })
+
+    it('the request store holds this integration\'s traffic, and a record\'s detail carries its body and payload', () => {
+      /* The positive twin of the two store tripwires: the headline activation is in the store
+       * under this integration, and its detail came back with the request payload — the kit code
+       * is in it — so the scan below reads real records rather than an empty page. */
+      expect(store.records.length).toBeGreaterThan(0)
+      expect(store.details).toHaveLength(store.records.length)
+      const activation = store.details.find(
+        (detail) => detail.method === 'POST' && detail.url.includes('/api/voyager/pet') && (detail.accessionIds ?? []).includes(KIT_ACTIVATION),
+      )
+      if (activation === undefined) {
+        throw new Error(`no activation of ${KIT_ACTIVATION} among the ${store.records.length} stored records: ${JSON.stringify(store.records.map((record) => `${record.method} ${new URL(record.url).pathname}`))}`)
+      }
+      expect(String(activation.payload)).toContain(`"code":"${KIT_ACTIVATION}"`)
+      expect(activation.body).toBeDefined()
+    })
+
+    it('the engine containers\' logs were read, from both processes\' start', () => {
+      /* The positive twin of the log tripwire. `Engine starting with role …` is the line the
+       * engine's bootstrap always prints, once per process. */
+      expect(logs).toContain("Engine starting with role 'api'")
+      expect(logs).toContain("Engine starting with role 'worker'")
+      for (const service of stacks['wisdom-panel'].logServices) {
+        expect(logs).toMatch(new RegExp(`^${service}-\\d+\\s+\\|`, 'm'))
+      }
+    })
+
+    it.failing('the token exchange is not in the request store', () => {
+      /* https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/45 — the
+       * integration sends its token exchange, password and token included, to the request store.
+       * Flips when it stops; a refused grant must not be stored either, hence any status. */
+      if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
+      const exchanges = store.records.filter((record) => record.url.includes('/oauth/token'))
+      expect(exchanges.map((record) => `${record.method} ${new URL(record.url).pathname} ${record.status}`)).toEqual([])
+    })
+
+    it.failing('no stored header, body or payload carries a credential', () => {
+      /* https://github.com/nominal-systems/dmi-api/issues/376 — dmi-api stores the body and payload
+       * an engine emits as they come, so the token exchange above keeps the password (payload) and
+       * the token (body). Flips when the store masks them — or when #45 keeps the exchange out of
+       * the store, since it is the only record that carries a credential here: no stored record
+       * carries request headers, and this loop provokes no refused login, which would be stored
+       * with its password too (the comment thread on
+       * https://github.com/nominal-systems/dmi-engine-common/issues/29). Headers are scanned all
+       * the same. */
+      if (store.records.length === 0) throw new Error('precondition: the request store read returned nothing')
+      expectNoSecrets(`${store.headers}\n${store.bodies}`, needles, 'the wisdom-panel request store (headers, bodies, payloads)')
+    })
+
+    it.failing('the engine containers\' logs carry no credential', () => {
+      /* https://github.com/nominal-systems/dmi-engine-common/issues/31 (and its comment) — with
+       * `HTTP_DEBUG=true`, which this harness sets on the engine, the shared base API service prints
+       * every request's headers and every POST's body, so each login prints the password and every
+       * call its bearer token. Flips when that dump is redacted, in the common release the engine's
+       * lockfile picks up. */
+      if (logs === '') throw new Error('precondition: the engine logs read returned nothing')
+      expectNoSecrets(logs, needles, `the logs of ${stacks['wisdom-panel'].logServices.join(', ')}`)
+    })
   })
 })

@@ -364,6 +364,37 @@ touches a live Zoetis host. What differs from the other two:
   and breed. Why it takes a value assertion: the *Ref-mapped fields need value assertions* rule in
   [CLAUDE.md](CLAUDE.md).
 
+### The credential scan
+
+The antech-v6, wisdom-panel and antech-v3 loops end with a block, `no credential leaves the stack`,
+that reads back what the run left behind and asserts that no provider credential is in it
+(`src/secrets.ts`). It looks for the loop's dummy password, the tokens its mock mints, and the
+shapes a credential takes on the wire whatever its value: a query parameter, a JSON member, an
+`Authorization` header, a bearer token. Each shape is written so that the masked `***` a fix writes
+does not match. A hit is reported as an excerpt with every secret in it masked, and is also logged,
+because an `it.failing` test keeps its message to itself.
+
+What it reads:
+
+- dmi-api's provider request store, `GET /admin/external-requests`: the list and every record's
+  detail, for every integration the loop created (the antech-v6 loop makes a second one to provoke
+  a refused login);
+- the order records it names, `GET /orders/:id` (and, for classic Antech, `GET /orders/:id/manifest`),
+  with the organization's `GET /events` that concern them;
+- the logs of the loop's `logServices` containers (`src/stacks.js`), through `docker compose logs`.
+
+What it does not read: dmi-api's own stdout, the mocks' logs (the provider's side), and the
+wisdom-panel loop's stored URLs on their own (that provider takes no credential in a URL). The
+idexx and zoetis loops have no scan yet.
+
+On today's engines most of those places hold a credential, so each check is an `it.failing`
+tripwire, one per place and issue, whose comment names the issue whose fix flips it. Classic
+Antech's stored bodies and payloads hold none, because that loop provokes no refused login, so
+there the check is a plain guard. The `dmi-engine-common` tripwires flip only once an engine's
+lockfile picks up a `dmi-engine-common` release carrying the fix: the harness builds each engine
+from its checkout, but installs `dmi-engine-common` from the registry, and today `dmi-engine` and
+the antech and wisdom-panel integrations lock 1.6.0, the antech-v6 integration 1.7.0.
+
 ### The idexx mock (VetConnect Plus)
 
 `src/idexx-mock/server.js` is a small, zero-dependency Node HTTP server that stands in for IDEXX (its VetConnect Plus API). It speaks IDEXX's **public, documented dialect** (developer.vetconnectplus.com)
@@ -636,7 +667,7 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
-  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
+  stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class, and `logServices` — the compose services whose logs the scenario's credential scan reads); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
   containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
@@ -649,6 +680,7 @@ src/
   antech-v6-mock/server.js    the antech-v6 mock provider (zero-dependency Node HTTP server)
   wisdom-panel-mock/server.js the wisdom-panel mock provider (zero-dependency Node HTTP server)
   poll.ts                     pollUntil, shared by the full-system scenarios
+  secrets.ts                  the credential scan: needles, masked excerpts, and readers for the request store, order records and events (see "The credential scan")
   report/summary-reporter.js  jest reporter: writes reports/<suite>/summary.json when the run ends
   report/report.ts            run.json at setup, the run index, publishing to the nginx directory
   report/publish.ts           `npm run report:publish`
@@ -665,7 +697,7 @@ scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
-  antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
+  antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end, four tripwires red by design (the credential scan's)
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
@@ -705,7 +737,18 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 | antech-v6 | `the orders channel completes an order whose provider status has reached Final` | COMPLETED. Today it stays SUBMITTED: the integration's status enum is numeric and the provider sends strings, so every completion assertion in the loop rests on the results channel | [dmi-engine-antech-v6-integration#84](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/84) |
 | antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
 | antech-v6 | `an order for a patient with no species OR breed mapping is still placeable` | The order is placed. Today the provider refuses it: the integration's default species and default breed are not a valid pair | [dmi-engine-antech-v6-integration#88](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/88) |
+| antech-v6 | `the pre-order's submissionUri carries no token, in the order record, its events or the engine log` | The link identifies the draft by its accession id alone. Today it carries the integration's login token, which dmi-api keeps on the order and in its events, and the integration prints in its log | [dmi-engine-antech-v6-integration#85](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/85) |
+| antech-v6 | `no stored URL carries a credential` | Stored request URLs have their credential parameters masked. Today the test-guide fetch is stored as `…/Tests/v6?accesstoken=…` | [dmi-engine-common#31](https://github.com/nominal-systems/dmi-engine-common/issues/31) (the emitter) and [dmi-api#376](https://github.com/nominal-systems/dmi-api/issues/376) (the store); whichever lands first flips it |
+| antech-v6 | `no stored header, body or payload carries a credential` | Stored bodies and payloads have their credential fields masked. Today a refused login (this loop's foreign-clinic test) is stored with the clinic's password in its payload: the shared interceptor's rejection path never consults the exclusion list | [dmi-api#376](https://github.com/nominal-systems/dmi-api/issues/376) (the store); the engine side is [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5946025238) |
+| antech-v6 | `the engine containers' logs carry no credential` | No token or password in the engine's stdout. Today the `HTTP_DEBUG` dumps print every login body and every request's `accessToken` header, and the test-guide URL is logged with its token | [dmi-engine-common#31](https://github.com/nominal-systems/dmi-engine-common/issues/31) (and its comment) |
+| antech-v3 | `the order's submissionUri and manifest carry no token, in the order record or its events` | The order's links identify the order alone. Today the manifest fetched at placement is kept with `?accessToken=` in its URI, on the order, at its manifest endpoint and in its events | [dmi-engine-antech-integration#57](https://github.com/nominal-systems/dmi-engine-antech-integration/issues/57) |
+| antech-v3 | `no stored URL carries a credential` | As in the antech-v6 loop. Today every stored request URL ends in `?accessToken=…`, the provider's own auth scheme | [dmi-engine-common#31](https://github.com/nominal-systems/dmi-engine-common/issues/31) and [dmi-api#376](https://github.com/nominal-systems/dmi-api/issues/376); whichever lands first flips it |
+| antech-v3 | `the integration's own error lines carry no credential` | A failed placement is logged without the request's token. Today the integration's error handler prints the full URL, token included | [dmi-engine-antech-integration#59](https://github.com/nominal-systems/dmi-engine-antech-integration/issues/59) |
+| antech-v3 | `the integration container's other log lines carry no credential` | No token in the integration's stdout. Today the shared interceptor logs every request URL with `?accessToken=` | [dmi-engine-common#31](https://github.com/nominal-systems/dmi-engine-common/issues/31) |
 | wisdom-panel | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | As in the antech-v6 loop: dmi-api's defect, not the provider's | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | wisdom-panel | `a result whose ideal-weight section is empty yields no ideal-weight items` | No ideal-weight panel. Today three DONE items with no value | [dmi-engine-wisdom-panel-integration#46](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/46) |
 | wisdom-panel | `a provider error on the orders poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none, as in the antech-v6 loop | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
 | wisdom-panel | `the integration re-authenticates when the provider stops accepting its token` | A new token after a 401. Today the token is cached for ten days and never refreshed, so a credential rotated at the provider fails every call until the cache expires | no open issue |
+| wisdom-panel | `the token exchange is not in the request store` | The `POST /oauth/token` exchange is excluded from the audit trail. Today it is stored, with the clinic's password in the payload and the access token in the body | [dmi-engine-wisdom-panel-integration#45](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/45) |
+| wisdom-panel | `no stored header, body or payload carries a credential` | Stored bodies and payloads have their credential fields masked. Today the token exchange's are stored verbatim | [dmi-api#376](https://github.com/nominal-systems/dmi-api/issues/376) (the store) or [dmi-engine-wisdom-panel-integration#45](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/45) (the emitter); whichever lands first flips it |
+| wisdom-panel | `the engine containers' logs carry no credential` | No token or password in the engine's stdout. Today the `HTTP_DEBUG` dumps print the login body and every request's bearer header | [dmi-engine-common#31](https://github.com/nominal-systems/dmi-engine-common/issues/31) (and its comment) |
