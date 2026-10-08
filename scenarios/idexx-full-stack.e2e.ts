@@ -448,14 +448,15 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(response.text).toMatch(/NOT-A-REAL-IDEXX-CODE/)
       expect(response.text).not.toMatch(/failed with \d+ status code/)
       expect(response.text).not.toMatch(/undefined error in idexx/)
-      /* And the entry is worded from its code's family: an INVALID_* code is a value the provider
-       * refused, not a missing one. The entry carries `index` (the offending test's position), which
-       * the mapper used to read as "required" — telling the operator that a test code they supplied
-       * was missing (dmi-engine-idexx-integration#85). The index is reported as a position. */
-      expect(response.text).toMatch(
-        /INVALID_LAB_SERVICE_ID is invalid for idexx: unknown test code\(s\): NOT-A-REAL-IDEXX-CODE \(index 0\)/,
-      )
-      expect(response.text).not.toMatch(/is required by idexx/)
+      /* And each entry is worded from its code's family: an INVALID_* code is a value the provider
+       * refused, not a missing one. The field-level entry carries `index` (the offending test's
+       * position), which the mapper used to read as "required" — telling the operator that a test code
+       * they supplied was missing (dmi-engine-idexx-integration#85); it is reported as a position. The
+       * whole array, so an entry the mapper drops goes red too, not only a mislabelled one. */
+      expect(response.body.errors).toEqual([
+        'INVALID_ORDER is invalid for idexx: Invalid order, see data for field level details',
+        'INVALID_LAB_SERVICE_ID is invalid for idexx (index 0): unknown test code(s): NOT-A-REAL-IDEXX-CODE',
+      ])
     }, 30_000)
 
     it("the mock refuses an empty order with IDEXX's per-field codes, under its INVALID_ORDER entry", async () => {
