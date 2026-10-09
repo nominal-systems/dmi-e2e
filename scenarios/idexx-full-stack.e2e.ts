@@ -69,11 +69,11 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
   /* An order payload whose patient carries the canonical dmi ref codes. The default patient is kept
    * and only its species/sex/breed replaced — NOT a `patient:` override, which would replace the
-   * whole default and silently drop the `pims:patient:id` identifier this loop's reconciliation
-   * depends on (see orderPayload). Without it dmi-api's matching guard sees a different patient id
-   * on the result, reconciles it into a fresh orphan order, and this one stays SUBMITTED: a red
-   * that looks like a broken result loop but is a broken payload. The tripwire at the bottom of
-   * this file places exactly such an order, and pins the fix (dmi-api#334). */
+   * whole default and silently drop its `pims:patient:id` (see orderPayload). The order would still
+   * reconcile, but IDEXX would then be sent dmi-api's internal patient id instead of one the
+   * scenario chose, so the patient id the integration forwards would no longer be a known value.
+   * The dmi-api#334 guard at the bottom of this file places an order without the identifier on
+   * purpose. */
   function refMappedOrderPayload (overrides: OrderPayloadOverrides): Record<string, unknown> {
     const payload = orderPayload(org.integrationId, overrides)
     payload.patient = {

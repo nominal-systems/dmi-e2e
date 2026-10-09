@@ -44,15 +44,14 @@ import { closePool } from '../src/sql'
  *     IDEXX_*_POLLING_INTERVAL_MS), exactly as with antech — so the waits below budget whole
  *     intervals. A slow pass here is the poll cadence, not a hang.
  *
- * RECONCILIATION IS A THIRD CASE, and it is worth stating because copying either of the other two
- * scenarios would be wrong. dmi-api's `ProviderResultUtils.isMatchingOrder` compares
- * `pims:patient:id` across the order it holds and the order the integration extracts FROM A RESULT,
- * and rejects the match when only one side carries one. idexx must therefore SUPPLY the identifier
- * (dmi-api#334) and antech must OMIT it (its mapper tags `antech:pet:id`). Zoetis reaches that guard
- * at all: `ZoetisMapper.mapLabReport` attaches no `.order` to a result, so results always take
- * dmi-api's externalId path and `isMatchingOrder` is never consulted. Reconciliation is therefore
- * purely `PracticeRef == client_order_id == externalId == requisitionId`. Carrying a patient
- * identifier is a free choice; this scenario omits one, mirroring antech, to keep the order minimal.
+ * RECONCILIATION IS externalId-ONLY, unlike the idexx and antech-v3 loops. Their results carry an
+ * extracted order, which dmi-api's `ProviderResultUtils.isMatchingOrder` compares with the order it
+ * holds (patient name, client last name, and `pims:patient:id` where both sides carry one). Zoetis
+ * never reaches that guard at all: `ZoetisMapper.mapLabReport` attaches no `.order` to a result, so
+ * results always take dmi-api's externalId path and `isMatchingOrder` is never consulted.
+ * Reconciliation is therefore purely `PracticeRef == client_order_id == externalId ==
+ * requisitionId`, and this scenario omits the patient identifier, as the antech-v3 loop's own order
+ * does, to keep the order minimal.
  *
  * A note on the mock, because it is what makes these assertions worth anything: it VALIDATES the
  * order it receives rather than defaulting the missing bits, and it enforces its own catalogues for
@@ -262,8 +261,8 @@ describe('zoetis full-stack (Zoetis mock)', () => {
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
     it('POST /orders creates the order via the real zoetis integration (externalId assigned)', async () => {
       /* Deliberately NO `pims:patient:id` identifier — see the reconciliation note in the file
-       * header. For zoetis it is a free choice rather than a workaround, because its results never
-       * reach dmi-api's patient-matching guard; omitting it keeps the order minimal.
+       * header. Zoetis results never reach dmi-api's patient-matching guard, so the identifier plays
+       * no part in reconciliation here; omitting it keeps the order minimal.
        *
        * species/sex are canonical dmi ref codes, NOT provider codes: dmi-api maps them to the zoetis
        * vocabulary on the way to the engine, and the next test asserts the mapped values arrived.

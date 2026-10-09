@@ -207,17 +207,13 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
 
   describe('an order round-trips through the real integration and the mock, and the loop closes', () => {
     it('POST /orders creates the order via the real antech integration (externalId assigned)', async () => {
-      /* Deliberately NO `pims:patient:id` identifier, which is where antech parts company with idexx.
-       * The antech result mapper tags the patient it extracts from a result with its own
-       * `antech:pet:id` system, while dmi-api's reconciliation guard (ProviderResultUtils
-       * .isMatchingOrder) looks up `pims:patient:id` on both sides and rejects the match when only
-       * one side has it. An order carrying one would therefore never be updated by its own results —
-       * dmi-api logs "Skipping order update ... patient/client mismatch" and the order sits at
-       * SUBMITTED forever. Omitting it leaves both sides without a patient id, which the guard
-       * treats as compatible, and reconciliation falls back to patient name + client last name (both
-       * echoed by the mock). This is the mirror image of the idexx scenario, which must SUPPLY the
-       * identifier to work around dmi-api#334. The tripwire at the bottom of this file places an
-       * order WITH the identifier, and pins the fix.
+      /* Deliberately NO `pims:patient:id` identifier (the `patient:` override below replaces
+       * orderPayload()'s default patient whole), so that the loop covers both shapes an antech order
+       * can take: this one without, the dmi-api#334 guard at the bottom of this file with. The antech
+       * result mapper tags the patient id it extracts from a result with its own `antech:pet:id`
+       * system, so a result here never carries a `pims:patient:id`; with none on the order either,
+       * dmi-api's reconciliation guard (ProviderResultUtils.isMatchingOrder) compares patient name
+       * and client last name, both echoed by the mock.
        *
        * autoSubmitOrder is not passed: it drives idexx's confirmOrder handshake and antech has no
        * equivalent — placement is a single POST and the order is SUBMITTED once it lands.
@@ -508,8 +504,8 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
    * a plain test in front of it, chained through the describe's own `let`s as the loop's tests are. */
   describe('reconciliation with a pims:patient:id on the order side only (dmi-api#334)', () => {
     /* The PIMS patient id this block's order is placed with — its own, explicitly, rather than
-     * orderPayload()'s default, which is a workaround for the very defect the tripwire pins and may
-     * be dropped once that is fixed. */
+     * orderPayload()'s default, so that the guard states the shape it tests instead of inheriting it
+     * from a shared default. */
     const withIdentifierPatientId = `pat-${randomUUID().slice(0, 8)}`
     let withIdentifierOrderId: string
     let withIdentifierRequisitionId: string

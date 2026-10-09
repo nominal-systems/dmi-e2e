@@ -42,11 +42,10 @@ import { closePool, query } from '../src/sql'
  * RECONCILIATION. dmi-api matches a polled result to its order on `externalId`, and for antech-v6
  * that is the whole of it: `mapAntechV6Result` attaches a `.order` to a result ONLY when the result
  * is an orphan (empty ClinicAccessionID), and this harness seeds no orphans — so dmi-api's
- * patient-matching guard (`ProviderResultUtils.isMatchingOrder`) is never consulted and the
- * `pims:patient:id` identifier is a FREE CHOICE, as with zoetis rather than with idexx (which must
- * supply one) or antech-v3 (which must omit one). The orders here keep the harness's default
- * patient identifier, which becomes the provider's `PetID`, because carrying it costs nothing and
- * makes the forwarded patient assertable. The id that matters is
+ * patient-matching guard (`ProviderResultUtils.isMatchingOrder`) is never consulted, as with zoetis,
+ * and the `pims:patient:id` identifier plays no part in reconciliation. The orders here keep the
+ * harness's default patient identifier, which becomes the provider's `PetID`, because carrying it
+ * costs nothing and makes the forwarded patient assertable. The id that matters is
  * `requisitionId == ClinicAccessionID == externalId`.
  *
  * POLL CADENCE. The engine exposes ANTECH_V6_POLLING_INTERVAL_MS and the compose profile dials it

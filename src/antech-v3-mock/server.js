@@ -246,8 +246,10 @@ function buildLabOrder (order) {
  * (ProviderResultUtils.isMatchingOrder — patient name and client last name must agree).
  *
  * PetID/ClientID are echoed only when the order carried them. Note the integration tags them with
- * its own identifier systems ('antech:pet:id' / 'antech:client:id'), NOT the PIMS ones — see the
- * scenario's note on why the harness's order deliberately carries no pims:patient:id. */
+ * its own identifier systems ('antech:pet:id' / 'antech:client:id'), NOT the PIMS ones: for an
+ * order placed with a pims:patient:id, the result carries none, so the id is on the order's side
+ * only — the shape the scenario's dmi-api#334 guard places on purpose, next to the loop's own order
+ * without one. */
 function buildLabResult (order) {
   const result = order.result
   const entry = {
