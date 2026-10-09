@@ -331,10 +331,10 @@ function isBlank (value) {
 }
 
 /* IDEXX's error envelope (`ErrorResponse` -> `{ errors: [{ errorCode, message, index? }] }`). The
- * field is `errorCode`, not `code`: the integration's own providerErrorMapper reads
- * `providerError.errorCode` (and its IDEXX-captured fixtures carry that name), so emitting `code`
- * here renders every rejection as "undefined error in idexx: ..." — legible enough to debug by
- * accident, but it leaves the mapper's real branch unexercised by the gate.
+ * field is `errorCode`, not `code`, as in IDEXX's spec and the integration's IDEXX-captured
+ * fixtures. The integration's providerErrorMapper falls back to `code` when `errorCode` is absent,
+ * so a mock keyed `code` would still render correctly and the scenario could not tell: keep the
+ * provider's name here, because the gate is only as faithful as the envelope it is fed.
  *
  * A refused order is answered the way the live endpoint answers one — observed on IDEXX's
  * development endpoint and in the integration's captured fixtures: a leading INVALID_ORDER entry
