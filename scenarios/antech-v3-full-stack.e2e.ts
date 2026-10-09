@@ -501,16 +501,12 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
     }, 30_000)
   })
 
-  /* ---- tripwires ----
+  /* ---- dmi-api#334 guards ----
    *
-   * Each asserts the CORRECT behaviour and is marked `failing` while the platform does not have it.
-   * That keeps CI green while the defect stands, and turns the test red the moment someone fixes it
-   * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
-   * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
-   * even though it was supposed to fail", and the only correct response is to delete the marker, not
-   * to relax the assertion. A tripwire's preconditions run as a plain test in front of it, chained
-   * through the describe's own `let`s as the loop's tests are: see the first test below for why. */
-  describe('tripwires: behaviours the loop should have and does not', () => {
+   * These tests guard the dmi-api#334 fix (dmi-api#384): an order whose `pims:patient:id` is on one
+   * side only — here the order's — is completed by its own result. The guard's preconditions run as
+   * a plain test in front of it, chained through the describe's own `let`s as the loop's tests are. */
+  describe('reconciliation with a pims:patient:id on the order side only (dmi-api#334)', () => {
     /* The PIMS patient id this block's order is placed with — its own, explicitly, rather than
      * orderPayload()'s default, which is a workaround for the very defect the tripwire pins and may
      * be dropped once that is fixed. */
@@ -520,23 +516,23 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
     let ordersBefore: number
 
     it('the orders poll acknowledges an order placed with a pims:patient:id, and dmi-api stores the identifier', async () => {
-      /* The setup half of the tripwire below, split out and deliberately NOT marked `failing`. Inside
-       * `it.failing` every throw counts as "failed as expected", so a precondition living there is
-       * silent: if the orders poll stopped acknowledging, or dmi-api stopped storing the identifier,
-       * the tripwire would keep passing on main for the wrong reason and could never fire when the
-       * fix lands. Here a broken precondition is a red run.
+      /* The setup half of the guard below, kept as a test of its own so that a red names which half
+       * broke. A red here means a precondition has gone — the orders poll stopped acknowledging, or
+       * dmi-api stopped storing the identifier — and without it the guard could pass without
+       * exercising the fix. A red below means the fix itself has regressed.
        *
-       * Two preconditions. First, the order really carries a `pims:patient:id`: the tripwire is about
+       * Two preconditions. First, the order really carries a `pims:patient:id`: the guard is about
        * an identifier present on the order's side only, so the stored order must hold it, and the
        * provider must have been sent it as the PetID it echoes back on the result.
        *
-       * Second, the results channel must be the ONLY route to COMPLETED, or the tripwire's status
+       * Second, the results channel must be the ONLY route to COMPLETED, or the guard's status
        * assertion proves nothing. Seeding a result also flips the mock's order status to completed,
        * and an order the orders poll has not yet acknowledged is still on that feed — so a result
        * seeded before the poll's first tick lets the orders channel complete the order, past the
-       * guard the tripwire is about (observed: COMPLETED within one tick, while the result was still
-       * filed under a new order). So the orders poll must see and acknowledge the order at SUBMITTED
-       * first; after that the mock never offers it on the orders feed again. */
+       * matching guard the test below is about (observed before the fix: COMPLETED within one tick,
+       * while the result was still filed under a new order). So the orders poll must see and
+       * acknowledge the order at SUBMITTED first; after that the mock never offers it on the orders
+       * feed again. */
       const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }] })
       /* The ref codes and the identifier are MERGED into the default patient rather than passed as a
        * `patient:` override, the way the idexx scenario's refMappedOrderPayload does it. */
@@ -580,28 +576,25 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       ordersBefore = await countOrdersForOrganization(org.organizationId)
     }, 60_000 + COMPLETION_WAIT_MS + 30_000)
 
-    it.failing('an order placed with a pims:patient:id is completed by its own result, with no duplicate order', async () => {
-      /* EXPECTED: an order whose patient carries a `pims:patient:id` — what an integrator's PIMS
-       * would normally send — is completed by its result like any other: the order reaches
-       * COMPLETED, its own report is filled, and the organization holds no more orders after the
-       * result than before it. ACTUAL: the order stays SUBMITTED, and the result is filed under a
-       * second, new order.
+    it('an order placed with a pims:patient:id is completed by its own result, with no duplicate order', async () => {
+      /* An order whose patient carries a `pims:patient:id` — what an integrator's PIMS normally
+       * sends — is completed by its result like any other: the order reaches COMPLETED, its own
+       * report is filled, and the organization holds no more orders after the result than before it.
        *
-       * The integration sends Antech the order's `pims:patient:id` as the PetID, and the result
-       * echoes it back — but the integration's result mapper tags the echoed id with its own
-       * `antech:pet:id` system, so the result carries no `pims:patient:id` at all while the order
-       * dmi-api holds does. dmi-api's matching guard (ProviderResultUtils.isMatchingOrder) rejects a
-       * `pims:patient:id` present on ONE side, not only two that differ. Both result handlers then
-       * refuse the order the result belongs to: the one that completes orders skips it ("Skipping
-       * order update ... patient/client mismatch"), and the one that files reports creates a new
-       * orphan order for the result instead. Tracked in nominal-systems/dmi-api#334 — the mirror of
-       * the idexx scenario's tripwire, where the identifier is missing from the order instead.
+       * The shape is the point: the identifier is on the ORDER's side only. The integration sends
+       * Antech the order's `pims:patient:id` as the PetID and the result echoes it back, but the
+       * result mapper tags the echoed id with its own `antech:pet:id` system, so the result carries
+       * no `pims:patient:id` while the order dmi-api holds does. Until dmi-api#384, dmi-api's
+       * matching guard (ProviderResultUtils.isMatchingOrder) refused a `pims:patient:id` present on
+       * one side only: the order stayed SUBMITTED ("Skipping order update ... patient/client
+       * mismatch") and its result was filed under a new orphan order (nominal-systems/dmi-api#334).
+       * This test guards that fix; the idexx scenario guards the mirror shape, with the identifier
+       * on the result's side only.
        *
-       * It is why the loop's own order deliberately carries no identifier. That order is the positive
-       * twin: the same patient WITHOUT the identifier, whose report the same seeded result fills —
-       * so the results channel demonstrably delivers, and it is the identifier alone that strands
-       * this order. The order is the one the test above placed and saw acknowledged; nothing after
-       * this test reads what it leaves behind. */
+       * The positive twin is the loop's own order: the same patient WITHOUT the identifier, whose
+       * report the same kind of seeded result fills — so a red here alone points at the one-sided
+       * identifier, not at the results channel. The order is the one the test above placed and saw
+       * acknowledged; nothing after this test reads what it leaves behind. */
       expectOk(
         await mock.post(`/__control__/orders/${withIdentifierRequisitionId}/results`, {}),
         'seed a result at the mock for the order with a pims:patient:id',
@@ -618,7 +611,7 @@ describe('antech-v3 full-stack (classic Antech mock)', () => {
       /* The result reaches dmi-api as two messages: the one that completes the order, and — sent
        * after it — the one that files the report, which is where a duplicate order would be created.
        * Count only once that second one has run (this order's report is FINAL, or a new order has
-       * appeared), so that a fix to the first handler alone cannot pass here on timing. */
+       * appeared), so that the first handler alone matching the order cannot pass here on timing. */
       const settled = await pollUntil(
         async () => ({
           orders: await countOrdersForOrganization(org.organizationId),
