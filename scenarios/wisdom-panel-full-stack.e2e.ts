@@ -34,9 +34,9 @@ import { closePool, query } from '../src/sql'
  * 3. RECONCILIATION IS externalId-ONLY, the zoetis shape. `mapWisdomPanelResult` attaches no
  *    `.order` to a result, so dmi-api's patient-matching guard
  *    (`ProviderResultUtils.isMatchingOrder`) is never consulted and the `pims:patient:id`
- *    identifier is a FREE choice for reconciliation. The orders here keep the harness's default
- *    identifier anyway, because the integration sends its value as the provider's `voyager_pet_id`
- *    — so carrying it is what makes that field assertable. The id that matters is
+ *    identifier plays no part in reconciliation. The orders here keep the harness's default
+ *    identifier because the integration sends its value as the provider's `voyager_pet_id` — so
+ *    carrying it is what makes that field assertable. The id that matters is
  *    `kit id == externalId == result.orderId`.
  *
  * 4. WHICH CHANNEL CAN SATISFY A COMPLETION ASSERTION? Both, here — which is why the completion

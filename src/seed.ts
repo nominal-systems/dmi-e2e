@@ -174,13 +174,13 @@ export function orderPayload (
       sex: 'MALE',
       species: 'DOG',
       breed: 'LABRADOR',
-      /* A caller-supplied PIMS patient id. dmi-api reconciles a provider result into its order only
-       * when their `pims:patient:id` matches (ProviderResultUtils.isMatchingOrder); without one, the
-       * result lands as a duplicate orphan order while the original stays SUBMITTED — a dmi-api
-       * reconciliation bug tracked as nominal-systems/dmi-api#334. Supplying one (the mock echoes it
-       * back in the result) is the workaround so the loop closes; it can be dropped once #334 lands.
-       * The tripwires at the bottom of the idexx and antech-v3 scenarios pin the fix, one from each
-       * side: an idexx order without the identifier, an antech-v3 order with it. */
+      /* A caller-supplied PIMS patient id, because a PIMS normally sends one and every loop can
+       * carry it. The integrations forward it to the provider as the patient's id (IDEXX's
+       * `patientId`, Antech's `PetID`, Wisdom Panel's `voyager_pet_id`), so a scenario can assert the
+       * forwarded patient against a value it chose rather than dmi-api's internal patient id.
+       * Reconciliation does not depend on it: a result reconciles into its order whether or not the
+       * order carried one (dmi-api#334, fixed in dmi-api#384). A caller that wants an order without
+       * it passes a `patient:` override, which replaces this whole default, identifier included. */
       identifier: [{ system: 'pims:patient:id', value: unique('pat') }],
     },
     client: { firstName: 'Jane', lastName: 'Doe' },
