@@ -72,17 +72,17 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
 
 ## Per-provider differences that bite
 
-- **Reconciliation is provider-specific, and there are more than two shapes.** Whether an order must
-  carry a `pims:patient:id` identifier — or must omit it — depends on what the provider's result
-  mapper emits. But first check whether its results reach dmi-api's matching guard at all: a mapper
-  that attaches no `.order` to a result (zoetis) makes reconciliation pure `externalId`, and the
-  identifier becomes a free choice. Read the mapper **before** copying an existing scenario; the
-  wrong choice strands orders at `SUBMITTED` forever. Background:
-  [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334). And mind the shared
-  `orderPayload()`: a `patient:` override replaces the whole default patient, identifier included —
-  where the provider needs the identifier, merge the fields you change into the default instead.
-  The symptom of dropping it is a result that reconciles into a fresh orphan order while the placed
-  one stays `SUBMITTED`, which reads like a broken result loop.
+- **Know what each result mapper stamps.** Since
+  [dmi-api#384](https://github.com/nominal-systems/dmi-api/pull/384) (the fix for
+  [dmi-api#334](https://github.com/nominal-systems/dmi-api/issues/334)) a result reconciles into its
+  order whether or not the caller supplied a `pims:patient:id`; two differing ids still refuse, as do
+  a different patient name or client last name. Which identifier system a result mapper stamps the
+  echoed patient id with (idexx `pims:patient:id`, antech-v3 `antech:pet:id`) is still worth knowing
+  when asserting on a result, and a mapper that attaches no `.order` to a result (zoetis,
+  wisdom-panel) makes reconciliation pure `externalId`. And mind the shared `orderPayload()`: a
+  `patient:` override replaces the whole default patient, identifier included. That no longer
+  strands an order, but it drops the id the forwarded-patient assertions read — merge the fields you
+  change into the default instead.
 - **Ref-mapped fields need value assertions, or they are not tested at all.** dmi-api maps an
   order's species/sex/breed from its canonical refs to provider codes before handing it to the
   engine, and falls back to forwarding the raw string when nothing resolves — so a scenario that
