@@ -101,9 +101,13 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   stated only in a comment leaves the next author a silent poll timeout.
 - **A more faithful mock can WEAKEN an assertion that was sound against a cruder one.** Assertion
   strength does not transfer with the template — re-derive it per provider. Worked example: the idexx
-  and antech-v3 mocks drop an order from the orders feed permanently once acked, so the only route to a
+  mock drops an order from the orders feed permanently once acked, so the only route to a
   `COMPLETED` order is the results channel, and waiting on `COMPLETED` is a fair reconciliation proof
-  there. The zoetis mock instead models the provider's re-notification on status change, which is more
+  there. The antech-v3 mock does too, but seeding a result also flips its order status, and an order
+  the orders poll has not yet acknowledged is still on the orders feed — so the orders channel, which
+  applies no identity guard, can complete it in that tick. An antech-v3 completion proof must wait for
+  the ack first, as both the loop's completion test and the dmi-api#334 tripwire do. The
+  zoetis mock instead models the provider's re-notification on status change, which is more
   faithful — and that extra fidelity lets its orders poll reach `COMPLETED` on its own, so the same
   assertion passes with the results channel severed outright. It has to wait on the report reaching
   `FINAL`. Ask of every completion assertion: **which channels can satisfy this, and is the one I

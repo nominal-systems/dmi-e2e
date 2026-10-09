@@ -3,7 +3,7 @@ import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
-import { closePool } from '../src/sql'
+import { closePool, countOrdersForOrganization } from '../src/sql'
 
 /* Full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
  * dmi-api under a NORMAL NODE_ENV, wired over real MQTT/Bull/HTTP to the REAL
@@ -72,7 +72,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * whole default and silently drop the `pims:patient:id` identifier this loop's reconciliation
    * depends on (see orderPayload). Without it dmi-api's matching guard sees a different patient id
    * on the result, reconciles it into a fresh orphan order, and this one stays SUBMITTED: a red
-   * that looks like a broken result loop but is a broken payload. */
+   * that looks like a broken result loop but is a broken payload. The tripwire at the bottom of
+   * this file places exactly such an order, and pins the fix (dmi-api#334). */
   function refMappedOrderPayload (overrides: OrderPayloadOverrides): Record<string, unknown> {
     const payload = orderPayload(org.integrationId, overrides)
     payload.patient = {
@@ -467,5 +468,110 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         'MISSING_TESTS',
       ])
     })
+  })
+
+  /* ---- tripwires ----
+   *
+   * Each asserts the CORRECT behaviour and is marked `failing` while the platform does not have it.
+   * That keeps CI green while the defect stands, and turns the test red the moment someone fixes it
+   * — at which point the `.failing` marker comes off in the same commit and the test stays on as a
+   * plain regression guard. A tripwire that PASSES is a red run: jest reports "Failing test passed
+   * even though it was supposed to fail", and the only correct response is to delete the marker, not
+   * to relax the assertion. A tripwire's preconditions run as a plain test in front of it, chained
+   * through the describe's own `let`s as the loop's tests are: see the first test below for why. */
+  describe('tripwires: behaviours the loop should have and does not', () => {
+    let noIdentifierOrderId: string
+    let ordersBefore: number
+
+    it('the result for an order placed without a pims:patient:id echoes a patient id the stored order does not carry', async () => {
+      /* The setup half of the tripwire below, split out and deliberately NOT marked `failing`. Inside
+       * `it.failing` every throw counts as "failed as expected", so a precondition living there is
+       * silent: if the asymmetry the tripwire depends on ever went away, it would keep passing on main
+       * for the wrong reason and could never fire when the fix lands. Here a broken precondition is a
+       * red run.
+       *
+       * The asymmetry, asserted from both ends: the order dmi-api stores carries no `pims:patient:id`,
+       * while the result the provider returns for it carries a patient id — dmi-api's own internal
+       * patient id, which the integration sent IDEXX in place of the missing identifier, and which the
+       * integration's result mapper reports back as the result's `pims:patient:id`. */
+      const payload = orderPayload(org.integrationId, {
+        /* A `patient:` override replaces the default patient WHOLE, identifier included — the very
+         * thing refMappedOrderPayload exists to avoid, and here the point of the test. */
+        patient: { name: 'Bramble', sex: sexRefCode, species: speciesRefCode, breed: breedRefCode },
+        testCodes: [{ code: serviceCode }],
+        devices: [deviceSerial],
+      })
+      const noIdentifierRequisitionId = payload.requisitionId as string
+
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place an idexx order whose patient carries no identifier',
+      )
+      noIdentifierOrderId = created.id
+
+      const stored = expectOk<{ patient: { id: string, identifier: Array<{ system: string, value: string }> } }>(
+        await org.api.get(`/orders/${noIdentifierOrderId}`),
+        'read the stored order',
+      )
+      ordersBefore = await countOrdersForOrganization(org.organizationId)
+
+      const seeded = expectOk<{ result: { patient: { patientId: string } } }>(
+        await mock.post(`/__control__/orders/${noIdentifierRequisitionId}/results`, {}),
+        'seed a result at the mock for the order without an identifier',
+      )
+
+      /* The order's side: no `pims:patient:id`. */
+      expect(stored.patient.identifier.filter((identifier) => identifier.system === 'pims:patient:id')).toEqual([])
+      /* The result's side: a patient id, and specifically dmi-api's internal one (a UUID). */
+      expect(stored.patient.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+      expect(seeded.result.patient.patientId).toBe(stored.patient.id)
+    }, 60_000)
+
+    it.failing('an order placed without a pims:patient:id is completed by its own result, with no duplicate order', async () => {
+      /* EXPECTED: an order whose patient carries no `identifier` at all — which dmi-api's contract
+       * allows, `patient.identifier` being optional — is completed by its result like any other: the
+       * order reaches COMPLETED, its own report is filled, and the organization holds no more orders
+       * after the result than before it. ACTUAL: the order stays SUBMITTED, and the result is filed
+       * under a second, new order.
+       *
+       * The integration always sends IDEXX a patient id: the order's `pims:patient:id` when it has
+       * one, and otherwise dmi-api's own internal patient id. The result echoes that id back, and the
+       * integration's result mapper reports it as the result's `pims:patient:id`. dmi-api never stored
+       * its internal id as an identifier, so the order it holds has none — and its matching guard
+       * (ProviderResultUtils.isMatchingOrder) rejects a `pims:patient:id` present on ONE side, not
+       * only two that differ. Both result handlers then refuse the order the result belongs to: the
+       * one that completes orders skips it, and the one that files reports creates a new orphan order
+       * for the result instead. Tracked in nominal-systems/dmi-api#334.
+       *
+       * It is why orderPayload() gives every patient a `pims:patient:id`, and why refMappedOrderPayload
+       * keeps it. The positive twin is the loop's own completion test above: an order of the same
+       * shape placed WITH the identifier, completed by the same kind of seeded result — so the results channel
+       * demonstrably delivers, and it is the missing identifier alone that strands this order. The
+       * order is the one the test above placed and seeded a result for; nothing after this test
+       * reads what it leaves behind. */
+      const response = await pollUntil(
+        async () => await org.api.get(`/orders/${noIdentifierOrderId}`),
+        (r) => r.body?.status === 'COMPLETED',
+        90_000,
+        2_000,
+      )
+      expect(response.body.status).toBe('COMPLETED')
+
+      /* The result reaches dmi-api as two messages: the one that completes the order, and — sent
+       * after it — the one that files the report, which is where a duplicate order would be created.
+       * Count only once that second one has run (this order's report is FINAL, or a new order has
+       * appeared), so that a fix to the first handler alone cannot pass here on timing. */
+      const settled = await pollUntil(
+        async () => ({
+          orders: await countOrdersForOrganization(org.organizationId),
+          reportStatus: (await org.api.get(`/orders/${noIdentifierOrderId}/report`)).body?.status,
+        }),
+        (state) => state.orders !== ordersBefore || state.reportStatus === 'FINAL',
+        30_000,
+        1_000,
+      )
+      expect(settled.reportStatus).toBe('FINAL')
+      expect({ newOrdersForTheResult: settled.orders - ordersBefore }).toEqual({ newOrdersForTheResult: 0 })
+    }, 90_000 + 30_000 + 20_000)
   })
 })
