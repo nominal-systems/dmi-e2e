@@ -288,6 +288,20 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   `included` that is omitted rather than empty, kit activation, both acknowledge channels, the
   simplified genetic result, a binary vet report). Plus dmi-api + ActiveMQ + Redis, behind the
   `wisdom-panel` compose profile. Runs `scenarios/wisdom-panel-full-stack.e2e.ts`.
+  Since 2026-09-22 Wisdom Panel lists a result set about twelve hours before its kit's report is
+  ready, and the mock models that window from the kit's state, the way the vendor shows it: the kit
+  reads `generating-report` with both of its readiness keys (`report-ready-at`, `report-ready-on`)
+  null, the simplified result answers 200 with no data, and the vet report 404. A scenario seeds
+  such a set with `reportPending: true` on `POST /__control__/kits/<kit>/result-sets` (with
+  `additional: true` for a kit's second set), and the vendor finishes the report with
+  `POST /__control__/kits/<kit>/report-ready`. The loop asserts that the integration asks for
+  nothing while the report is pending and leaves the set unacknowledged, delivers it on the first
+  poll after the report is ready, and delivers a kit with two sets once, acknowledging both in one
+  call. The mock's header comment (load-bearing detail 9) has the measurements and their sources.
+  What it asserts is the integration's answer in
+  [dmi-engine-wisdom-panel-integration#51](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/pull/51).
+  `e2e-wisdom-panel.yml` builds the integration at its `main`, so the loop's job is red on those
+  tests until that change merges.
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
