@@ -6,8 +6,9 @@
  * container — to drive it unmodified: the OAuth2 password grant, the two JSON:API polling feeds
  * (kits and result-sets), the simplified genetic results, the binary vet report, both acknowledge
  * channels, and kit ACTIVATION (which is what an "order" is for this provider). A separate control
- * plane (`/__control__/*`) lets tests provision provider-side kits, seed result sets, fail the PDF
- * generator, revoke bearers and inspect what the mock received, so the
+ * plane (`/__control__/*`) lets tests provision provider-side kits, seed result sets (with their
+ * kit's report ready, or still pending until the test finishes it), fail the PDF generator, revoke
+ * bearers and inspect what the mock received, so the
  * order -> result -> report loop is deterministic and CI-safe.
  *
  * It NEVER talks to a live Wisdom Panel host and never authenticates for real. Every kit code,
@@ -113,6 +114,30 @@
  *    shape would not be fidelity; the scenario's prove-red for it shows what the mapper does with
  *    that shape (three valueless items — the same outcome as the empty object).
  *
+ * 9. A RESULT SET CAN BE LISTED BEFORE ITS KIT'S REPORT EXISTS, and only the KIT says so. Until
+ *    2026-09-22 a result set reached the unacknowledged feed in the same minute as its kit's report
+ *    became ready; since that evening every one has reached it about twelve hours EARLIER (OBSERVED
+ *    in production by the integration's author: 186 of 186 result sets released from 2026-09-22
+ *    21:00 UTC, against 656 of 656 ready in the same minute before 13:00 that day). While the report
+ *    is pending the kit `include`d with the set reads `current-stage: 'generating-report'` with both
+ *    readiness keys (below) null, the simplified endpoint answers 200 with a `message` and NO `data`,
+ *    and the PDF generator answers 404 (both at their handlers). Some kits never leave that state:
+ *    on 2026-10-05 production held six of them, pending for 3 to 19 days, one carrying
+ *    `current-failure: 'sample-failed'` and two carrying two result sets each (OBSERVED, same
+ *    source). So the provider endpoints here answer from the KIT's state, never from a flag of
+ *    their own: the control plane's `reportPending` seeds a result set whose kit is still
+ *    generating its report, and `POST /__control__/kits/{key}/report-ready` is the vendor
+ *    finishing it.
+ *    Two result sets on one kit were seen only while its report was PENDING. A kit whose report is
+ *    READY with two sets listed — what finishing such a kit's report through the control plane
+ *    produces here, and what the scenario's two-set test delivers — is INFERRED: the reading is
+ *    that a listed set stays listed until it is acknowledged (detail 6), whatever its kit does
+ *    meanwhile.
+ *    The readiness itself travels under TWO keys with the same value, `report-ready-at` and
+ *    `report-ready-on` (OBSERVED on every kit of the staging captures of 2026-09-11; the public API
+ *    spec names only `-on`). The mock keeps one field and sends it under both, so the two cannot
+ *    disagree here — an integration that reads either one meets the vendor's value.
+ *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL, because the vendor's behaviour is unverified
  *
@@ -144,6 +169,21 @@
  * - **`voyager_kits`.** What the vendor means by it is unknown; OBSERVED only that
  *   `filter[activated]=false&filter[voyager_kits]=true` returns a clinic's unused inventory. Here it
  *   is a per-kit flag, enforced like every other filter.
+ *
+ * And three limits of detail 9, which are choices rather than gaps in the evidence:
+ *
+ * - **The length of the pending window.** The ~12 hours have no duration here. Nothing advances a
+ *   kit on a clock: its report is pending until a scenario calls
+ *   `POST /__control__/kits/{key}/report-ready`. The loop proves what the integration does on
+ *   either side of that step, and nothing about how long it waits.
+ * - **A result set's age.** Its `created-at` is the moment the control plane seeded it, so it is
+ *   always "now". The integration's warning for a kit pending past its threshold (36 h by default,
+ *   measured from that `created-at`) therefore cannot fire here; it is a log line, and the scenario
+ *   would not assert it anyway.
+ * - **A pending kit that carries a failure.** One of the stuck kits of detail 9 read
+ *   `current-failure: 'sample-failed'` while generating its report. The mock can serve that
+ *   (provision the kit with `failure`, then seed with `reportPending`), but no scenario exercises
+ *   it.
  */
 
 const http = require('http')
@@ -179,13 +219,16 @@ const KIT_FAILURES = [null, 'sample-failed']
 const PET_SPECIES = ['dog', 'cat']
 const PET_SEXES = ['male', 'female']
 
-/* How the PDF generator can fail. `text` and `json` are two 500s whose BODIES were both OBSERVED
- * live, on a sizeable minority of the development endpoint's result sets — the same endpoint
- * answering two different 500s — which is why the control plane picks between them rather than the
- * mock choosing one. `not-generated` is the 404 production answers for a released kit whose report
- * has not been generated yet: the STATUS is OBSERVED (production, 2026-09) and the body is the one
- * the development endpoint gives every kit that has no report-ready result set (OBSERVED there
- * 2026-09-25, INFERRED for the released-but-pending state; see handleVetReport). */
+/* How the PDF generator can fail for a kit whose report IS ready. `text` and `json` are two 500s
+ * whose BODIES were both OBSERVED live, on a sizeable minority of the development endpoint's result
+ * sets — the same endpoint answering two different 500s — which is why the control plane picks
+ * between them rather than the mock choosing one. `not-generated` is a ready kit whose PDF is
+ * nevertheless missing: the generator's 404 (status OBSERVED in production, body OBSERVED on the
+ * development endpoint; see handleVetReport) served where the kit says the report exists. The
+ * combination is INVENTED — nobody has seen the vendor produce it — and kept because an integration
+ * that gates on readiness still has a path for it, which nothing else here can reach. The ordinary
+ * 404, a kit whose report is still being generated, is NOT a flag: it follows from the kit's state
+ * (load-bearing detail 9). */
 const PDF_FAILURE_MODES = [null, 'text', 'json', 'not-generated']
 
 /* The clinic's unactivated kit inventory: the physical kits it holds and has not used. This is the
@@ -210,6 +253,9 @@ const INVENTORY = [
   { code: 'WPKIT-0006', organizationIdentity: 'HARNESS-KIT-0006', currentStage: 'shipped' },
   { code: 'WPKIT-0007', organizationIdentity: null, currentStage: 'shipped' },
   { code: 'WPKIT-0008', organizationIdentity: 'HARNESS-KIT-0008', currentStage: null },
+  { code: 'WPKIT-0009', organizationIdentity: null, currentStage: 'shipped' },
+  { code: 'WPKIT-0010', organizationIdentity: 'HARNESS-KIT-0010', currentStage: null },
+  { code: 'WPKIT-0011', organizationIdentity: null, currentStage: 'shipped' },
 ]
 
 /* The filter vocabulary each feed accepts. OBSERVED: an unknown key is a 400 naming it, not a
@@ -300,7 +346,7 @@ function seedInventory () {
       labOrderNumber: null,
       inboundTrackingCode: null,
       outboundTrackingCode: null,
-      reportReadyOn: null,
+      reportReadyAt: null,
       sampleReceivedOn: null,
       profilingResultPresent: false,
       petId: null,
@@ -565,7 +611,10 @@ function kitItem (req, kit) {
       'inbound-tracking-code': kit.inboundTrackingCode,
       'outbound-tracking-code': kit.outboundTrackingCode,
       'stage-updated-at': kit.stageUpdatedAt,
-      'report-ready-on': kit.reportReadyOn,
+      /* The readiness, under both of the keys a live kit carries, from ONE field (load-bearing
+       * detail 9). null while the report is pending. */
+      'report-ready-at': kit.reportReadyAt,
+      'report-ready-on': kit.reportReadyAt,
       'sample-received-on': kit.sampleReceivedOn,
       'relative-counts': {},
       'profiling-result-present': kit.profilingResultPresent,
@@ -684,6 +733,22 @@ function matchesBoolean (value, actual) {
   return (value === 'true') === actual
 }
 
+/* ---- the kit's report state ---- */
+
+/* A kit's result sets, in the order they were seeded (a Map keeps insertion order). Usually one;
+ * two is OBSERVED on a kit whose report is pending and INFERRED on one whose report is ready
+ * (load-bearing detail 9). */
+function resultSetsOfKit (kitId) {
+  return [...state.resultSets.values()].filter((entry) => entry.kitId === kitId)
+}
+
+/* Whether the kit's report exists. The per-kit endpoints answer from this and nothing else, so
+ * that what they serve can never disagree with what the feeds say about the kit. The readiness
+ * keys are set and cleared in the same places as the stage (detail 9). */
+function reportIsReady (kit) {
+  return kit.currentStage === 'report-ready'
+}
+
 /* ---- provider handlers ---- */
 
 /* OBSERVED shape. The token string is the mock's own; `expires_in` and `scope` are the live values.
@@ -782,9 +847,17 @@ function handleResultSets (req, res, params, query) {
     return true
   })
 
+  /* Each kit ONCE, however many of its sets the page lists. A kit can carry two unacknowledged
+   * sets (load-bearing detail 9: OBSERVED while its report is pending, INFERRED once it is ready),
+   * and JSON:API forbids a compound document from including one resource twice; the vendor
+   * implements JSON:API strictly (detail 4), so a duplicate would be the mock's invention.
+   * INFERRED: no page with two sets of one kit was captured. */
   const includeAsked = String(query.get('include') || '').split(',').includes('kit')
   const included = includeAsked
-    ? sets.map((resultSet) => state.kits.get(resultSet.kitId)).filter((kit) => kit !== undefined).map((kit) => kitItem(req, kit))
+    ? [...new Set(sets.map((resultSet) => resultSet.kitId))]
+        .map((kitId) => state.kits.get(kitId))
+        .filter((kit) => kit !== undefined)
+        .map((kit) => kitItem(req, kit))
     : []
 
   sendPage(req, res, sets.map((resultSet) => resultSetItem(req, resultSet)), included)
@@ -810,29 +883,42 @@ function handleSimplifiedResults (req, res, params) {
      * only the code and sentence are the mock's. */
     return sendVoyagerError(res, 404, `WIS_VOY__140: Failed: Kit ${kitId} could not be found.`, `simplified results for unknown kit ${kitId}`)
   }
-  const resultSet = [...state.resultSets.values()].find((entry) => entry.kitId === kitId)
+  /* The first result set seeded for the kit. A kit can carry several (load-bearing detail 9), and
+   * this endpoint is keyed by KIT, so it has one answer whatever the count; which set's body the
+   * vendor serves then was not observed, so serving the first is INVENTED. */
+  const resultSet = resultSetsOfKit(kitId)[0]
   if (resultSet === undefined) {
     /* INVENTED, same reasoning: a kit with no result set was never asked for live. */
     return sendVoyagerError(res, 404, `WIS_VOY__141: Failed: No results are available for kit ${kit.code}.`, `no result set for kit ${kit.code}`)
+  }
+  if (!reportIsReady(kit)) {
+    /* A result set released before its kit's report (load-bearing detail 9). OBSERVED on the
+     * development endpoint (2026-09-25) for a kit at `generating-report`: **200**, not an error
+     * status, and a body of exactly this one key — no `data` at all, not `data: null`. The same
+     * `data`-less shape is in production logs. An integration that reads the status alone takes
+     * this for a result. */
+    log(`simplified results for kit ${kit.code}: report not ready (stage ${String(kit.currentStage)})`)
+    return sendJson(res, 200, { message: `WIS_VOY__107: Results for kit with id ${kit.id} are not ready yet.` })
   }
 
   sendJson(res, 200, { message: 'success', data: resultSet.simplified })
 }
 
-/* `GET /pdf-generator/vet-report/{kitId}`. Three OBSERVED behaviours, all reproduced:
- *   - a real kit with a report: 200, `application/pdf`, a `%PDF-1.7` document;
+/* `GET /pdf-generator/vet-report/{kitId}`. Four OBSERVED behaviours, all reproduced:
+ *   - a kit whose report is ready: 200, `application/pdf`, a `%PDF-1.7` document;
  *   - an unknown kit: **404** with a `text/html` body of exactly `Kit not found.` (14 bytes) —
  *     NOT a 200 carrying an error page, so the "HTML base64'd as a PDF" trap does not apply here;
+ *   - a kit with no report-ready result set: **404**, `text/html`, exactly `Result set not found.`
+ *     (21 bytes). The body is OBSERVED on the development endpoint (2026-09-25) for every kit in
+ *     that state, 17 of 17, whatever its stage; the status is OBSERVED in production too, where it
+ *     is what a result set released before its kit's report gets for the ~12 hours until the report
+ *     is ready (load-bearing detail 9). It follows from the KIT's state here, not from a flag;
  *   - a failure: **500**, on a sizeable minority of real result sets, in TWO different bodies — a bare
  *     `An unknown error occurred.` and a JSON `{"error": "Internal Server Error"}`. Which one a
  *     given kit gets is a control-plane flag, because the live endpoint produced both and nothing
  *     was found that predicts which.
- * And a fourth, half observed: a released kit whose report has not been generated yet (the
- * `not-generated` flag). The **404** STATUS is OBSERVED in production (2026-09), where it lasts for
- * hours after release; its BODY is INFERRED from the development endpoint, which answers exactly
- * `Result set not found.` (`text/html`, 21 bytes, OBSERVED 2026-09-25) for every kit without a
- * report-ready result set, in any stage — the one state not seen there is a released set whose
- * report is still pending, which is the production case. Nothing in the integration reads the body.
+ * And one INVENTED combination, the `not-generated` flag: the same 404 for a kit whose report IS
+ * ready (see PDF_FAILURE_MODES). Nothing in the integration reads either 404 body.
  * The integration reads this with `responseType: 'arraybuffer'`. A non-2xx costs that one result
  * set, which it leaves unacknowledged and asks for again on every poll; the rest of the batch is
  * delivered. Its HTTP layer retries a 5xx once inside the same request and never a 4xx, so a poll
@@ -848,6 +934,11 @@ function handleVetReport (req, res, params) {
     log(`404 vet report: unknown kit ${kitId}`)
     return sendText(res, 404, 'Kit not found.', 'text/html; charset=utf-8')
   }
+  if (resultSetsOfKit(kit.id).length === 0 || !reportIsReady(kit)) {
+    /* No report-ready result set: OBSERVED, body and status, see above. */
+    log(`404 vet report for kit ${kit.code}: no report-ready result set (stage ${String(kit.currentStage)})`)
+    return sendText(res, 404, 'Result set not found.', 'text/html; charset=utf-8')
+  }
   if (kit.pdfFailure === 'text') {
     log(`500 vet report (text) for kit ${kit.code}`)
     return sendText(res, 500, 'An unknown error occurred.')
@@ -857,9 +948,9 @@ function handleVetReport (req, res, params) {
     return sendJson(res, 500, { error: 'Internal Server Error' })
   }
   if (kit.pdfFailure === 'not-generated') {
-    /* Status OBSERVED (production, 2026-09); body OBSERVED on dev for the no-report case, INFERRED
-     * for the pending one — see above. */
-    log(`404 vet report (not generated yet) for kit ${kit.code}`)
+    /* INVENTED combination of OBSERVED parts: the no-report 404, for a kit that says its report is
+     * ready — see PDF_FAILURE_MODES. */
+    log(`404 vet report (ready kit, PDF missing) for kit ${kit.code}`)
     return sendText(res, 404, 'Result set not found.', 'text/html; charset=utf-8')
   }
 
@@ -893,7 +984,10 @@ async function handleAcknowledgeKits (req, res) {
       return sendVoyagerError(res, 422, `WIS_VOY__121: Failed: Kit ${id} could not be found.`, `acknowledge-kits for unknown id ${id}`)
     }
     if (kit.acknowledgedAt === null) kit.acknowledgedAt = nowIso()
-    const resultSet = [...state.resultSets.values()].find((entry) => entry.kitId === kit.id)
+    /* The counterpart id. For a kit with two result sets (load-bearing detail 9), which one the
+     * vendor names here, or whether it names both, was not observed: naming the first is INVENTED,
+     * and the integration discards this body. */
+    const resultSet = resultSetsOfKit(kit.id)[0]
     acknowledged.push({ acknowledged_kit_id: kit.id, related_result_set_id: resultSet?.id ?? null })
   }
   log(`acknowledged ${acknowledged.length} kit(s): ${ids.join(', ')}`)
@@ -1066,8 +1160,13 @@ function handleGetPet (req, res, params, query) {
     return sendVoyagerError(res, 422, `WIS_VOY__105: Failed: Kit ${kitCode} could not be found.`, `pet lookup for '${kitCode}'`)
   }
   if (kit.voyagerPetId !== voyagerPetId) {
-    /* INVENTED: the "activated for a different patient" refusal was never captured. */
-    return sendVoyagerError(res, 422, `WIS_VOY__107: Failed: Kit ${kitCode} is activated for a different pet.`, `pet lookup mismatch for '${kitCode}'`)
+    /* INVENTED: the "activated for a different patient" refusal was never captured. Its code is
+     * the mock's own and must not be one the vendor is known to use: `WIS_VOY__107` is the
+     * simplified endpoint's "not ready yet" (OBSERVED, see handleSimplifiedResults) and
+     * `WIS_VOY__108` its "Kit analysis has resulted in a failure…" (documented by the
+     * integration). So it follows the mock's other invented codes, 140 and 141, at that
+     * endpoint. */
+    return sendVoyagerError(res, 422, `WIS_VOY__142: Failed: Kit ${kitCode} is activated for a different pet.`, `pet lookup mismatch for '${kitCode}'`)
   }
 
   const pet = state.pets.get(kit.petId)
@@ -1100,7 +1199,7 @@ function handleGetPet (req, res, params, query) {
 
 function publicKit (kit) {
   const pet = kit.petId === null ? null : state.pets.get(kit.petId)
-  const resultSet = [...state.resultSets.values()].find((entry) => entry.kitId === kit.id)
+  const resultSets = resultSetsOfKit(kit.id)
   return {
     id: kit.id,
     code: kit.code,
@@ -1110,6 +1209,7 @@ function publicKit (kit) {
     activated: kit.activated,
     currentStage: kit.currentStage,
     currentFailure: kit.currentFailure,
+    reportReadyAt: kit.reportReadyAt,
     acknowledged: kit.acknowledgedAt !== null,
     acknowledgedAt: kit.acknowledgedAt,
     hospitalNumber: kit.hospitalNumber,
@@ -1132,7 +1232,9 @@ function publicKit (kit) {
           birthMonth: pet.birthMonth,
           birthDay: pet.birthDay,
         },
-    resultSetId: resultSet?.id ?? null,
+    /* The first result set, as before a kit could carry two; `resultSetIds` lists them all. */
+    resultSetId: resultSets[0]?.id ?? null,
+    resultSetIds: resultSets.map((entry) => entry.id),
     simplifiedFetches: state.fetches.simplified[kit.id] || 0,
     pdfFetches: state.fetches.pdf[kit.id] || 0,
   }
@@ -1210,7 +1312,7 @@ async function handleControlProvisionKit (req, res) {
     labOrderNumber: body.labOrderNumber ?? null,
     inboundTrackingCode: null,
     outboundTrackingCode: null,
-    reportReadyOn: (body.stage ?? null) === 'report-ready' ? nowIso() : null,
+    reportReadyAt: (body.stage ?? null) === 'report-ready' ? nowIso() : null,
     sampleReceivedOn: null,
     profilingResultPresent: body.activated === true,
     petId,
@@ -1257,15 +1359,38 @@ async function handleControlSetPdfFailure (req, res, params) {
  * `emptyIdealWeight` and `emptyNotable` select the OBSERVED third shape (load-bearing detail 8):
  * `ideal_weight_result: {}` alongside `notable_and_at_risk_health_test_results: []`, which a
  * sizeable minority of the live result sets carry. They were only ever seen together, so the
- * control plane accepts them separately but the scenario uses the pair. */
+ * control plane accepts them separately but the scenario uses the pair.
+ *
+ * Two options shape WHEN the set is released relative to its kit's report (load-bearing detail 9):
+ *   - `reportPending: true` releases the set while the kit is still generating its report — the
+ *     vendor's behaviour since 2026-09-22. The kit moves to `generating-report` with both readiness
+ *     keys null, and the per-kit endpoints answer accordingly until
+ *     `POST /__control__/kits/{key}/report-ready`. Without it the set is released with its report
+ *     ready, as every set was before that date.
+ *   - `additional: true` releases a further set for a kit that already has one, as the vendor did
+ *     for some of the kits stuck pending (OBSERVED, with the report pending). Two sets on a kit
+ *     whose report is ready — after `report-ready`, or seeded without `reportPending` — are
+ *     INFERRED (detail 9). Without it a second seed is refused, so a scenario cannot double-seed by
+ *     accident. */
 async function handleControlSeedResultSet (req, res, params) {
   const kit = findKit(params.key)
   if (kit === undefined) return controlError(res, `no kit '${params.key}'`)
   if (!kit.activated || kit.petId === null) return controlError(res, `kit '${kit.code}' is not activated, so it can carry no result set`)
-  if ([...state.resultSets.values()].some((entry) => entry.kitId === kit.id)) {
-    return controlError(res, `kit '${kit.code}' already has a result set`)
-  }
   const body = await readJson(req)
+  if (body.additional !== undefined && typeof body.additional !== 'boolean') return controlError(res, 'additional must be a boolean')
+  if (body.reportPending !== undefined && typeof body.reportPending !== 'boolean') return controlError(res, 'reportPending must be a boolean')
+  const existing = resultSetsOfKit(kit.id)
+  if (existing.length > 0 && body.additional !== true) {
+    return controlError(res, `kit '${kit.code}' already has a result set (set additional to release a further one, as the vendor does for some kits)`)
+  }
+  if (existing.length === 0 && body.additional === true) {
+    return controlError(res, `kit '${kit.code}' has no result set yet, so there is nothing for this one to be additional to`)
+  }
+  if (body.reportPending === true && reportIsReady(kit)) {
+    /* Whether the vendor ever releases a set for a kit whose report is ready and takes the kit back
+     * to generating it was not observed, so the mock does not invent it. */
+    return controlError(res, `kit '${kit.code}' already has its report ready; a pending release for it is not modelled`)
+  }
   const pet = state.pets.get(kit.petId)
 
   const breeds = body.breeds
@@ -1396,16 +1521,64 @@ async function handleControlSeedResultSet (req, res, params) {
   })
   if (idealWeightBody.result_set_id === null) idealWeightBody.result_set_id = id
 
-  /* The kit has a report now, so its stage advances the way the vendor's does. `report-ready` maps
-   * to dmi COMPLETED through the ORDERS channel too — which is exactly why the scenario waits on
-   * the REPORT rather than on the order: see the scenario's header. */
-  kit.currentStage = 'report-ready'
-  kit.stageUpdatedAt = nowIso()
-  kit.reportReadyOn = nowIso()
-  kit.profilingResultPresent = true
-  log(`seeded result set ${id} for kit ${kit.code}`)
+  if (body.reportPending === true) {
+    /* Released before the report (load-bearing detail 9), OBSERVED: the kit reads
+     * `generating-report` and both readiness keys are null. `profiling-result-present` is left as
+     * it was — its value on a pending kit was not recorded. */
+    if (kit.currentStage !== 'generating-report') {
+      kit.currentStage = 'generating-report'
+      kit.stageUpdatedAt = nowIso()
+    }
+    kit.reportReadyAt = null
+    log(`seeded result set ${id} for kit ${kit.code}, report pending`)
+  } else {
+    /* Released with its report, as every set was before 2026-09-22: the stage advances the way the
+     * vendor's does. `report-ready` maps to dmi COMPLETED through the ORDERS channel too — which is
+     * exactly why the scenario waits on the REPORT rather than on the order: see the scenario's
+     * header. */
+    markReportReady(kit)
+    log(`seeded result set ${id} for kit ${kit.code}`)
+  }
 
   sendJson(res, 201, { id, kitId: kit.id, kitCode: kit.code })
+}
+
+/* Everything that changes on the kit when its report is ready, in one place, so the seed and the
+ * report-ready control cannot drift apart: the stage, when it changed, BOTH readiness keys (one
+ * field, detail 9) and `profiling-result-present`, which this mock has always set with the report
+ * (INFERRED from the name; nothing in the integration reads it). */
+function markReportReady (kit) {
+  const at = nowIso()
+  kit.currentStage = 'report-ready'
+  kit.stageUpdatedAt = at
+  kit.reportReadyAt = at
+  kit.profilingResultPresent = true
+}
+
+/* `POST /__control__/kits/{key}/report-ready` — the vendor finishing a report it released a result
+ * set ahead of (load-bearing detail 9). From here on both per-kit endpoints answer as for any ready
+ * kit. Whether the kit then returns to the unacknowledged kits feed was not observed and is not
+ * modelled (see "Re-notification" in the header), so an order the orders poll has already
+ * acknowledged stays where it was. Refused for a kit with no result set, or one already ready: a
+ * scenario that thinks it is finishing a pending report and is not must hear about it.
+ *
+ * The answer is the kit plus `seq`: the call log's sequence number at the moment of the flip,
+ * taken in the same tick as it. The result-sets feed is answered in the tick its request is
+ * recorded, so every feed request logged at or below `seq` saw the kit pending and every one above
+ * it saw the kit ready. A scenario that counts polls "after the report became ready" counts from
+ * this; reading `lastSeq` from the call log first and flipping in a second request would count a
+ * poll that slipped in between, which saw the kit pending, as one that came after. */
+function handleControlReportReady (req, res, params) {
+  const kit = findKit(params.key)
+  if (kit === undefined) return controlError(res, `no kit '${params.key}'`)
+  if (resultSetsOfKit(kit.id).length === 0) {
+    return controlError(res, `kit '${kit.code}' has no result set; seed one with reportPending first`)
+  }
+  if (reportIsReady(kit)) return controlError(res, `kit '${kit.code}' already has its report ready`)
+  markReportReady(kit)
+  const seq = state.nextCallSeq
+  log(`kit ${kit.code}: report ready (call log at seq ${seq})`)
+  sendJson(res, 200, { ...publicKit(kit), seq })
 }
 
 async function handleControlBearer (req, res) {
@@ -1507,6 +1680,7 @@ const routes = [
   ['DELETE', /^\/__control__\/kits\/(?<key>[^/]+)$/, handleControlDeleteKit],
   ['POST', /^\/__control__\/kits\/(?<key>[^/]+)\/pdf$/, handleControlSetPdfFailure],
   ['POST', /^\/__control__\/kits\/(?<key>[^/]+)\/result-sets$/, handleControlSeedResultSet],
+  ['POST', /^\/__control__\/kits\/(?<key>[^/]+)\/report-ready$/, handleControlReportReady],
   [
     'GET',
     /^\/__control__\/result-sets$/,
