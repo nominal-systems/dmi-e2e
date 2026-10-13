@@ -58,6 +58,7 @@ const fastProject = {
     '<rootDir>/scenarios/smoke.e2e.ts',
     '<rootDir>/scenarios/tenant-isolation.e2e.ts',
     '<rootDir>/scenarios/event-store-throttling.e2e.ts',
+    '<rootDir>/scenarios/engine-failures.e2e.ts',
   ],
 }
 
