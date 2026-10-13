@@ -421,8 +421,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
      * the way the live endpoint does — an INVALID_ORDER entry, then the field-level entries under
      * IDEXX's own codes — and the integration's providerErrorMapper reads that envelope's
      * `errorCode`/`message`/`index` and renders each entry into dmi-api's `errors[]`. These two tests
-     * are what make the envelope's codes and shape non-decorative: renaming a code, or keying the
-     * envelope `code` instead of `errorCode`, goes red here and nowhere else. */
+     * are what make the envelope's codes and shape non-decorative: renaming a code goes red here and
+     * nowhere else. */
 
     it('an order for a code outside the catalogue is refused end to end, naming the code', async () => {
       /* An unknown code takes the device rule's Passthrough branch (the integration forwards whatever
@@ -442,13 +442,20 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
       expect(response.ok).toBe(false)
       /* The provider's code and the mock's message both reach dmi-api's errors[], which proves the
-       * mapper read the envelope. Its fallbacks must NOT fire: "… failed with <status> status code"
-       * appears when the envelope is unreadable, "undefined error in idexx" when it is keyed `code`
-       * instead of `errorCode`. */
+       * mapper read the envelope. Its fallback must NOT fire: "… failed with <status> status code"
+       * appears when the envelope is unreadable. */
       expect(response.text).toMatch(/INVALID_LAB_SERVICE_ID/)
       expect(response.text).toMatch(/NOT-A-REAL-IDEXX-CODE/)
       expect(response.text).not.toMatch(/failed with \d+ status code/)
-      expect(response.text).not.toMatch(/undefined error in idexx/)
+      /* And each entry is worded from its code's family: an INVALID_* code is a value the provider
+       * refused, not a missing one. The field-level entry carries `index` (the offending test's
+       * position), which the mapper used to read as "required" — telling the operator that a test code
+       * they supplied was missing (dmi-engine-idexx-integration#85); it is reported as a position. The
+       * whole array, so an entry the mapper drops goes red too, not only a mislabelled one. */
+      expect(response.body.errors).toEqual([
+        'INVALID_ORDER is invalid for idexx: Invalid order, see data for field level details',
+        'INVALID_LAB_SERVICE_ID is invalid for idexx (index 0): unknown test code(s): NOT-A-REAL-IDEXX-CODE',
+      ])
     }, 30_000)
 
     it("the mock refuses an empty order with IDEXX's per-field codes, under its INVALID_ORDER entry", async () => {
