@@ -626,6 +626,29 @@ async function handleResultsSearch (req, res, query) {
   })
 }
 
+/* `IdexxIvlsDevice` as the integration's device mapper reads it (deviceSerialNumber,
+ * vcpActivatedStatus, displayName): the clinic's one analyzer, advertised where the provider would
+ * advertise it. The `ivlsDevices` scenario fails the lookup; without a body of its own it answers with
+ * the `ErrorResponse` IDEXX's spec gives this endpoint's 500, under UNKNOWN_ERROR — a code from the
+ * spec's list, and the envelope the integration's providerErrorMapper reads. */
+function handleIvlsDevices (req, res) {
+  const scenario = takeScenario('ivlsDevices')
+  if (scenario != null) {
+    sendJson(res, scenario.status, scenario.body ?? { errors: [{ errorCode: 'UNKNOWN_ERROR', message: 'device list failed' }] })
+    return
+  }
+  sendJson(res, 200, {
+    ivlsDeviceList: [
+      {
+        deviceSerialNumber: IVLS_DEVICE_SERIAL,
+        displayName: 'VetLab Station (mock)',
+        lastPolledCloudTime: nowIso(),
+        vcpActivatedStatus: 'ACTIVE',
+      },
+    ],
+  })
+}
+
 /* ---- control plane (/__control__) ---- */
 
 async function handleControlSeedResult (req, res, params) {
@@ -725,20 +748,7 @@ const routes = [
   ['GET', /^\/api\/v1\/ref\/species$/, (req, res) =>
     sendJson(res, 200, refList(Object.entries(SPECIES_NAMES).map(([code, name]) => ({ code, name }))))],
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
-  /* `IdexxIvlsDevice` as the integration's device mapper reads it (deviceSerialNumber,
-   * vcpActivatedStatus, displayName). Nothing in the harness syncs devices yet; the list exists so
-   * the clinic's one analyzer is advertised where the provider would advertise it. */
-  ['GET', /^\/api\/v1\/ivls\/devices$/, (req, res) =>
-    sendJson(res, 200, {
-      ivlsDeviceList: [
-        {
-          deviceSerialNumber: IVLS_DEVICE_SERIAL,
-          displayName: 'VetLab Station (mock)',
-          lastPolledCloudTime: nowIso(),
-          vcpActivatedStatus: 'ACTIVE',
-        },
-      ],
-    })],
+  ['GET', /^\/api\/v1\/ivls\/devices$/, handleIvlsDevices],
 
   ['GET', /^\/ui$/, handleUiPage],
   ['GET', /^\/ui\/order\/(?<orderId>[^/]+)$/, handleUiOrderGet],

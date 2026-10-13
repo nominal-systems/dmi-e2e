@@ -7,10 +7,10 @@ short version is that this suite's only product is a trustworthy red.
 
 ## What this repo is
 
-Black-box e2e for the DMI platform: a fast suite (smoke + tenant isolation against a real dmi-api),
-plus per-provider full-stack loops (`HARNESS_FULL_STACK=1 HARNESS_STACK=<provider>`) that boot the
-**real** provider integration container against a **synthetic** provider mock and assert the
-order → result → report loop closes. This repo is **public**.
+Black-box e2e for the DMI platform: a fast suite (smoke, tenant isolation and engine failures against
+a real dmi-api), plus per-provider full-stack loops (`HARNESS_FULL_STACK=1 HARNESS_STACK=<provider>`)
+that boot the **real** provider integration container against a **synthetic** provider mock and
+assert the order → result → report loop closes. This repo is **public**.
 
 ## Every assertion must be able to fail
 

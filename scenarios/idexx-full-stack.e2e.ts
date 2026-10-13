@@ -477,6 +477,49 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     })
   })
 
+  describe('a device lookup reports what failed, not a 404 (dmi-api#364)', () => {
+    /* `GET /providers/idexx/devices` is how a PIMS lists the clinic's IVLS analyzers: dmi-api RPCs
+     * `idexx/devices/list`, and the integration GETs the provider's /api/v1/ivls/devices and maps
+     * each entry. The first test proves that path is live, so the failure after it is the provider's
+     * and not a route that never worked. */
+    it("GET /providers/idexx/devices lists the clinic's analyzer through the real integration", async () => {
+      const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+
+      expect(response.status).toBe(200)
+      /* In dmi's device shape, not IDEXX's (`deviceSerialNumber`, `displayName`, `vcpActivatedStatus`):
+       * the integration's device mapper ran. Its status enum spells ACTIVE as IDEXX does. */
+      expect(response.body).toEqual([
+        { serialNumber: deviceSerial, status: 'ACTIVE', name: 'VetLab Station (mock)' },
+      ])
+    }, 30_000)
+
+    /* Regression guard (dmi-api#364): dmi-api wrapped every failure of the devices round trip in a
+     * 404, so a provider failing looked like a clinic with no analyzers, and alerting that counts 5xx
+     * saw nothing. The mock fails one lookup with IDEXX's 500 envelope; the integration replies with
+     * its ProviderError; dmi-api must answer 502 and say who failed, with what status and why. */
+    it("a provider failure is a 502 naming IDEXX, its status and its error", async () => {
+      expectOk(
+        await mock.post('/__control__/scenarios', {
+          key: 'ivlsDevices',
+          status: 500,
+          body: { errors: [{ errorCode: 'UNKNOWN_ERROR', message: 'device registry unavailable' }] },
+          once: true,
+        }),
+        'inject a failed device lookup at the mock',
+      )
+
+      const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+      console.log(
+        `[idexx-scenario] failed device lookup -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+
+      expect(response.status).toBe(502)
+      expect(response.body.message).toBe(
+        'The provider idexx failed to list devices with status 500: UNKNOWN_ERROR error in idexx: device registry unavailable',
+      )
+    }, 30_000)
+  })
+
   /* ---- dmi-api#334 guards ----
    *
    * These tests guard the dmi-api#334 fix (dmi-api#384): an order whose `pims:patient:id` is on one

@@ -629,7 +629,8 @@ which are:
   `demo` provider, configured with an unreachable URL — so this is how orders get created through
   the real HTTP endpoint. It is a pre-existing dmi-api code path, not one added for testing.
 - **`ENGINE_RESPONSE_TIMEOUT=2000`** — anything that *does* reach for the absent engine fails in 2s
-  rather than hanging for dmi-api's 90s default.
+  rather than hanging for dmi-api's 90s default. `engine-failures.e2e.ts` relies on it: that
+  timeout is the outage it asserts dmi-api reports as one.
 - **`STATSIG_ENABLED=false`**, **`DATABASE_RUN_MIGRATIONS=false`** — no network for feature flags;
   migrations run as an explicit, observable step.
 
@@ -678,6 +679,7 @@ scripts/
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
+  engine-failures.e2e.ts      an engine that does not answer is a 504 on every provider route, not a 404
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
