@@ -10,7 +10,7 @@ import { closePool } from '../src/sql'
  * budget while IDEXX's ordering API degraded, and on 2026-09-21 one pod stopped receiving replies.
  *
  * A timeout is a 504, whichever route asked. Only a lookup that fails before the round trip — an
- * integration that does not exist — is a 404. */
+ * integration that does not exist, or not for the provider asked — is a 404. */
 
 describe('engine failures', () => {
   let org: SeededOrg
@@ -44,12 +44,26 @@ describe('engine failures', () => {
     expect(response.body.message).toBe('The engine did not respond in time')
   }, 30_000)
 
-  /* The one 404 the devices route keeps: the integration lookup fails before any engine is asked. A
+  /* The 404s the devices route keeps: the integration lookup fails before any engine is asked. First a
    * well-formed id (the query must be a UUID) that names no integration. */
   it('GET /providers/:id/devices still answers 404 for an integration that does not exist', async () => {
     const response = await org.api.get(`/providers/demo/devices?integrationId=${randomUUID()}`)
 
     expect(response.status).toBe(404)
     expect(response.body.message).toBe('The integration was not found')
+  })
+
+  /* Then a real integration asked for under another provider. The provider in the path picks the engine
+   * the lookup is sent to, so asking idexx about a demo integration would hand the idexx engine the demo
+   * integration's options, and a provider id nobody serves would only time out — a 504 for what is a
+   * wrong request. No engine runs here, so a lookup that went out would take the 2s timeout: the answer
+   * must be immediate. */
+  it("GET /providers/:id/devices answers 404 for an integration of another provider, without asking an engine", async () => {
+    const started = Date.now()
+    const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+
+    expect(response.status).toBe(404)
+    expect(response.body.message).toBe('The integration was not found')
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })
