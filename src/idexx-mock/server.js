@@ -69,7 +69,7 @@ function freshState () {
      * the ack return a stable batchId (the integration acks exactly that id). */
     activeBatch: null,
     /* Error/edge injection: { [key]: { status, body } }. Keys are logical operation names, e.g.
-     * 'createOrder', 'resultsLatest', 'authValidate'. */
+     * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices'. */
     scenarios: {},
   }
 }

@@ -519,6 +519,22 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         'The provider idexx failed to list devices with status 500: UNKNOWN_ERROR error in idexx: device registry unavailable',
       )
     }, 30_000)
+
+    /* The engine failing rather than the provider: a 200 without `ivlsDeviceList` breaks the
+     * integration's mapper, the handler throws a plain TypeError, and Nest replies with its generic
+     * `{ status: 'error', message: 'Internal server error' }` — the shape an engine crash has on the
+     * wire (the zoetis device mapper fails this way on a single-test device). It must be a 502 too. */
+    it('an engine that fails on the provider\'s answer is a 502 naming the engine', async () => {
+      expectOk(
+        await mock.post('/__control__/scenarios', { key: 'ivlsDevices', status: 200, body: {}, once: true }),
+        'inject a device list the integration cannot map',
+      )
+
+      const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+
+      expect(response.status).toBe(502)
+      expect(response.body.message).toBe('The engine failed to list devices: Internal server error')
+    }, 30_000)
   })
 
   /* ---- dmi-api#334 guards ----
