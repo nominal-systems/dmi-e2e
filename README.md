@@ -24,13 +24,14 @@ could have. Those defects are fixed now, and the tests that caught them stay on 
 "Tripwires").
 
 It imports **nothing** from dmi-api. It talks to a running server over HTTP, and — for setup and
-assertions that no HTTP route exposes — to MySQL directly via `mysql2`. That boundary is the whole
-point: the harness must survive dmi-api refactors and stay reusable as a conformance suite. Two
-setup steps could go over HTTP and do not, each because the route that exists for it is broken and
-pinned by a tripwire (see "Tripwires"): the shared seeder inserts each user over SQL, because
-`POST /users` answers 500, and the two engine loops insert their provider's reference data,
-because `POST /admin/refs/sync/<provider>` stores nothing. Everything after that, from login to
-orders, is real HTTP.
+assertions that no HTTP route exposes — to MySQL directly via `mysql2`. One scenario also reaches
+Mongo, via the `mongodb` driver, but only to make one of dmi-api's own writes fail on purpose
+(`src/mongo.ts`). That boundary is the whole point: the harness must survive dmi-api refactors and
+stay reusable as a conformance suite. Two setup steps could go over HTTP and do not, each because
+the route that exists for it is broken and pinned by a tripwire (see "Tripwires"): the shared
+seeder inserts each user over SQL, because `POST /users` answers 500, and the two engine loops
+insert their provider's reference data, because `POST /admin/refs/sync/<provider>` stores nothing.
+Everything after that, from login to orders, is real HTTP.
 
 ## Requirements
 
@@ -55,7 +56,8 @@ npm run test:harness        # DMI_API_DIR defaults to ../dmi-api
 That does the whole thing from a clean state:
 
 1. Take the run's slot (slot 0 unless you ask for another — see "Parallel runs" below), then
-   `docker compose up -d` — MySQL 8, Mongo 4, ActiveMQ (this repo's `docker-compose.yml`).
+   `docker compose up -d` — MySQL 8, Mongo 4, ActiveMQ (this repo's `docker-compose.yml`). Mongo
+   runs with test commands on, so that a scenario can arm a failpoint in it (see "Layout").
 2. Poll until all three accept connections. No fixed sleeps.
 3. `npm run migration:run` in the dmi-api checkout, against the harness database. This also
    regression-tests that dmi-api's migrations produce a working schema from empty.
@@ -74,6 +76,10 @@ HARNESS_BUILD=0   npm run test:harness   # skip `npm run build` in the checkout
 # drive a dmi-api you are already running yourself; the harness touches no checkout:
 HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:harness
 ```
+
+With `HARNESS_MANAGE_CONTAINERS=0` the databases and the broker are yours as well, and your Mongo must
+be started with `--setParameter enableTestCommands=1`: `scenarios/event-store-throttling.e2e.ts`
+arms a `failCommand` failpoint in it, and without the flag it fails at once, naming the flag.
 
 **Full-system re-runs with `HARNESS_KEEP_UP=1`.** A loop's integration (see "Full-system mode"
 below) polls its mock through Bull jobs kept in Redis, and Redis outlives a kept-up run, so a stale
@@ -610,7 +616,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_ZOETIS_PARTNER_ID` / `_PARTNER_PASSWORD` | `harness-partner` / `harness-pass` | zoetis only. Dummy provider-**configuration** credentials; the mock never authenticates for real. |
 | `HARNESS_ZOETIS_CLIENT_ID` | `harness-client` | zoetis only. The dummy "FUSE Client ID" **integration** option. The integration joins it to `partnerId` as the HTTP Basic username `partnerId\clientId`, which is why the two live in different places. All four zoetis provider options are declared `string` by dmi-api — unlike antech's `LabId`, none is an integer. There is deliberately no zoetis poll-interval knob, for the same reason as antech. |
 | `HARNESS_REDIS_PORT` | `6380` | full-stack only (every loop). Host port for Redis (the integration's Bull queues). |
-| `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. |
+| `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. Start that Mongo with `--setParameter enableTestCommands=1`, as `docker-compose.yml` does: the event-store throttling scenario arms a failpoint in it. |
 | `HARNESS_MANAGE_APP` | `1` unless `HARNESS_BASE_URL` is set | `0` to bring your own dmi-api. |
 | `HARNESS_BUILD` | `1` | `0` to reuse an existing `dist/` in the checkout. |
 | `HARNESS_KEEP_UP` | `0` | `1` to skip `docker compose down -v` on exit. |
@@ -646,7 +652,9 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               (redis + the Zoetis mock + the zoetis integration), an `antech-v6` profile
                               (redis + the antech-v6 mock + the real dmi-engine as api + worker, built
                               from three checkouts) and a `wisdom-panel` profile (redis + the
-                              wisdom-panel mock + the same two dmi-engine services)
+                              wisdom-panel mock + the same two dmi-engine services). Mongo runs
+                              with test commands on, for the event-store throttling scenario's
+                              failpoint
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
@@ -655,6 +663,8 @@ src/
   dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
+  mongo.ts                    mongodb client for failure injection: arms the `failCommand` failpoint so
+                              one command on one of dmi-api's collections fails, and reads back how often
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   refs.ts                     canonical dmi ref codes looked up by name over GET /refs/*, for the ref-mapping value assertions
   idexx-mock/server.js        the VetConnect Plus mock provider (zero-dependency Node HTTP server)
@@ -678,6 +688,9 @@ scripts/
 scenarios/
   smoke.e2e.ts                the stack is really up and really wired
   tenant-isolation.e2e.ts     two organizations, neither able to read, count or write the other's data
+  event-store-throttling.e2e.ts an order survives the event store throttling its order:created write
+                              (dmi-api#371): the insert and its sequence-counter write are retried,
+                              and an event that still fails no longer fails the request
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
