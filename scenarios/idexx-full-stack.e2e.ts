@@ -1,5 +1,6 @@
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
+import { clearFailPoints, closeMongo, failInserts } from '../src/mongo'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
@@ -572,5 +573,120 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(settled.reportStatus).toBe('FINAL')
       expect({ newOrdersForTheResult: settled.orders - ordersBefore }).toEqual({ newOrdersForTheResult: 0 })
     }, 90_000 + 30_000 + 20_000)
+  })
+
+  /* ---- dmi-api#371 guard ----
+   *
+   * The fast suite's event-store throttling scenario proves dmi-api retries a throttled event write
+   * and no longer fails the request when the event store keeps refusing it. It runs dmi-api under
+   * NODE_ENV=seed, though, where `createOrder` returns before the engine call, so it cannot prove the
+   * outcome that matters to the clinic: the order is still sent to the provider. This proves it,
+   * here at the end of the loop so that its main flow above is untouched. */
+  describe('an order survives its event store throttling every event write (dmi-api#371)', () => {
+    /* dmi-api's event collection, as its Event schema names it. */
+    const EVENTS = 'events_v2'
+
+    /* What dmi-api records for an order placed with autoSubmitOrder once the integration's
+     * confirmOrder handshake has run: the integration answers a confirmed order as SUBMITTED, and
+     * dmi-api stores the status it answers with. (The mock-side test above pins the same status at
+     * the provider.) */
+    const SUBMITTED = 'SUBMITTED'
+
+    afterAll(async () => {
+      /* A test that fails midway must not leave inserts failing: disarm before closing. */
+      try {
+        await clearFailPoints()
+      } finally {
+        await closeMongo()
+      }
+    })
+
+    it('an order placed while every events_v2 insert is throttled is still sent to the provider', async () => {
+      /* Every insert into `events_v2` fails with 16500, the code the production event store (Azure
+       * Cosmos DB's Mongo API) throttles a write with, for as long as the failpoint is armed: 1000 is
+       * far more than the request can use (src/mongo.ts). `createOrder` writes three events on the
+       * way — order:created before the engine call, order:updated and report:created after it — and
+       * dmi-api tries each three times, waiting its 1 s no-hint fallback between tries, before it logs
+       * the event as lost and carries on: two 1 s waits per event, which is why the test's timeout is
+       * the loop's placement budget plus 3 × 2 s. Before the fix the first refusal escaped as a 500,
+       * and the order was never sent. */
+      await failInserts(EVENTS, 1000)
+
+      /* The same order as the loop's own: an in-house code with the clinic's analyzer, ref-mapped
+       * patient fields, autoSubmitOrder so the integration runs confirmOrder. */
+      const payload = refMappedOrderPayload({
+        testCodes: [{ code: serviceCode }],
+        devices: [deviceSerial],
+      })
+      const throttledRequisitionId = payload.requisitionId as string
+      const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
+      /* Disarmed at once, before any assertion, so that a red below cannot leave the event store
+       * refusing writes; the count is what the failpoint refused while it was armed. */
+      const refused = await clearFailPoints()
+
+      /* HTTP status, error message and order status compared together, so a refusal goes red naming
+       * dmi-api's status and the error behind it, not a bare "expected 201". */
+      expect({
+        httpStatus: response.status,
+        message: response.ok ? undefined : response.body?.message,
+        status: response.body?.status,
+      }).toEqual({ httpStatus: 201, message: undefined, status: SUBMITTED })
+      const created = response.body as { id: string, externalId: string }
+      expect(created.externalId).toBeTruthy()
+
+      /* dmi-api recorded the provider's answer: the order reads back SUBMITTED, with the externalId
+       * results are later correlated on. */
+      const stored = expectOk<{ id: string, status: string, externalId: string }>(
+        await org.api.get(`/orders/${created.id}`),
+        'read the throttled order back',
+      )
+      expect({ id: stored.id, status: stored.status, externalId: stored.externalId })
+        .toEqual({ id: created.id, status: SUBMITTED, externalId: created.externalId })
+
+      /* THE POINT OF THIS TEST: the provider has the order, confirmed, as the loop's own order
+       * reached it — and it is the order dmi-api holds, since the mock's idexxOrderId is the
+       * externalId dmi-api stored. */
+      const received = expectOk<{
+        idexxOrderId: string
+        corporateRequisitionId: string
+        status: string
+        tests: string[]
+        ivls: string[]
+      }>(
+        await mock.get(`/__control__/orders/${throttledRequisitionId}`),
+        'read the throttled order from the mock control plane',
+      )
+      expect({
+        idexxOrderId: received.idexxOrderId,
+        corporateRequisitionId: received.corporateRequisitionId,
+        status: received.status,
+        tests: received.tests,
+        ivls: received.ivls,
+      }).toEqual({
+        idexxOrderId: created.externalId,
+        corporateRequisitionId: throttledRequisitionId,
+        status: 'SUBMITTED',
+        tests: [serviceCode],
+        ivls: [deviceSerial],
+      })
+
+      /* The event really was refused, not written: the org's feed, which the lifecycle test above
+       * shows carrying the loop's own order:created, has none for this order. */
+      const events = expectOk<{ data: Array<{ type: string, data?: { orderId?: string } }> }>(
+        await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+        'list events',
+      )
+      expect(
+        events.data
+          .filter((event) => event.type === 'order:created' && event.data?.orderId === created.id)
+          .map((event) => ({ type: event.type, orderId: event.data?.orderId })),
+      ).toEqual([])
+
+      /* 9 is createOrder's three event writes (order:created, order:updated, report:created) × three
+       * attempts each. At least, not exactly: the integration's own polls keep running while the
+       * failpoint is armed, and an event dmi-api writes for one of them in that window is refused and
+       * counted too, so an exact count would depend on timing. */
+      expect(refused).toBeGreaterThanOrEqual(9)
+    }, 30_000 + 3 * 2_000)
   })
 })

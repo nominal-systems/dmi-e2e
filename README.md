@@ -24,7 +24,7 @@ could have. Those defects are fixed now, and the tests that caught them stay on 
 "Tripwires").
 
 It imports **nothing** from dmi-api. It talks to a running server over HTTP, and — for setup and
-assertions that no HTTP route exposes — to MySQL directly via `mysql2`. One scenario also reaches
+assertions that no HTTP route exposes — to MySQL directly via `mysql2`. Two scenarios also reach
 Mongo, via the `mongodb` driver, but only to make one of dmi-api's own writes fail on purpose
 (`src/mongo.ts`). That boundary is the whole point: the harness must survive dmi-api refactors and
 stay reusable as a conformance suite. Two setup steps could go over HTTP and do not, each because
@@ -79,7 +79,8 @@ HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:
 
 With `HARNESS_MANAGE_CONTAINERS=0` the databases and the broker are yours as well, and your Mongo must
 be started with `--setParameter enableTestCommands=1`: `scenarios/event-store-throttling.e2e.ts`
-arms a `failCommand` failpoint in it, and without the flag it fails at once, naming the flag.
+and the idexx loop's last test arm a `failCommand` failpoint in it, and without the flag they fail,
+naming the flag.
 
 **Full-system re-runs with `HARNESS_KEEP_UP=1`.** A loop's integration (see "Full-system mode"
 below) polls its mock through Bull jobs kept in Redis, and Redis outlives a kept-up run, so a stale
@@ -351,7 +352,10 @@ results poll picks up a result the scenario seeds at the mock → dmi-api writes
 test results and moves the order to `COMPLETED`, and `/events` shows the `order:*`/`report:*`
 sequence. The harness talks **only to the mock**, never to live `*.vetconnectplus.com`, so runs are
 deterministic, need no credentials, and place no real orders. See "The idexx mock (VetConnect Plus)"
-below.
+below. Its last test is the full-system half of dmi-api#371: the fast suite's event-store throttling
+scenario proves a throttled event write is retried, but runs dmi-api in seed mode, where no order
+reaches an engine; here, with every `events_v2` insert refused, the order is still sent to the mock
+and comes back `SUBMITTED`, while the feed has no `order:created` for it.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -616,7 +620,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_ZOETIS_PARTNER_ID` / `_PARTNER_PASSWORD` | `harness-partner` / `harness-pass` | zoetis only. Dummy provider-**configuration** credentials; the mock never authenticates for real. |
 | `HARNESS_ZOETIS_CLIENT_ID` | `harness-client` | zoetis only. The dummy "FUSE Client ID" **integration** option. The integration joins it to `partnerId` as the HTTP Basic username `partnerId\clientId`, which is why the two live in different places. All four zoetis provider options are declared `string` by dmi-api — unlike antech's `LabId`, none is an integer. There is deliberately no zoetis poll-interval knob, for the same reason as antech. |
 | `HARNESS_REDIS_PORT` | `6380` | full-stack only (every loop). Host port for Redis (the integration's Bull queues). |
-| `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. Start that Mongo with `--setParameter enableTestCommands=1`, as `docker-compose.yml` does: the event-store throttling scenario arms a failpoint in it. |
+| `HARNESS_MANAGE_CONTAINERS` | `1` | `0` to bring your own MySQL/Mongo/ActiveMQ and schema. Start that Mongo with `--setParameter enableTestCommands=1`, as `docker-compose.yml` does: the event-store throttling scenario and the idexx loop arm a failpoint in it. |
 | `HARNESS_MANAGE_APP` | `1` unless `HARNESS_BASE_URL` is set | `0` to bring your own dmi-api. |
 | `HARNESS_BUILD` | `1` | `0` to reuse an existing `dist/` in the checkout. |
 | `HARNESS_KEEP_UP` | `0` | `1` to skip `docker compose down -v` on exit. |
@@ -653,8 +657,8 @@ docker-compose.yml            base MySQL + Mongo + ActiveMQ; + an `idexx` profil
                               (redis + the antech-v6 mock + the real dmi-engine as api + worker, built
                               from three checkouts) and a `wisdom-panel` profile (redis + the
                               wisdom-panel mock + the same two dmi-engine services). Mongo runs
-                              with test commands on, for the event-store throttling scenario's
-                              failpoint
+                              with test commands on, for the failpoint the event-store throttling
+                              scenario and the idexx loop arm
 src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
@@ -691,7 +695,8 @@ scenarios/
   event-store-throttling.e2e.ts an order survives the event store throttling its order:created write
                               (dmi-api#371): the insert and its sequence-counter write are retried,
                               and an event that still fails no longer fails the request
-  idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end
+  idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, and an order
+                              throttled on every event write is still sent to the provider (dmi-api#371)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
