@@ -56,6 +56,7 @@ const fastProject = {
   testMatch: [
     '<rootDir>/scenarios/smoke.e2e.ts',
     '<rootDir>/scenarios/tenant-isolation.e2e.ts',
+    '<rootDir>/scenarios/engine-failures.e2e.ts',
   ],
 }
 
