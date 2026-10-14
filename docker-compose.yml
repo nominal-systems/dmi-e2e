@@ -49,8 +49,15 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
 
+  # Test commands on, for scenarios/event-store-throttling.e2e.ts and the idexx loop's last test:
+  # both arm the `failCommand` failpoint (src/mongo.ts) so that dmi-api's event writes fail with code
+  # 16500, the error the production event store (Azure Cosmos DB's Mongo API) raises when it
+  # throttles a write. The flag makes the server's test-only commands available (configureFailPoint
+  # among them); nothing else calls one, and a failpoint does nothing until it is configured.
+  # A Mongo you bring yourself (HARNESS_MANAGE_CONTAINERS=0) must be started with it too.
   mongo:
     image: mongo:4
+    command: ['--setParameter', 'enableTestCommands=1']
     ports:
       - '${HARNESS_MONGO_PORT:-27018}:27017'
     volumes:
