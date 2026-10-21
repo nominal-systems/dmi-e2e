@@ -51,12 +51,11 @@
  * THE LOAD-BEARING DETAILS, in the order they will bite someone
  *
  * 1. `OrderStatus` IS A STRING ON THE WIRE. OBSERVED: `"Submitted"`, `"Received"`, `"Partial"`,
- *    `"Final"`, `"In Progress"`. The integration's `AntechV6OrderStatus` is a *bare* TypeScript
- *    enum, so its members are NUMBERS, and `mapOrderStatus` switches on those numbers — which no
- *    wire value ever equals. Every status therefore falls to the switch default and reaches dmi as
- *    SUBMITTED. This mock serves the STRINGS. Emitting the integers would make the integration's
- *    status mapping appear to work and would hide a real defect (the scenario has a tripwire for
- *    exactly this), so the strings are not a stylistic choice: they are the contract.
+ *    `"Final"`, `"In Progress"` (with the space). This mock serves those STRINGS, and the
+ *    integration's `mapOrderStatus` has to match them as such. A mock that served anything else —
+ *    an enum's integer, a tidied spelling — could make a status mapping look right, or wrong,
+ *    against values the live endpoint never sends, so the strings are not a stylistic choice:
+ *    they are the contract.
  *
  * 2. `GET /LabResults/v6/GetStatus` ALWAYS answers with BOTH `LabOrders` and `LabResults`, the
  *    irrelevant one an empty array. OBSERVED on every captured response. The interceptor's
@@ -166,11 +165,12 @@ function traceId () {
 
 /* ---- Antech V6 order-status vocabulary ----
  *
- * STRINGS on the wire (see load-bearing detail 1). These five were OBSERVED; the enum in the
- * integration's interface declares three more (`Draft`, `Expired`, `Canceled`) that have never been
- * seen. The control plane accepts any of the eight so a test can drive an unobserved one
- * deliberately, but the mock only ever *produces* `Submitted` (at placement) and whatever a test
- * sets. */
+ * STRINGS on the wire (see load-bearing detail 1). Five were OBSERVED (`Submitted`, `Received`,
+ * `In Progress`, `Partial`, `Final`). The integration's `AntechV6OrderStatus` declares all nine
+ * below; the other four (`Draft`, `Expired`, `Canceled`, `Resulted`) have never been seen. The
+ * control plane accepts any of the nine so a test can drive an unobserved one deliberately, but
+ * the mock only ever *produces* `Submitted` (at placement), `Partial` or `Final` (when a result is
+ * seeded) and whatever a test sets. */
 const ORDER_STATUS_SUBMITTED = 'Submitted'
 const ORDER_STATUS_VALUES = [
   'Draft',
