@@ -33,8 +33,9 @@ import { closePool, query } from '../src/sql'
  *    `OrderStatus` is a STRING on the wire (`"Submitted"`, `"Received"`, `"In Progress"`,
  *    `"Partial"`, `"Final"`, …) and the integration maps it: `Received`, `In Progress` and
  *    `Partial` to dmi PARTIAL, `Resulted` and `Final` to COMPLETED, `Expired` and `Canceled` to
- *    CANCELLED, anything it does not know to SUBMITTED. A describe of its own drives those through
- *    the whole loop, on orders that never get a result. What bounds the channel is the feed, not
+ *    CANCELLED, anything it does not know to SUBMITTED. A describe of its own drives `Final`,
+ *    `Canceled`, `Expired`, `Received` and `In Progress` through the whole loop, on orders that
+ *    never get a result. What bounds the channel is the feed, not
  *    the mapping: the orders poll reads only records it has not acknowledged, and the provider was
  *    observed NOT to re-offer an acknowledged order when its status changes, so the mock does not
  *    either. An order acknowledged at `Submitted` never returns to the orders channel unless a test
