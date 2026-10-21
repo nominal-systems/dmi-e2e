@@ -502,8 +502,8 @@ function sendJson (res, status, body) {
 }
 
 /* A bare text body. OBSERVED: the login endpoint answers bad credentials with `text/plain`, not
- * JSON — which is why the integration's error mapper has a `typeof options === 'string'` branch at
- * all. Serving this as JSON would leave that branch unexercised. */
+ * JSON — which is why the integration's error mapper has a bare-string branch at all. Serving this
+ * as JSON would leave that branch unexercised. */
 function sendText (res, status, body) {
   res.writeHead(status, {
     'content-type': 'text/plain; charset=utf-8',
@@ -542,9 +542,16 @@ async function readJson (req) {
 /* ---- the provider's error envelopes ----
  *
  * SEVEN distinct shapes, and that variety is itself part of the contract: the integration's
- * `AntechV6ApiException` unwinds a fixed list of fields off the raw response body, so which shape
- * an endpoint returns decides whether Antech's own explanation reaches the operator or is replaced
- * by a generic `Failed to POST <url>`. Each builder below is used only where it was OBSERVED. */
+ * `AntechV6ApiException` puts a generic `Failed to <METHOD> <url>` line first and then reads
+ * Antech's own explanation out of the raw response body by the keys these envelopes use — the body
+ * itself when it is a bare string; otherwise `title`, `message`, `errorMessage` and `detail`,
+ * matched in any case, the `errors` / `errorDetails` field maps, and the same again under `value`.
+ * Since nominal-systems/dmi-engine-antech-v6-integration#86 that reaches the wording in all seven,
+ * and a non-empty body with none of those keys is passed on raw, cut at 500 characters; before it,
+ * three of them (the two lowercase-`message` envelopes and the `ErrorMessage` one) reached the
+ * operator as the generic line alone. Each builder below is used only where it was OBSERVED, and
+ * keeps the provider's keys rather than one the mapper happens to read: the mapper is what is
+ * under test. */
 
 /* 401, bare text. OBSERVED for a bad password on /Users/v6/Login. */
 function sendBadCredentials (res, why) {
@@ -560,10 +567,13 @@ function sendNotFound (res, why) {
 }
 
 /* 401 RFC 9110 problem-ish envelope. OBSERVED for a missing accessToken. Note the key is
- * `message`, lowercase — which the integration's error mapper does NOT read (it looks for
- * `Message`), so this surfaces to an operator as the generic `Failed to GET <url>`. That is the
- * provider-real behaviour and the mock reproduces it rather than "helpfully" using a key the
- * mapper happens to understand. */
+ * `message`, lowercase, beside an EMPTY `errorDetails` map. Until
+ * nominal-systems/dmi-engine-antech-v6-integration#86 the integration's error mapper looked only
+ * for `Message`, so this surfaced to an operator as the generic `Failed to GET <url>` alone; it
+ * now matches the key in any case and reads `errorDetails` as a field map, so
+ * `Access token is missing.` follows the generic line and the empty map adds nothing. The mock
+ * keeps the provider-real casing and the empty map rather than "helpfully" using a key the mapper
+ * happens to understand. */
 function sendMissingAccessToken (res) {
   sendJson(res, 401, {
     type: 'https://www.rfc-editor.org/rfc/rfc9110.html#status.401',
@@ -593,7 +603,7 @@ function sendValidationProblem (res, field, message) {
 }
 
 /* 400 with a BARE JSON STRING body. OBSERVED for `POC_FLAG=Z` on /Tests/v6 — not an object, a
- * JSON-encoded string. The integration's `typeof options === 'string'` branch handles it. */
+ * JSON-encoded string. The integration's error mapper handles it in its bare-string branch. */
 function sendBarePocFlagError (res, value) {
   log(`400 bare string: POC_Flag:${value} is not valid`)
   sendJson(res, 400, `POC_Flag:${value} is not valid`)
@@ -602,7 +612,11 @@ function sendBarePocFlagError (res, value) {
 /* 500 on the TRF endpoint. OBSERVED for an unknown ClinicAccessionID (and, separately, for a
  * pre-order, which has no TRF) — a 500, NOT a 404. `getOrderTrf` catches everything and returns
  * undefined, so this degrades cleanly; a mock that answered 404 would not be reproducing the
- * endpoint. Neither key (`StatusCode`, `ErrorMessage`) is one the error mapper reads. */
+ * endpoint. Neither key (`StatusCode`, `ErrorMessage`) was one the error mapper read until
+ * nominal-systems/dmi-engine-antech-v6-integration#86; it now reads `ErrorMessage`. The scenario
+ * arms it at placement, whose errors do reach an operator, because production has shown failed
+ * order sends reaching the caller with nothing from Antech, though the logs do not say which
+ * envelope they met. */
 function sendTrfUnavailable (res, why) {
   log(`TRF unavailable: ${why}`)
   sendJson(res, 500, { StatusCode: 500, ErrorMessage: 'Internal server error' })
@@ -610,8 +624,9 @@ function sendTrfUnavailable (res, why) {
 
 /* 400 placement rejection — the ONE placement refusal OBSERVED live, and its shape verbatim:
  * `{value: {Data, StatusCode, HttpStatusCode, Message, InnerExceptionMessage, Error, ClientData},
- *   statusCode, contentType}`. The integration's error mapper reads `.value.Message`, so this is
- * the one provider envelope whose wording actually reaches the operator through POST /orders.
+ *   statusCode, contentType}`. The integration's error mapper reads `.value.Message`, so the
+ * provider's wording reaches the operator through POST /orders; the mock refuses what an order
+ * carries (its fields, codes, species, breed, sex) in this envelope.
  *
  * Only ONE message was observed: `Invalid BreedId <n>`, for a breed that does not belong to the
  * species. Every other message this mock sends through this envelope is INVENTED — the ENVELOPE is
@@ -1864,8 +1879,11 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  /* OBSERVED: an unknown path is `{statusCode, message}` — neither key one the integration's error
-   * mapper reads, so a typo'd endpoint surfaces to an operator as a bare `Failed to GET <url>`. */
+  /* OBSERVED: an unknown path is `{statusCode, message}`. Until
+   * nominal-systems/dmi-engine-antech-v6-integration#86 neither key was one the integration's
+   * error mapper read, so a typo'd endpoint surfaced to an operator as a bare
+   * `Failed to GET <url>`; it now reads the lowercase `message`, so `Resource not found` follows
+   * that line. */
   sendNotFound(res, `no route for ${req.method} ${pathname}`)
 })
 
