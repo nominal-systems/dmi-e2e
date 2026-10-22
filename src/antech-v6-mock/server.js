@@ -18,6 +18,14 @@
  * `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot answer and never
  * reached it can be named and cleaned up instead of leaving that answer for the next call.
  *
+ * A result is seeded (`POST /__control__/orders/:id/results`) only for an order the orders poll has
+ * already acknowledged; a seed for any other is answered 409. Seeding moves the order's
+ * `OrderStatus` to `Partial` or `Final`, and a record still on the unacknowledged feed carries that
+ * status through the orders channel on the next tick, so a test that seeded first could no longer
+ * say which channel moved the dmi order. A test waits for `orderAcked` on
+ * `GET /__control__/orders/:id` first, or passes `allowUnacked: true` in the seed to seed anyway.
+ * A harness rule, not a provider one.
+ *
  * It NEVER talks to a live Antech host and never authenticates for real. All canned patient,
  * client, doctor and clinic data is SYNTHETIC — invented values shaped like Antech responses, never
  * captured clinic or patient data. What IS genuine is Antech's published CATALOGUE vocabulary: the
@@ -51,12 +59,11 @@
  * THE LOAD-BEARING DETAILS, in the order they will bite someone
  *
  * 1. `OrderStatus` IS A STRING ON THE WIRE. OBSERVED: `"Submitted"`, `"Received"`, `"Partial"`,
- *    `"Final"`, `"In Progress"`. The integration's `AntechV6OrderStatus` is a *bare* TypeScript
- *    enum, so its members are NUMBERS, and `mapOrderStatus` switches on those numbers — which no
- *    wire value ever equals. Every status therefore falls to the switch default and reaches dmi as
- *    SUBMITTED. This mock serves the STRINGS. Emitting the integers would make the integration's
- *    status mapping appear to work and would hide a real defect (the scenario has a tripwire for
- *    exactly this), so the strings are not a stylistic choice: they are the contract.
+ *    `"Final"`, `"In Progress"` (with the space). This mock serves those STRINGS, and the
+ *    integration's `mapOrderStatus` has to match them as such. A mock that served anything else —
+ *    an enum's integer, a tidied spelling — could make a status mapping look right, or wrong,
+ *    against values the live endpoint never sends, so the strings are not a stylistic choice:
+ *    they are the contract.
  *
  * 2. `GET /LabResults/v6/GetStatus` ALWAYS answers with BOTH `LabOrders` and `LabResults`, the
  *    irrelevant one an empty array. OBSERVED on every captured response. The interceptor's
@@ -166,11 +173,12 @@ function traceId () {
 
 /* ---- Antech V6 order-status vocabulary ----
  *
- * STRINGS on the wire (see load-bearing detail 1). These five were OBSERVED; the enum in the
- * integration's interface declares three more (`Draft`, `Expired`, `Canceled`) that have never been
- * seen. The control plane accepts any of the eight so a test can drive an unobserved one
- * deliberately, but the mock only ever *produces* `Submitted` (at placement) and whatever a test
- * sets. */
+ * STRINGS on the wire (see load-bearing detail 1). Five were OBSERVED (`Submitted`, `Received`,
+ * `In Progress`, `Partial`, `Final`). The integration's `AntechV6OrderStatus` declares all nine
+ * below; the other four (`Draft`, `Expired`, `Canceled`, `Resulted`) have never been seen. The
+ * control plane accepts any of the nine so a test can drive an unobserved one deliberately, but
+ * the mock only ever *produces* `Submitted` (at placement), `Partial` or `Final` (when a result is
+ * seeded) and whatever a test sets. */
 const ORDER_STATUS_SUBMITTED = 'Submitted'
 const ORDER_STATUS_VALUES = [
   'Draft',
@@ -1551,6 +1559,8 @@ async function handleControlSetStatus (req, res, params) {
  *   pendingTestCount, totalTestCount   -> drive the mapper's result status
  *   corrected                          -> non-empty means REVISED
  *   orderStatus, resultStatus          -> the order's provider-side status after the result lands
+ *   allowUnacked                       -> true seeds an order the orders poll has not acknowledged
+ *                                         yet, which is otherwise refused (409; see below)
  *
  * The `pendingTestCount`/`totalTestCount`/`corrected` trio is the WHOLE of the integration's result
  * status decision (`extractResultStatus`): 0 pending -> COMPLETED, some pending -> PARTIAL,
@@ -1566,6 +1576,20 @@ async function handleControlSeedResult (req, res, params) {
   if (order.kind !== 'order') {
     sendJson(res, 400, {
       message: `${params.clinicAccessionId} is a pre-order (a draft). A draft produces no results at the provider; promote it first.`,
+    })
+    return
+  }
+  /* A HARNESS rule, not a provider one (see the header): a seed for an order the orders poll has not
+   * acknowledged would let the orders channel, not the results channel, carry the seed's status to
+   * dmi-api on the next tick. */
+  if (order.orderAcked === false && body.allowUnacked !== true) {
+    sendJson(res, 409, {
+      message:
+        `${params.clinicAccessionId} has not been acknowledged by the orders poll yet. Seeding a result moves its ` +
+        "OrderStatus to 'Partial' or 'Final', and a record that is not acknowledged carries that status through " +
+        'the orders channel on the next tick, so a test could no longer say which channel moved the order. ' +
+        `Wait for orderAcked on GET /__control__/orders/${params.clinicAccessionId}, or pass allowUnacked: true ` +
+        'to seed anyway.',
     })
     return
   }
@@ -1631,7 +1655,8 @@ async function handleControlSeedResult (req, res, params) {
   /* A result that lands moves the order's provider-side status. Faithful: a real Antech order with
    * final results reports `Final`. It does NOT clear the order acknowledgement, so a record the
    * orders channel has already acked stays out of the `overrideAck=false` feed — which is why the
-   * scenario can claim that only the RESULTS channel can have completed the order. */
+   * scenario can claim that only the RESULTS channel can have completed the order, and why a seed
+   * for an order not yet acked is refused above. */
   const orderStatus = body.orderStatus ?? (pendingTestCount > 0 ? 'Partial' : 'Final')
   if (!ORDER_STATUS_VALUES.includes(orderStatus)) {
     sendJson(res, 400, { message: `orderStatus must be one of ${ORDER_STATUS_VALUES.join(', ')}` })

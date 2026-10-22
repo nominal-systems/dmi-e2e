@@ -29,15 +29,28 @@ import { closePool, query } from '../src/sql'
  *    Both paths are driven below, and the POC catalogue flag is what selects between them, so the
  *    scenario picks its test codes BY FLAG (from the mock's control plane) and never by position.
  *
- * 3. ONLY THE RESULTS CHANNEL CAN COMPLETE AN ORDER TODAY, and that is not a property of this
- *    harness — it is a defect in the integration, pinned by a tripwire at the bottom of this file
- *    and filed as nominal-systems/dmi-engine-antech-v6-integration#84. `OrderStatus` is a STRING on
- *    the wire (`"Submitted"`, `"Received"`, `"Final"`, …) while the integration's status enum is a
- *    bare numeric one, so its `mapOrderStatus` switch never matches a wire value and every polled
- *    status falls to its default, dmi SUBMITTED. The orders channel can therefore move an order
- *    WAITING_FOR_INPUT -> SUBMITTED (that transition is asserted, on the promoted draft) and
- *    nothing further. A tripwire at the bottom of this file asserts the CORRECT behaviour and is
- *    marked `failing` while the defect stands.
+ * 3. THE ORDERS CHANNEL CARRIES THE PROVIDER'S OWN STATUS, BUT ONLY WHEN THE FEED OFFERS THE ORDER.
+ *    `OrderStatus` is a STRING on the wire (`"Submitted"`, `"Received"`, `"In Progress"`,
+ *    `"Partial"`, `"Final"`, …) and the integration maps it, ignoring case and surrounding
+ *    whitespace: `Draft` to dmi ACCEPTED; `Submitted`, `Received` and `In Progress` to SUBMITTED,
+ *    because dmi's PARTIAL means some tests are complete and available, and a lab that has only
+ *    received the sample has produced none; `Partial` to PARTIAL; `Resulted` and `Final` to
+ *    COMPLETED; `Expired` and `Canceled` to CANCELLED; anything it does not know to SUBMITTED,
+ *    with a warning. A describe of its own drives `Final`, `Canceled`, `Expired` and `Partial`
+ *    through the whole loop, and shows that `Received` and `In Progress` leave the order
+ *    SUBMITTED, on orders that never get a result. What bounds the channel is the feed, not the
+ *    mapping: the orders poll reads only records it has not acknowledged, and the provider was
+ *    observed NOT to re-offer an acknowledged order when its status changes, so the mock does not
+ *    either. An order acknowledged at `Submitted` never returns to the orders channel unless a test
+ *    replays it through the control plane. Seeding a result moves the mock's provider status to
+ *    `Partial` or `Final`, so every result in this file — the headline order's, the CBC's, the
+ *    promoted draft's, and both of the partial order's deliveries — is seeded only once the orders
+ *    poll has acknowledged that order at `Submitted`, and the mock refuses a seed for an order it
+ *    has not (409, unless the seed passes `allowUnacked`). That wait is what makes the order's
+ *    PARTIAL or COMPLETED in those tests the results channel's alone. A report's PARTIAL or FINAL
+ *    needs no such wait: dmi-api moves a report only on the results path. The one transition the
+ *    orders channel makes without a replay is the promoted draft's WAITING_FOR_INPUT -> SUBMITTED,
+ *    because promotion puts a record the poll has never acknowledged into the feed.
  *
  * RECONCILIATION. dmi-api matches a polled result to its order on `externalId`, and for antech-v6
  * that is the whole of it: `mapAntechV6Result` attaches a `.order` to a result ONLY when the result
@@ -67,9 +80,15 @@ const POLL_MS = 3_000
  * poll does a login + status + per-order result-status + (sometimes) a TRF fetch per tick. */
 const COMPLETION_WAIT_MS = 60_000
 const ORDER_ACK_WAIT_MS = 45_000
-/* How long to wait before concluding that something did NOT happen. Used only by the tripwires and
- * by the "the draft is invisible" assertion, where a short budget is the point. */
+/* How long to wait before concluding that something did NOT happen. Used by the status-poll audit
+ * tripwire, by the guard that a COMPLETED order does not go back, and by the two provider statuses
+ * that leave an order SUBMITTED, where a short budget is the point. */
 const NEGATIVE_WAIT_MS = 20_000
+/* How long dmi-api gets to apply a status the orders poll has delivered. The orders-channel tests
+ * start this wait only once the mock has re-acknowledged the order at its new status, and the
+ * integration emits `external_orders` BEFORE it acknowledges, so all that is left is dmi-api
+ * handling one event. Short, because a red waits it out. */
+const STATUS_APPLIED_WAIT_MS = 20_000
 
 /* ---- ref mapping ----
  *
@@ -332,6 +351,27 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       await mock.get(`/__control__/orders/${encodeURIComponent(clinicAccessionId)}`),
       `read order ${clinicAccessionId} from the mock control plane`,
     )
+  }
+
+  /* Wait for the orders poll to acknowledge an order AT `status` — `Submitted`, the status every
+   * order is placed at, unless a test has since set another — and return the mock's record of it.
+   * An order is acknowledged only after a full orders-poll cycle, and the integration emits
+   * `external_orders` to dmi-api BEFORE it acknowledges, so once the ack has landed, dmi-api has
+   * been handed the status the poll saw. The one copy of this wait in the file; a red names the
+   * order and the acknowledgement the mock held when the budget ran out. */
+  async function waitForOrderAck (clinicAccessionId: string, status = 'Submitted'): Promise<MockOrder> {
+    const entry = await pollUntil(
+      async () => await mockOrder(clinicAccessionId),
+      (order) => order.orderAckedStatus === status,
+      ORDER_ACK_WAIT_MS,
+      1_000,
+    )
+    expect({ order: clinicAccessionId, acked: entry.orderAcked, at: entry.orderAckedStatus }).toEqual({
+      order: clinicAccessionId,
+      acked: true,
+      at: status,
+    })
+    return entry
   }
 
   async function observationsFor (orderId: string): Promise<Observation[]> {
@@ -751,18 +791,11 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * only acked after a full orders-poll cycle (poll -> status -> per-order result status ->
        * emit external_orders -> ack), so once the ack lands, the integration has provably decided
        * whether to fetch this order's TRF. Without the ack gate, "no TRF was fetched" would be
-       * equally true of a poll that had not run yet. */
-      const received = await pollUntil(
-        async () => await mockOrder(pocRequisitionId),
-        (order) => order.orderAcked,
-        ORDER_ACK_WAIT_MS,
-        1_000,
-      )
-
-      expect(received.orderAcked).toBe(true)
-      /* Acknowledged AT the status it was serving — the mock records which one, so this also pins
-       * that the ack followed the poll rather than preceding it. */
-      expect(received.orderAckedStatus).toBe('Submitted')
+       * equally true of a poll that had not run yet.
+       *
+       * Acknowledged AT the status it was serving — the mock records which one, and the wait
+       * asserts it — so this also pins that the ack followed the poll rather than preceding it. */
+      const received = await waitForOrderAck(pocRequisitionId)
 
       /* The POC rule, observed at the provider. `getBatchOrders` skips the TRF when every mnemonic
        * on the order is point-of-care per the test guide — so a zero here is evidence of three
@@ -814,14 +847,15 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       /* Wait on the REPORT reaching FINAL rather than on the order reaching COMPLETED, and ask the
        * question CLAUDE.md insists on: which channels can satisfy this assertion?
        *
-       * For antech-v6 the answer is unusually clean, for an unhappy reason. dmi-api sets a report
-       * to FINAL in exactly one place (ReportsService, on the `external_results` path); order
-       * creation leaves it REGISTERED and no orders-poll path touches it. So FINAL is reachable
-       * only through the results channel. And the ORDER's COMPLETED is equally unambiguous here,
-       * because the orders channel cannot produce a COMPLETED at all (see the file header: every
-       * polled status collapses to SUBMITTED) — and because this order was acknowledged at
-       * 'Submitted' in the previous test and the mock does not re-notify on a status change, so it
-       * never returns to the unacknowledged feed. Both assertions are the results channel's. */
+       * For the report the answer is unusually clean. dmi-api sets a report to FINAL in exactly one
+       * place (ReportsService, on the `external_results` path); order creation leaves it REGISTERED
+       * and no orders-poll path touches it. So FINAL is reachable only through the results channel.
+       * The ORDER's COMPLETED takes one more step of reasoning, because the orders channel can
+       * complete an order too — a polled `Final` does (see the file header), and seeding just moved
+       * the mock's provider status to `Final`. It cannot reach the orders channel: this order was
+       * acknowledged at 'Submitted' in the previous test and the mock does not re-notify on a status
+       * change, so it never returns to the unacknowledged feed. Both assertions are the results
+       * channel's. */
       const report = await pollUntil(
         async () => await org.api.get(`/orders/${pocOrderId}/report`),
         (response) => response.body?.status === 'FINAL',
@@ -1104,6 +1138,15 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       cbcOrderId = created.id
       expect(created.status).toBe('SUBMITTED')
 
+      /* Wait for the orders poll to acknowledge the order at `Submitted` before seeding. Seeding
+       * moves the mock's provider status to `Final`, and a record the orders poll has not yet
+       * acknowledged is still on the unacknowledged feed: the next tick would carry `Final`
+       * through the orders channel, and the orders channel, not the results channel, would
+       * complete this order — breaking the file header's claim (point 3) that only the results
+       * channel moves an order a result was seeded for. The mock refuses an unacknowledged seed
+       * for the same reason. */
+      await waitForOrderAck(cbcRequisitionId)
+
       expectOk(
         await mock.post(`/__control__/orders/${encodeURIComponent(cbcRequisitionId)}/results`, {
           unitCodeResults: [{ orderCode: CBC_CODE, testCodeResults: CBC_SEEDED_ORDER }],
@@ -1140,7 +1183,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       const histogram = observations.find((observation) => observation.code === 'PLTHIST')
       expect(histogram?.valueString).toBe('see attached')
       expect(histogram?.valueQuantity ?? null).toBeNull()
-    }, COMPLETION_WAIT_MS + 60_000)
+    }, ORDER_ACK_WAIT_MS + COMPLETION_WAIT_MS + 60_000)
   })
 
   describe('the pre-order path: a reference-lab order is a draft until the clinic completes it', () => {
@@ -1251,11 +1294,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * models the completion: the record becomes an order in the feed, as `Submitted`, with a lab
        * accession and a requisition form.
        *
-       * This is the ONE assertion in this file that the orders channel can satisfy, and it is worth
-       * being precise about why: dmi-api accepts an incoming SUBMITTED only from WAITING_FOR_INPUT
-       * or ACCEPTED, and this order is WAITING_FOR_INPUT. The results channel is not involved —
-       * nothing is seeded for this order until the next test — so a change here can only have come
-       * from `external_orders`. */
+       * Outside the describe that replays orders to the orders channel, this is the one assertion in
+       * this file that channel satisfies, and it is worth being precise about why it needs no
+       * replay: promotion puts a record the poll has never acknowledged into the feed, at
+       * `Submitted`. dmi-api accepts an incoming SUBMITTED only from WAITING_FOR_INPUT or ACCEPTED,
+       * and this order is WAITING_FOR_INPUT. The results channel is not involved — nothing is seeded
+       * for this order until the next test — so a change here can only have come from
+       * `external_orders`. */
       expectOk(
         await mock.post(`/__control__/orders/${encodeURIComponent(draftRequisitionId)}/promote`, {}),
         'promote the draft to a placed order at the mock',
@@ -1273,16 +1318,15 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * this order's only code is a reference-lab one, so the integration MUST have fetched its
        * requisition form. (The mock serves a real `%PDF-1.7` body; the integration base64s it onto
        * the order as a manifest, which dmi-api stores but does not serialise on GET /orders/:id —
-       * so the fetch at the provider is the observable half.) */
-      const received = await pollUntil(
-        async () => await mockOrder(draftRequisitionId),
-        (entry) => entry.trfFetches > 0,
-        ORDER_ACK_WAIT_MS,
-        1_000,
-      )
+       * so the fetch at the provider is the observable half.)
+       *
+       * Waited for as the acknowledgement at `Submitted`, not as the fetch: the integration fetches
+       * the TRF inside the same poll cycle, before it emits the order and acknowledges it, so once
+       * the ack has landed the fetch has happened. The ack is also what the next test needs before
+       * it seeds a result (the file header, point 3). The wait asserts the ack at `Submitted`. */
+      const received = await waitForOrderAck(draftRequisitionId)
       expect(received.kind).toBe('order')
       expect(received.trfFetches).toBeGreaterThanOrEqual(1)
-      expect(received.orderAcked).toBe(true)
     }, ORDER_ACK_WAIT_MS * 2 + 30_000)
 
     it('seeding a result completes the promoted order too', async () => {
@@ -1351,6 +1395,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       partialOrderId = created.id
       expect(created.status).toBe('SUBMITTED')
 
+      /* Let the orders poll acknowledge the order at `Submitted` before anything is seeded. Seeding
+       * moves the mock's provider status to `Partial`, and a record the orders poll has not yet
+       * acknowledged is still on the unacknowledged feed — so a result seeded first would let the
+       * orders channel carry `Partial` to dmi-api and move the order itself, and the order
+       * assertion below would no longer say which channel moved it. */
+      await waitForOrderAck(partialRequisitionId)
+
       /* One of two tests reported. `extractResultStatus` reads ONLY the pending/total counts and
        * `Corrected` — the per-unit ResultStatus is not consulted — so this trio is the whole of the
        * decision: 1 of 2 pending is PARTIAL. */
@@ -1372,15 +1423,16 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(report.body.status).toBe('PARTIAL')
 
       /* A partial result moves the ORDER too — `setOrderStatusFromResult` acts on a PARTIAL result
-       * status, and dmi-api accepts PARTIAL from SUBMITTED. This is still the results channel: the
-       * orders channel cannot produce anything but SUBMITTED. */
+       * status, and dmi-api accepts PARTIAL from SUBMITTED. This is the results channel's: the order
+       * was acknowledged at `Submitted` before the result was seeded, and the mock does not re-offer
+       * an acknowledged order when its status changes, so the orders channel never saw `Partial`. */
       const order = await org.api.get(`/orders/${partialOrderId}`)
       expect(order.body.status).toBe('PARTIAL')
 
       const observations = await observationsFor(partialOrderId)
       expect(observations.map((observation) => observation.code)).toEqual(['BUN', 'CREA'])
       expect(observations.find((observation) => observation.code === 'BUN')?.valueQuantity?.value).toBe(24.3)
-    }, COMPLETION_WAIT_MS + 60_000)
+    }, ORDER_ACK_WAIT_MS + COMPLETION_WAIT_MS + 60_000)
 
     it('the completing delivery amends in place: FINAL, one copy of each observation, nothing lost', async () => {
       expectOk(
@@ -1430,6 +1482,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(observations.find((observation) => observation.code === 'HWAG')?.valueString).toBe('Negative')
       expect(observations).toHaveLength(3)
 
+      /* Still the results channel's, for the reason the test above gives: neither delivery puts the
+       * acknowledged order back on the orders feed. */
       const order = await org.api.get(`/orders/${partialOrderId}`)
       expect(order.body.status).toBe('COMPLETED')
     }, COMPLETION_WAIT_MS + 30_000)
@@ -1878,6 +1932,201 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     }, 60_000)
   })
 
+  describe('the orders channel carries the provider\'s own status', () => {
+    /* The integration polls Antech's order-status feed and reports each order's `OrderStatus` to
+     * dmi-api over `external_orders`, and dmi-api applies it through `isValidStatusChange`. Each
+     * test here drives one provider status through that path ALONE, on an order of its own:
+     *
+     *   - the order is placed on the auto-submit path and the orders poll acknowledges it once, at
+     *     `Submitted`, which dmi-api, already holding SUBMITTED, takes as no change. So the status
+     *     set next is a SECOND observation, never the first;
+     *   - the status is advanced with `replay: true`, the control plane's way of offering the record
+     *     again. The provider was observed NOT to re-offer an acknowledged order when its status
+     *     changes, and the mock does not either, so the replay is a harness action: it gets the new
+     *     status to the integration's mapping, and claims nothing about when production sees one;
+     *   - the mock re-acknowledging the order AT THE NEW STATUS is the proof the poll saw it. The
+     *     integration emits to dmi-api and then acknowledges, so after that point an unchanged dmi
+     *     status means dmi-api refused or never got it — not that the poll had not run yet;
+     *   - NO result is ever seeded for these orders, and each test asserts at the mock that none
+     *     exists, and at dmi-api that the report is still the empty REGISTERED one order creation
+     *     made. The results channel is the only other route to PARTIAL or COMPLETED, so whatever the
+     *     order's status becomes is the orders channel's doing.
+     *
+     * The mapping under test (the file header, point 3, says why `Received` is not PARTIAL): `Draft`
+     * to ACCEPTED; `Submitted`, `Received` and `In Progress` to SUBMITTED; `Partial` to PARTIAL;
+     * `Resulted` and `Final` to COMPLETED; `Expired` and `Canceled` to CANCELLED; anything else to
+     * SUBMITTED, with a warning; case and surrounding whitespace ignored. Driven here: `Final`,
+     * `Canceled`, `Expired` and `Partial`, which move the order, and `Received` and `In Progress`,
+     * which leave it SUBMITTED. `Resulted` shares its branch with `Final`. `Draft` is not driven:
+     * its ACCEPTED could be told apart from the unmapped default on a WAITING_FOR_INPUT order, where
+     * dmi-api would apply SUBMITTED and refuses ACCEPTED, but the live feed was observed to show no
+     * draft in any status view (the mock's header, load-bearing detail 6), so driving one would be
+     * a harness construct. It is left to the integration's unit tests.
+     *
+     * Until nominal-systems/dmi-engine-antech-v6-integration#84 was fixed, the integration's status
+     * enum was numeric while the provider sends strings, so `mapOrderStatus` matched no wire value
+     * and every polled status reached dmi-api as SUBMITTED; the `Final` test below was an
+     * `it.failing` tripwire for it. Against that code `Final` and the three rows that move the
+     * order go red naming SUBMITTED, and the guard after `Final` goes red on its precondition,
+     * because `Final` left it no completed order. The `Received` and `In Progress` rows stay green
+     * there by design: SUBMITTED is what they expect. */
+    let finalOrderId = ''
+    let finalRequisitionId = ''
+
+    /* Place a point-of-care order and wait for the orders poll to acknowledge it at `Submitted`.
+     * Acknowledged, it is off the unacknowledged feed until the test replays it. */
+    async function placeAcknowledgedOrder (providerStatus: string): Promise<{ orderId: string, requisitionId: string }> {
+      const payload = payloadFor([KIDNEY_PANEL_CODE], {
+        requisitionId: `hrn-v6-status-${providerStatus.toLowerCase().replace(/\s+/g, '-')}-${randomUUID().slice(0, 8)}`,
+      })
+      const requisitionId = payload.requisitionId as string
+      const created = expectOk<{ id: string, status: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        `place an order for the orders-channel '${providerStatus}' test`,
+      )
+      expect(created.status).toBe('SUBMITTED')
+
+      await waitForOrderAck(requisitionId)
+      return { orderId: created.id, requisitionId }
+    }
+
+    /* Set the provider status, offer the record again, and wait for the orders poll to acknowledge
+     * it AT that status. */
+    async function advanceProviderStatus (requisitionId: string, orderStatus: string): Promise<void> {
+      expectOk(
+        await mock.post(`/__control__/orders/${encodeURIComponent(requisitionId)}/status`, {
+          orderStatus,
+          replay: true,
+        }),
+        `advance the provider order status to '${orderStatus}' and re-offer the record`,
+      )
+      await waitForOrderAck(requisitionId, orderStatus)
+    }
+
+    /* The dmi order's status once dmi-api has handled the re-offered record: polled until it reads a
+     * status other than SUBMITTED, so a red waits out the budget and then names the status it got.
+     * Only a status ends the poll early: a transient error or an empty body inside the window does
+     * not, or the red would read `undefined` instead of the status dmi-api holds. */
+    async function dmiStatusAfterThePoll (orderId: string): Promise<string> {
+      const order = await pollUntil(
+        async () => await org.api.get(`/orders/${orderId}`),
+        (response) => typeof response.body?.status === 'string' && response.body.status !== 'SUBMITTED',
+        STATUS_APPLIED_WAIT_MS,
+        1_000,
+      )
+      return order.body?.status ?? `HTTP ${order.status}`
+    }
+
+    /* The results channel did nothing for this order: the mock holds no result for it (its control
+     * plane answers 404 for the result, with its own message: the mock answers 404 for a path it
+     * does not know too, so the status alone would prove little), and the order's report is the
+     * one order creation made, REGISTERED with no panels — dmi-api moves a report only on the
+     * results path. */
+    async function expectNothingFromTheResultsChannel (orderId: string, requisitionId: string): Promise<void> {
+      expect((await mockOrder(requisitionId)).hasResult).toBe(false)
+      const result = await mock.get(`/__control__/orders/${encodeURIComponent(requisitionId)}/result`)
+      expect(result.status).toBe(404)
+      expect(result.body?.message).toMatch(/^no seeded result for/)
+
+      const report = await org.api.get(`/orders/${orderId}/report`)
+      expect({ status: report.body?.status, panels: report.body?.testResultsSet }).toEqual({
+        status: 'REGISTERED',
+        panels: [],
+      })
+    }
+
+    it('the orders channel completes an order whose provider status has reached Final', async () => {
+      /* A polled `Final` reaches dmi COMPLETED through the orders channel alone: no result is ever
+       * seeded for this order, and the test checks that at both ends, so the results channel — the
+       * only other route to COMPLETED — cannot have done it. Was an `it.failing` tripwire until
+       * nominal-systems/dmi-engine-antech-v6-integration#84 was fixed: the integration's status
+       * enum was numeric and the provider sends the string `"Final"`, so the poll reported
+       * SUBMITTED, dmi-api correctly refused SUBMITTED -> SUBMITTED as no change, and the order
+       * stayed SUBMITTED. The order stays on for the next test. */
+      const { orderId, requisitionId } = await placeAcknowledgedOrder('Final')
+      finalOrderId = orderId
+      finalRequisitionId = requisitionId
+
+      await advanceProviderStatus(requisitionId, 'Final')
+
+      expect(await dmiStatusAfterThePoll(orderId)).toBe('COMPLETED')
+      await expectNothingFromTheResultsChannel(orderId, requisitionId)
+    }, ORDER_ACK_WAIT_MS * 2 + STATUS_APPLIED_WAIT_MS + 30_000)
+
+    it('a COMPLETED order stays COMPLETED when its provider status moves back to Partial', async () => {
+      /* `Partial` reaches dmi-api as PARTIAL, and `isValidStatusChange` applies PARTIAL only to an
+       * order at SUBMITTED, PARTIAL or ACCEPTED (and never a status equal to the current one), so a
+       * completed order stays where it is. `Partial` after `Final` is the realistic move back — an
+       * add-on test reopening the order at the lab — and the one that tests that rule: `Received` or
+       * `In Progress` arrive as SUBMITTED, which dmi-api refuses from anything but WAITING_FOR_INPUT
+       * or ACCEPTED, so they would leave a completed order alone even if COMPLETED were a source for
+       * PARTIAL. That is dmi-api's rule, not the integration's; it is pinned here because it is what
+       * the two together do end to end, now that the orders channel carries statuses that can move
+       * back at all. Waiting for the re-acknowledgement at `Partial` is what makes the wait after it
+       * mean "refused", not "not seen yet".
+       *
+       * It runs on the order the `Final` test completed, so when that test left none, it fails at
+       * once saying so, rather than reading `completedBeforehand: undefined`. */
+      if (finalOrderId === '') {
+        throw new Error(
+          "the 'Final' test did not leave a completed order for this guard to run on: " +
+            'its placement or acknowledgement wait failed, or this test ran on its own',
+        )
+      }
+      const before = await org.api.get(`/orders/${finalOrderId}`)
+      expect({ completedBeforehand: before.body?.status }).toEqual({ completedBeforehand: 'COMPLETED' })
+
+      await advanceProviderStatus(finalRequisitionId, 'Partial')
+      await new Promise((resolve) => setTimeout(resolve, NEGATIVE_WAIT_MS))
+
+      const order = await org.api.get(`/orders/${finalOrderId}`)
+      expect(order.body.status).toBe('COMPLETED')
+    }, ORDER_ACK_WAIT_MS + NEGATIVE_WAIT_MS + 30_000)
+
+    /* The rows that move the order. `Canceled` is the provider's spelling (one L), and dmi-api
+     * applies CANCELLED from any status. `Partial` is the one status that reaches dmi PARTIAL, so
+     * its row is the only end-to-end proof of the mapping's PARTIAL branch; its PARTIAL comes with
+     * a REGISTERED, empty report, which is how the results channel's PARTIAL (that report would be
+     * PARTIAL too) is ruled out. dmi-api applies PARTIAL from SUBMITTED, PARTIAL or ACCEPTED, but
+     * never a status equal to the current one, so PARTIAL -> PARTIAL is a no-op: the order moves
+     * once, from the SUBMITTED it was placed at. */
+    for (const { providerStatus, dmiStatus } of [
+      { providerStatus: 'Canceled', dmiStatus: 'CANCELLED' },
+      { providerStatus: 'Expired', dmiStatus: 'CANCELLED' },
+      { providerStatus: 'Partial', dmiStatus: 'PARTIAL' },
+    ]) {
+      it(`a provider status of '${providerStatus}' moves the order to ${dmiStatus} through the orders channel`, async () => {
+        const { orderId, requisitionId } = await placeAcknowledgedOrder(providerStatus)
+
+        await advanceProviderStatus(requisitionId, providerStatus)
+
+        expect(await dmiStatusAfterThePoll(orderId)).toBe(dmiStatus)
+        await expectNothingFromTheResultsChannel(orderId, requisitionId)
+      }, ORDER_ACK_WAIT_MS * 2 + STATUS_APPLIED_WAIT_MS + 30_000)
+    }
+
+    /* The rows that leave it. `Received` and `In Progress` are a lab that holds the sample and has
+     * reported nothing yet; both reach dmi-api as SUBMITTED, which it does not apply to an order
+     * that is SUBMITTED already. `In Progress` was OBSERVED on the wire (with the space) but not
+     * declared by the integration at all before the fix. These two rows are green against the
+     * unfixed integration too, where every status reached dmi-api as SUBMITTED: the integration's
+     * unit tests carry that red. They are here because they pin the chosen mapping end to end, and
+     * go red if someone maps either to PARTIAL. As in the rows above, the re-acknowledgement at the
+     * new status is what makes the wait after it mean "not applied", not "not seen yet". */
+    for (const providerStatus of ['Received', 'In Progress']) {
+      it(`a provider status of '${providerStatus}' leaves the order SUBMITTED`, async () => {
+        const { orderId, requisitionId } = await placeAcknowledgedOrder(providerStatus)
+
+        await advanceProviderStatus(requisitionId, providerStatus)
+        await new Promise((resolve) => setTimeout(resolve, NEGATIVE_WAIT_MS))
+
+        const order = await org.api.get(`/orders/${orderId}`)
+        expect(order.body?.status).toBe('SUBMITTED')
+        await expectNothingFromTheResultsChannel(orderId, requisitionId)
+      }, ORDER_ACK_WAIT_MS * 2 + NEGATIVE_WAIT_MS + 30_000)
+    }
+  })
+
   /* ---- tripwires ----
    *
    * Each asserts the CORRECT behaviour and is marked `failing` while the integration does not have
@@ -1920,64 +2169,6 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         body: '',
       })
     })
-
-    it.failing('the orders channel completes an order whose provider status has reached Final', async () => {
-      /* EXPECTED: a polled order whose provider status is `Final` reaches dmi COMPLETED (or at the
-       * very least leaves SUBMITTED). ACTUAL: it stays SUBMITTED.
-       *
-       * The provider sends `OrderStatus` as a STRING while the integration's status enum is a bare
-       * numeric one, so its `mapOrderStatus` switch matches no wire value and every polled status
-       * falls to the switch default, SUBMITTED. dmi-api then correctly refuses SUBMITTED -> SUBMITTED
-       * as a non-change, and the order never moves.
-       *
-       * This is why every completion assertion in this file rests on the results channel, and why
-       * the mock serves the strings: emitting the integers the enum declares would make this test
-       * pass against behaviour the live endpoint does not produce. Filed as
-       * nominal-systems/dmi-engine-antech-v6-integration#84. */
-      const payload = payloadFor([KIDNEY_PANEL_CODE])
-      const requisitionId = payload.requisitionId as string
-      const created = expectOk<{ id: string }>(
-        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
-        'place an order for the orders-channel tripwire',
-      )
-
-      /* Let the orders poll see and acknowledge it once at `Submitted` first, so the status change
-       * below is unambiguously a SECOND observation rather than the first. */
-      await pollUntil(
-        async () => await mockOrder(requisitionId),
-        (order) => order.orderAcked,
-        ORDER_ACK_WAIT_MS,
-        1_000,
-      )
-
-      /* Advance the provider status and offer the record again. NO result is ever seeded for this
-       * order, so the results channel cannot reach it: whatever happens next is the orders
-       * channel's doing, or nothing. */
-      expectOk(
-        await mock.post(`/__control__/orders/${encodeURIComponent(requisitionId)}/status`, {
-          orderStatus: 'Final',
-          replay: true,
-        }),
-        'advance the provider order status to Final and re-offer the record',
-      )
-
-      /* Proof the poll actually saw the new status: the mock re-acknowledges it, at `Final`. */
-      const reAcked = await pollUntil(
-        async () => await mockOrder(requisitionId),
-        (order) => order.orderAckedStatus === 'Final',
-        ORDER_ACK_WAIT_MS,
-        1_000,
-      )
-      expect(reAcked.orderAckedStatus).toBe('Final')
-
-      const order = await pollUntil(
-        async () => await org.api.get(`/orders/${created.id}`),
-        (response) => response.body?.status !== 'SUBMITTED',
-        NEGATIVE_WAIT_MS,
-        1_000,
-      )
-      expect(order.body.status).toBe('COMPLETED')
-    }, ORDER_ACK_WAIT_MS * 2 + NEGATIVE_WAIT_MS + 30_000)
 
     it.failing('a provider error on the status poll is recorded in the audit trail', async () => {
       /* EXPECTED: when Antech answers a status poll with an error, the failure is stored as an
