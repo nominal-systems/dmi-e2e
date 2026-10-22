@@ -18,6 +18,14 @@
  * `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot answer and never
  * reached it can be named and cleaned up instead of leaving that answer for the next call.
  *
+ * A result is seeded (`POST /__control__/orders/:id/results`) only for an order the orders poll has
+ * already acknowledged; a seed for any other is answered 409. Seeding moves the order's
+ * `OrderStatus` to `Partial` or `Final`, and a record still on the unacknowledged feed carries that
+ * status through the orders channel on the next tick, so a test that seeded first could no longer
+ * say which channel moved the dmi order. A test waits for `orderAcked` on
+ * `GET /__control__/orders/:id` first, or passes `allowUnacked: true` in the seed to seed anyway.
+ * A harness rule, not a provider one.
+ *
  * It NEVER talks to a live Antech host and never authenticates for real. All canned patient,
  * client, doctor and clinic data is SYNTHETIC — invented values shaped like Antech responses, never
  * captured clinic or patient data. What IS genuine is Antech's published CATALOGUE vocabulary: the
@@ -1551,6 +1559,8 @@ async function handleControlSetStatus (req, res, params) {
  *   pendingTestCount, totalTestCount   -> drive the mapper's result status
  *   corrected                          -> non-empty means REVISED
  *   orderStatus, resultStatus          -> the order's provider-side status after the result lands
+ *   allowUnacked                       -> true seeds an order the orders poll has not acknowledged
+ *                                         yet, which is otherwise refused (409; see below)
  *
  * The `pendingTestCount`/`totalTestCount`/`corrected` trio is the WHOLE of the integration's result
  * status decision (`extractResultStatus`): 0 pending -> COMPLETED, some pending -> PARTIAL,
@@ -1566,6 +1576,20 @@ async function handleControlSeedResult (req, res, params) {
   if (order.kind !== 'order') {
     sendJson(res, 400, {
       message: `${params.clinicAccessionId} is a pre-order (a draft). A draft produces no results at the provider; promote it first.`,
+    })
+    return
+  }
+  /* A HARNESS rule, not a provider one (see the header): a seed for an order the orders poll has not
+   * acknowledged would let the orders channel, not the results channel, carry the seed's status to
+   * dmi-api on the next tick. */
+  if (order.orderAcked === false && body.allowUnacked !== true) {
+    sendJson(res, 409, {
+      message:
+        `${params.clinicAccessionId} has not been acknowledged by the orders poll yet. Seeding a result moves its ` +
+        "OrderStatus to 'Partial' or 'Final', and a record that is not acknowledged carries that status through " +
+        'the orders channel on the next tick, so a test could no longer say which channel moved the order. ' +
+        `Wait for orderAcked on GET /__control__/orders/${params.clinicAccessionId}, or pass allowUnacked: true ` +
+        'to seed anyway.',
     })
     return
   }
@@ -1631,7 +1655,8 @@ async function handleControlSeedResult (req, res, params) {
   /* A result that lands moves the order's provider-side status. Faithful: a real Antech order with
    * final results reports `Final`. It does NOT clear the order acknowledgement, so a record the
    * orders channel has already acked stays out of the `overrideAck=false` feed — which is why the
-   * scenario can claim that only the RESULTS channel can have completed the order. */
+   * scenario can claim that only the RESULTS channel can have completed the order, and why a seed
+   * for an order not yet acked is refused above. */
   const orderStatus = body.orderStatus ?? (pendingTestCount > 0 ? 'Partial' : 'Final')
   if (!ORDER_STATUS_VALUES.includes(orderStatus)) {
     sendJson(res, 400, { message: `orderStatus must be one of ${ORDER_STATUS_VALUES.join(', ')}` })
