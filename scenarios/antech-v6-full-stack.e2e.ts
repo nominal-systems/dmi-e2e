@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { ApiClient, expectOk } from '../src/api-client'
+import { ApiClient, ApiResponse, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
@@ -338,6 +338,14 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     const response = await org.api.get(`/orders/${orderId}/report`)
     const panels = (response.body?.testResultsSet ?? []) as TestResultSet[]
     return panels.flatMap((panel) => panel.observations ?? [])
+  }
+
+  /* The generic line the integration puts first in the error list of a failed placement: the URL
+   * that failed, built from the baseUrl this scenario seeded into the provider configuration, so
+   * the whole-list assertions in this file follow the harness's configuration rather than a host
+   * written into the test. */
+  function failedPost (endpoint: string): string {
+    return `Failed to POST ${env.antechV6.baseUrl}${endpoint}`
   }
 
   /* Admin helpers for the ref sync + mapping. dmi ref ids are numeric row ids (the CODES are the
@@ -1428,18 +1436,66 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   })
 
   describe('refusals surface end to end', () => {
+    /* The tests at the end of this block arm a one-shot answer on a placement endpoint, and the
+     * mock clears it only when that endpoint is hit. A test that fails before its order gets there
+     * (dmi-api refuses the payload, the request times out, the order routes to the other endpoint)
+     * would leave the answer armed for the next order placed there (the cancel test's, say), and
+     * the red would land in the wrong test. So after each test, whatever is still armed at the
+     * mock is cleared and then named as a failure. Jest reports a failing `afterEach` on the test it
+     * followed, which is the one that armed the answer and never used it; clearing first means the
+     * tests after it start clean whatever happens here. */
+    afterEach(async () => {
+      const armed = expectOk<{ scenarios: Record<string, unknown> }>(
+        await mock.get('/__control__/scenarios'),
+        'list the scenarios still armed at the mock',
+      ).scenarios
+      const leftoverScenarios = Object.keys(armed)
+      for (const key of leftoverScenarios) {
+        expectOk(
+          await mock.delete(`/__control__/scenarios/${encodeURIComponent(key)}`),
+          `clear the leftover '${key}' scenario at the mock`,
+        )
+      }
+      expect({ leftoverScenarios }).toEqual({ leftoverScenarios: [] })
+    })
+
+    /* Arms `answer` once on `key` (`placeOrder` is `/LabOrders/v6/Order`, `placePreOrder` is
+     * `/LabOrders/v6/PreOrderPlacement`): a status and body spelled out here, or one of the mock's
+     * own envelopes by name. Then posts an order for `codes` with auto-submit asked for — a
+     * separate order, with its own requisitionId, that never reaches the loop above — and returns
+     * dmi-api's answer for the test to assert on. */
+    async function placeAgainst (
+      key: 'placeOrder' | 'placePreOrder',
+      answer: { status: number, body: unknown } | { envelope: 'trfUnavailable' | 'unknownPath' },
+      codes: string[],
+      what: string,
+    ): Promise<ApiResponse> {
+      expectOk(
+        await mock.post('/__control__/scenarios', { key, ...answer, once: true }),
+        `arm a one-shot ${what} on the next ${key === 'placeOrder' ? 'order' : 'pre-order'} placement`,
+      )
+      const response = await org.api.post('/orders', payloadFor(codes), { autoSubmitOrder: true })
+      console.log(
+        `[antech-v6-scenario] ${key} ${what} response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+      return response
+    }
+
     it('an unknown test code fails POST /orders, carrying the provider\'s OWN message', async () => {
-      /* Exercises the integration's error path, which the happy path never touches — and
-       * specifically the one provider envelope whose wording reaches an operator. The mock rejects
-       * a code outside its catalogue with the placement-rejection envelope observed live:
-       * `{value: {..., Message: "..."}, statusCode, contentType}`. `AntechV6ApiException` reads
-       * `.value.Message`, so the provider's explanation survives; dmi-api re-throws the engine error
-       * out of createOrder, and POST /orders answers non-2xx with it in `errors`.
+      /* Exercises the integration's error path, which the happy path never touches, through the
+       * one placement refusal observed live. The mock rejects a code outside its catalogue with
+       * that placement-rejection envelope: `{value: {..., Message: "..."}, statusCode,
+       * contentType}`. `AntechV6ApiException` reads `.value.Message`, so the provider's explanation
+       * survives; dmi-api re-throws the engine error out of createOrder, and POST /orders answers
+       * non-2xx with it in `errors`.
        *
-       * Pinning the exact message rather than merely "it failed" is what distinguishes the real
-       * branch from the generic `Failed to POST <url>` fallback every other Antech envelope
-       * degrades to. A separate order, with its own requisitionId, that never reaches the loop
-       * above. */
+       * Pinning the exact message rather than merely "it failed" is what distinguishes the
+       * provider's wording from the generic `Failed to POST <url>` line that leads every error
+       * list — which, until nominal-systems/dmi-engine-antech-v6-integration#86, was all an
+       * operator was told for three more of Antech's envelopes. The tests at the end of this block
+       * pin two of those at placement and a placement refusal of the third's family, and what an
+       * envelope nobody has seen yet surfaces as, cut to length. A separate order, with its own
+       * requisitionId, that never reaches the loop above. */
       const payload = payloadFor(['NOT-A-REAL-ANTECH-CODE'])
 
       const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
@@ -1448,19 +1504,24 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       )
 
       expect(response.ok).toBe(false)
-      expect(response.text).toContain('Invalid OrderCode NOT-A-REAL-ANTECH-CODE')
-      /* And the generic fallback is present too, as the LAST-added entry of the error list — so
-       * this also pins that the provider message is additional to it, not instead of it. */
-      expect(response.text).toContain('/LabOrders/v6/PreOrderPlacement')
+      /* The whole list: the generic line first, naming the endpoint, then the provider's message,
+       * and nothing else, so this also pins that the provider message is added to the generic
+       * line, not put in its place. The integration read this envelope before
+       * nominal-systems/dmi-engine-antech-v6-integration#86 too, so the list is the same on its
+       * main: this test pins the list, it does not prove that fix. */
+      expect(response.body?.errors).toEqual([
+        failedPost('/LabOrders/v6/PreOrderPlacement'),
+        'Invalid OrderCode NOT-A-REAL-ANTECH-CODE',
+      ])
     }, 30_000)
 
     it('an integration pointed at a clinic the account does not own surfaces `Invalid User or Password`', async () => {
       /* The mock accepts any username/password VALUES — they are dummy by design — but refuses a
        * clinic it was not provisioned for, with the bare-text 401 body the live endpoint returns
        * when credentials do not open a session. The interesting part is the surface: that body is a
-       * STRING, not JSON, and `AntechV6ApiException`'s `typeof options === 'string'` branch is the
-       * only thing that carries it through. A mock that answered credential failures in JSON would
-       * leave that branch unexercised.
+       * STRING, not JSON, and `AntechV6ApiException`'s bare-string branch is the only thing that
+       * carries it through. A mock that answered credential failures in JSON would leave that
+       * branch unexercised.
        *
        * A second practice + integration on the SAME provider configuration, deliberately never
        * started, so it schedules no polling and cannot perturb anything above. */
@@ -1498,13 +1559,17 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
     it('the mock refuses, in the provider\'s own dialects, every call the loop never makes', async () => {
       /* Direct probes. Each of these is a shape the integration can produce but this loop does not,
-       * and each is a DIFFERENT envelope — the variety is itself the contract, because which shape
-       * an endpoint returns decides whether Antech's explanation reaches an operator or is replaced
-       * by a generic message. Pinning them here keeps the mock from drifting onto one house style. */
+       * and each is a DIFFERENT envelope — the variety is itself the contract. Since
+       * nominal-systems/dmi-engine-antech-v6-integration#86 the integration's error mapper reads
+       * Antech's explanation out of every envelope pinned here, but it does so by knowing each
+       * one's keys, so a mock that drifted onto one house style would stop testing all but one of
+       * them. Pinning them here keeps the mock from drifting. */
       const base = env.antechV6.mockBaseUrl
 
-      /* 1. A missing accessToken header: RFC 9110 401, keyed `message` (lowercase) — which the
-       *    integration's error mapper does NOT read. */
+      /* 1. A missing accessToken header: RFC 9110 401, keyed `message` (lowercase), beside an
+       *    empty `errorDetails` map. The error mapper reads the lowercase key since that fix;
+       *    before it, this envelope reached an operator as the generic line alone. A 401 cannot be
+       *    armed at placement, so a test below pins a 400 of the same family there instead. */
       const noToken = await fetch(
         `${base}/LabResults/v6/GetStatus?serviceType=labOrder&ClinicID=${env.antechV6.clinicId}&overrideAck=false`,
       )
@@ -1545,7 +1610,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(guide.TotalCount).toBe(pocCodes.length)
 
       /* 3. A malformed serviceType: RFC 9110 validation problem+json, keyed by the offending field.
-       *    The error mapper DOES read `title` and `errors`, so this one reaches an operator. */
+       *    The error mapper reads `title` and `errors`, as it did before that fix too, so this one
+       *    reaches an operator. */
       const badServiceType = await fetch(
         `${base}/LabResults/v6/GetStatus?serviceType=notAThing&ClinicID=${env.antechV6.clinicId}`,
         { headers },
@@ -1599,12 +1665,184 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         contentType: 'application/json',
       })
 
-      /* 6. An unknown path: `{statusCode, message}` — a third distinct 4xx shape, and one more the
-       *    error mapper cannot read. */
+      /* 6. An unknown path: `{statusCode, message}` — a third distinct 4xx shape. The error mapper
+       *    reads its lowercase `message` since that fix; a test below pins it end to end, as a
+       *    refusal at the pre-order endpoint. */
       const unknownPath = await fetch(`${base}/LabResults/v6/NoSuchThing`, { headers })
       expect(unknownPath.status).toBe(404)
       expect(await unknownPath.json()).toEqual({ statusCode: 404, message: 'Resource not found' })
     }, 60_000)
+
+    it('a 500 `{StatusCode, ErrorMessage}` on the order endpoint reaches the operator with the provider\'s wording', async () => {
+      /* The TRF endpoint's 500 envelope, captured there for an unknown accession (the draft test
+       * above probes it). Production has shown failed order sends reaching the caller with
+       * nothing from Antech, so an envelope the integration could not read does reach placement,
+       * though the logs do not say which one. Neither of this envelope's keys was one the
+       * integration's error mapper read, so an operator was told only `Failed to POST <url>`.
+       * Since nominal-systems/dmi-engine-antech-v6-integration#86 the mapper reads
+       * `ErrorMessage`, in any case, and Antech's `Internal server error` follows the generic
+       * line.
+       *
+       * Armed once, by name (`envelope: 'trfUnavailable'`), so the mock answers with the builder
+       * that answers at the TRF endpoint, not a copy of its body: a new capture changes both at
+       * once, and the wording expected below then goes red until it follows. On the real ORDER
+       * endpoint: the order's code is point-of-care and auto-submit is asked for, so the
+       * integration places it at `/LabOrders/v6/Order`, as the unmapped-patient refusal at the
+       * bottom of this file does. The mock answers that one call before it reads the order, so
+       * nothing is recorded at the provider. The WHOLE error list is pinned: the generic line
+       * first, naming the URL that failed, which shows the 500 came from placement; then Antech's
+       * wording; and nothing else. That is what shows the provider's text is added to the generic
+       * line rather than put in its place.
+       *
+       * The wording expected is the captured one, which the mock also answers when one of its own
+       * handlers throws; that cannot pass for the armed answer, because the order handler takes
+       * the scenario right after its token check, so a crash before it leaves the scenario armed
+       * and the `afterEach` above names it. */
+      const response = await placeAgainst(
+        'placeOrder',
+        { envelope: 'trfUnavailable' },
+        [KIDNEY_PANEL_CODE],
+        '500 {StatusCode, ErrorMessage}',
+      )
+
+      expect(response.ok).toBe(false)
+      expect(response.body?.errors).toEqual([failedPost('/LabOrders/v6/Order'), 'Internal server error'])
+    }, 30_000)
+
+    it('a 404 `{statusCode, message}` on the pre-order endpoint reaches the operator with the provider\'s wording', async () => {
+      /* The unknown-path envelope (probe 6 above): Antech's answer for a path it does not have,
+       * and so the answer a placement would get from a moved or misspelled endpoint. Its lowercase
+       * `message` was not a key the integration's error mapper read, so an operator was told only
+       * `Failed to POST <url>`. Since nominal-systems/dmi-engine-antech-v6-integration#86 it is,
+       * and `Resource not found` follows the generic line. Armed once, by name
+       * (`envelope: 'unknownPath'`), so the mock answers with the builder its router answers probe
+       * 6 with, not a copy of its body: a new capture changes both at once.
+       *
+       * The pre-order endpoint this time, so both placement paths are covered: a reference-lab
+       * code is not point-of-care, so the integration takes the draft path even with auto-submit
+       * asked for, as the pre-order test above does. A real catalogue code, unlike the unknown-code
+       * refusal's, so the mock would have accepted this order and the 404 can only be the armed
+       * answer. The whole error list is pinned, as in the test above; its generic line names
+       * `/LabOrders/v6/PreOrderPlacement`, which shows where the 404 came from. A separate order,
+       * with its own requisitionId, that never reaches the loop above. */
+      const response = await placeAgainst(
+        'placePreOrder',
+        { envelope: 'unknownPath' },
+        [referenceLabCode],
+        '404 {statusCode, message}',
+      )
+
+      expect(response.ok).toBe(false)
+      expect(response.body?.errors).toEqual([failedPost('/LabOrders/v6/PreOrderPlacement'), 'Resource not found'])
+    }, 30_000)
+
+    it('a 400 `{message, detail, errorDetails}` on the order endpoint reaches the operator with the message, and the repeated detail once', async () => {
+      /* The RFC 9110 family Antech's missing-token 401 belongs to (probe 1 above): a lowercase
+       * `message` beside an `errorDetails` field map. This is the shape the integration's own unit
+       * tests carry for a point-of-care validation refusal at placement, taken verbatim but for a
+       * synthetic requestId; this harness has not captured it. It stands in for the 401, which
+       * cannot be armed at placement: the integration answers any 401 by logging in again and
+       * retrying the call once, so a one-shot 401 is used up by the first attempt and the retry
+       * succeeds, and a standing one cannot be disarmed between tests without resetting the mock.
+       *
+       * Until nominal-systems/dmi-engine-antech-v6-integration#86 the error mapper read only
+       * `detail` here, so the operator never saw the `Validation Failed` headline. It now reads
+       * `message` in any case, and the `errorDetails` map as well. The map's one entry renders
+       * exactly as `detail` does, and a message repeated under two keys is listed once, so the
+       * whole list is three entries: the de-duplication is pinned too. Placed as in the 500 test
+       * above, at the ORDER endpoint. A separate order, with its own requisitionId, that never
+       * reaches the loop above. */
+      const pocRefusal = 'POCValidation: POC validation errors: Only IHD order codes are supported.'
+      const response = await placeAgainst(
+        'placeOrder',
+        {
+          status: 400,
+          body: {
+            type: 'https://www.rfc-editor.org/rfc/rfc9110.html#status.400',
+            message: 'Validation Failed',
+            status: 400,
+            detail: pocRefusal,
+            errorDetails: { POCValidation: ['POC validation errors: Only IHD order codes are supported.'] },
+            isSuccess: false,
+            requestId: '00000000-0000-4000-8000-000000000001',
+          },
+        },
+        [KIDNEY_PANEL_CODE],
+        '400 {message, detail, errorDetails}',
+      )
+
+      expect(response.ok).toBe(false)
+      expect(response.body?.errors).toEqual([failedPost('/LabOrders/v6/Order'), 'Validation Failed', pocRefusal])
+    }, 30_000)
+
+    it('an error envelope nobody has captured yet reaches the operator as its raw body', async () => {
+      /* INVENTED on purpose: no such envelope has been seen, and its keys are ones the error
+       * mapper does not look for. Antech has already been seen answering in seven shapes (the
+       * mock's error-envelope builders), so an eighth would be no surprise, and until
+       * nominal-systems/dmi-engine-antech-v6-integration#86 the integration dropped a body it did
+       * not recognise, leaving the operator `Failed to POST <url>` alone. Since that fix a
+       * non-empty body with nothing recognisable is passed on raw (`JSON.stringify`, cut at 500
+       * characters) after the generic line, so whatever Antech said still reaches someone who can
+       * act on it.
+       *
+       * Placed as in the 500 test above, at the ORDER endpoint, and the whole error list is pinned
+       * the same way. The raw entry within it is pinned whole, so a fallback that altered the
+       * body on the way would be a red too. A separate order, with its own requisitionId, that
+       * never reaches the loop above. */
+      const unseenEnvelope = { Unexpected: 'envelope', Code: 'X-1' }
+      const response = await placeAgainst(
+        'placeOrder',
+        { status: 500, body: unseenEnvelope },
+        [KIDNEY_PANEL_CODE],
+        '500 with an unseen envelope',
+      )
+
+      expect(response.ok).toBe(false)
+      expect(response.body?.errors).toEqual([failedPost('/LabOrders/v6/Order'), JSON.stringify(unseenEnvelope)])
+    }, 30_000)
+
+    it('an unseen envelope\'s raw body is cut at 500 code points on its way to the operator', async () => {
+      /* The bound on the raw-body fallback above. `errors` goes back to the PIMS and is shown to
+       * its user, so since nominal-systems/dmi-engine-antech-v6-integration#86 each entry the
+       * integration takes from Antech's body is cut at 500 characters, counted in code points,
+       * with `…` appended. An unseen envelope whose one value is 2,000 emoji must therefore arrive
+       * as the generic line and ONE more entry of exactly 501 code points: the start of the raw
+       * body, then the ellipsis. Before that fix the body was dropped, and the list was the
+       * generic line alone.
+       *
+       * Emoji, not ASCII, because each is outside the BMP: 2,000 of them are 4,000 UTF-16 units,
+       * so a cut counted in code points and one counted in units give different entries. Counted in
+       * code points, the entry is 501. Counted in units, it would be the 15-character
+       * `{"Unexpected":"`, 242 whole emoji and half of the next, then the ellipsis: 259 code points
+       * and a split pair. An all-ASCII body comes out at 501 either way, and could not tell them
+       * apart. Placed as in the 500 test above, at the ORDER endpoint. */
+      const rawStart = '{"Unexpected":"'
+      const response = await placeAgainst(
+        'placeOrder',
+        { status: 500, body: { Unexpected: '🧪'.repeat(2000) } },
+        [KIDNEY_PANEL_CODE],
+        '500 with a 2,000-emoji unseen envelope',
+      )
+
+      expect(response.ok).toBe(false)
+      /* One object, so a red shows every property of the list at once rather than the first
+       * that broke. */
+      const errors = (response.body?.errors ?? []) as string[]
+      const raw = errors[1] ?? ''
+      expect({
+        entries: errors.length,
+        generic: errors[0],
+        codePoints: Array.from(raw).length,
+        start: raw.slice(0, rawStart.length),
+        end: raw.slice(-1),
+      }).toEqual({
+        entries: 2,
+        generic: failedPost('/LabOrders/v6/Order'),
+        codePoints: 501,
+        start: rawStart,
+        end: '…',
+      })
+    }, 30_000)
   })
 
   describe('cancel: the integration has no cancel path, and dmi-api leaves the order as it was', () => {
@@ -1818,8 +2056,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
     it('the unmapped-patient refusal reaches the operator with the provider\'s own wording', async () => {
       /* The positive half of the tripwire above, and the reason it is only half-bad: whatever else
-       * happens, the operator is told WHY. This is the `.value.Message` branch of the integration's
-       * error mapper — the one provider envelope whose wording survives — so an operator sees
+       * happens, the operator is told WHY. This is the `.value.Message` envelope, the one placement
+       * refusal observed live, and the integration's error mapper reads it, so an operator sees
        * `Invalid BreedId 370` rather than a bare `Failed to POST`. It is also the assertion that
        * would go red first if the ref mapping for species or breed silently stopped resolving for a
        * patient that IS mapped. */
@@ -1830,14 +2068,20 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       const response = await org.api.post('/orders', payload, { autoSubmitOrder: true })
 
       expect(response.ok).toBe(false)
-      expect(response.text).toContain(`Invalid BreedId ${DEFAULT_PET_BREED}`)
-      /* Named rather than implied, and worth pinning because the placement path is decided BEFORE
+      /* The whole list: the generic line, naming the endpoint, then the provider's wording, and
+       * nothing else. The endpoint is worth pinning because the placement path is decided BEFORE
        * the patient is: this order's code is point-of-care and auto-submit was asked for, so the
        * integration went to the real ORDER endpoint and was refused there. The unknown-test-code
        * refusal above names `/LabOrders/v6/PreOrderPlacement` instead — same envelope, different
        * endpoint — because an unknown code is not in the POC set and so routes to the draft path.
-       * The pair is what shows the refusal is the provider's, at whichever endpoint it happened. */
-      expect(response.text).toContain('/LabOrders/v6/Order')
+       * The pair is what shows the refusal is the provider's, at whichever endpoint it happened.
+       * Like that one, this envelope was read before
+       * nominal-systems/dmi-engine-antech-v6-integration#86 too, so this pins the list and does
+       * not prove that fix. */
+      expect(response.body?.errors).toEqual([
+        failedPost('/LabOrders/v6/Order'),
+        `Invalid BreedId ${DEFAULT_PET_BREED}`,
+      ])
     }, 60_000)
   })
 })

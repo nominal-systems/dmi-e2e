@@ -9,6 +9,15 @@
  * (`/__control__/*`) lets tests seed results, promote a draft, inspect what the mock received and
  * inject error scenarios, so the order -> result -> report loop is deterministic and CI-safe.
  *
+ * Error scenarios are armed per operation (`placeOrder`, `getStatus`, … — see `freshState`) with
+ * `POST /__control__/scenarios`: `{key, status, body, once}` for a body the test spells out, or
+ * `{key, envelope, once}` for one of the mock's own error envelopes by name (`ENVELOPES`:
+ * `trfUnavailable`, `unknownPath`), sent by the same builder the mock uses where that envelope was
+ * observed, so a test that arms it cannot keep an old copy after a new capture. `GET
+ * /__control__/scenarios` lists what is still armed (per key: `status`, `once`, `envelope`) and
+ * `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot answer and never
+ * reached it can be named and cleaned up instead of leaving that answer for the next call.
+ *
  * It NEVER talks to a live Antech host and never authenticates for real. All canned patient,
  * client, doctor and clinic data is SYNTHETIC — invented values shaped like Antech responses, never
  * captured clinic or patient data. What IS genuine is Antech's published CATALOGUE vocabulary: the
@@ -461,9 +470,9 @@ function freshState () {
     /* LabAccessionID -> { clinicAccessionId, document, acknowledged, servedCount, ackCount }. The
      * GetAllResults feed. */
     results: new Map(),
-    /* Error/edge injection: { [key]: { status, body, once } }. Keys are logical operation names —
-     * 'login', 'getStatus', 'getAllResults', 'ackStatus', 'testGuide', 'placeOrder',
-     * 'placePreOrder', 'trf'. */
+    /* Error/edge injection: { [key]: { status, body, envelope, once } }, `envelope` naming one of
+     * `ENVELOPES` (and then no `body`). Keys are logical operation names — 'login', 'getStatus',
+     * 'getAllResults', 'ackStatus', 'testGuide', 'placeOrder', 'placePreOrder', 'trf'. */
     scenarios: {},
     /* Per-endpoint call counts, so a scenario can assert on what the integration DID (a TRF that
      * was never fetched, a test guide that was), not only on what it ended up with. */
@@ -502,8 +511,8 @@ function sendJson (res, status, body) {
 }
 
 /* A bare text body. OBSERVED: the login endpoint answers bad credentials with `text/plain`, not
- * JSON — which is why the integration's error mapper has a `typeof options === 'string'` branch at
- * all. Serving this as JSON would leave that branch unexercised. */
+ * JSON — which is why the integration's error mapper has a bare-string branch at all. Serving this
+ * as JSON would leave that branch unexercised. */
 function sendText (res, status, body) {
   res.writeHead(status, {
     'content-type': 'text/plain; charset=utf-8',
@@ -542,9 +551,16 @@ async function readJson (req) {
 /* ---- the provider's error envelopes ----
  *
  * SEVEN distinct shapes, and that variety is itself part of the contract: the integration's
- * `AntechV6ApiException` unwinds a fixed list of fields off the raw response body, so which shape
- * an endpoint returns decides whether Antech's own explanation reaches the operator or is replaced
- * by a generic `Failed to POST <url>`. Each builder below is used only where it was OBSERVED. */
+ * `AntechV6ApiException` puts a generic `Failed to <METHOD> <url>` line first and then reads
+ * Antech's own explanation out of the raw response body by the keys these envelopes use — the body
+ * itself when it is a bare string; otherwise `title`, `message`, `errorMessage` and `detail`,
+ * matched in any case, the `errors` / `errorDetails` field maps, and the same again under `value`.
+ * Since nominal-systems/dmi-engine-antech-v6-integration#86 that reaches the wording in all seven,
+ * and a non-empty body with none of those keys is passed on raw, cut at 500 characters; before it,
+ * three of them (the two lowercase-`message` envelopes and the `ErrorMessage` one) reached the
+ * operator as the generic line alone. Each builder below is used only where it was OBSERVED, and
+ * keeps the provider's keys rather than one the mapper happens to read: the mapper is what is
+ * under test. */
 
 /* 401, bare text. OBSERVED for a bad password on /Users/v6/Login. */
 function sendBadCredentials (res, why) {
@@ -553,17 +569,21 @@ function sendBadCredentials (res, why) {
 }
 
 /* 404 JSON. OBSERVED for an unknown path, and (load-bearing detail 5) for /Tests/v6 reached with
- * header auth instead of query auth. */
+ * header auth instead of query auth. The router's fall-through sends it for every path the mock
+ * does not have, and a scenario can arm it on another operation by name (`unknownPath`). */
 function sendNotFound (res, why) {
   if (why !== undefined) log(`404: ${why}`)
   sendJson(res, 404, { statusCode: 404, message: 'Resource not found' })
 }
 
 /* 401 RFC 9110 problem-ish envelope. OBSERVED for a missing accessToken. Note the key is
- * `message`, lowercase — which the integration's error mapper does NOT read (it looks for
- * `Message`), so this surfaces to an operator as the generic `Failed to GET <url>`. That is the
- * provider-real behaviour and the mock reproduces it rather than "helpfully" using a key the
- * mapper happens to understand. */
+ * `message`, lowercase, beside an EMPTY `errorDetails` map. Until
+ * nominal-systems/dmi-engine-antech-v6-integration#86 the integration's error mapper looked only
+ * for `Message`, so this surfaced to an operator as the generic `Failed to GET <url>` alone; it
+ * now matches the key in any case and reads `errorDetails` as a field map, so
+ * `Access token is missing.` follows the generic line and the empty map adds nothing. The mock
+ * keeps the provider-real casing and the empty map rather than "helpfully" using a key the mapper
+ * happens to understand. */
 function sendMissingAccessToken (res) {
   sendJson(res, 401, {
     type: 'https://www.rfc-editor.org/rfc/rfc9110.html#status.401',
@@ -593,7 +613,7 @@ function sendValidationProblem (res, field, message) {
 }
 
 /* 400 with a BARE JSON STRING body. OBSERVED for `POC_FLAG=Z` on /Tests/v6 — not an object, a
- * JSON-encoded string. The integration's `typeof options === 'string'` branch handles it. */
+ * JSON-encoded string. The integration's error mapper handles it in its bare-string branch. */
 function sendBarePocFlagError (res, value) {
   log(`400 bare string: POC_Flag:${value} is not valid`)
   sendJson(res, 400, `POC_Flag:${value} is not valid`)
@@ -602,7 +622,11 @@ function sendBarePocFlagError (res, value) {
 /* 500 on the TRF endpoint. OBSERVED for an unknown ClinicAccessionID (and, separately, for a
  * pre-order, which has no TRF) — a 500, NOT a 404. `getOrderTrf` catches everything and returns
  * undefined, so this degrades cleanly; a mock that answered 404 would not be reproducing the
- * endpoint. Neither key (`StatusCode`, `ErrorMessage`) is one the error mapper reads. */
+ * endpoint. Neither key (`StatusCode`, `ErrorMessage`) was one the error mapper read until
+ * nominal-systems/dmi-engine-antech-v6-integration#86; it now reads `ErrorMessage`. The scenario
+ * arms it at placement by name (`trfUnavailable`), so this builder is what answers there, because
+ * placement's errors do reach an operator and production has shown failed order sends reaching
+ * the caller with nothing from Antech, though the logs do not say which envelope they met. */
 function sendTrfUnavailable (res, why) {
   log(`TRF unavailable: ${why}`)
   sendJson(res, 500, { StatusCode: 500, ErrorMessage: 'Internal server error' })
@@ -610,8 +634,9 @@ function sendTrfUnavailable (res, why) {
 
 /* 400 placement rejection — the ONE placement refusal OBSERVED live, and its shape verbatim:
  * `{value: {Data, StatusCode, HttpStatusCode, Message, InnerExceptionMessage, Error, ClientData},
- *   statusCode, contentType}`. The integration's error mapper reads `.value.Message`, so this is
- * the one provider envelope whose wording actually reaches the operator through POST /orders.
+ *   statusCode, contentType}`. The integration's error mapper reads `.value.Message`, so the
+ * provider's wording reaches the operator through POST /orders; the mock refuses what an order
+ * carries (its fields, codes, species, breed, sex) in this envelope.
  *
  * Only ONE message was observed: `Invalid BreedId <n>`, for a breed that does not belong to the
  * species. Every other message this mock sends through this envelope is INVENTED — the ENVELOPE is
@@ -633,10 +658,26 @@ function sendPlacementRejection (res, message) {
   })
 }
 
-/* An injected scenario short-circuits a handler with a canned status/body. `once: true` consumes
- * it, so a test can stage exactly one transient failure. The default body is whatever the endpoint
- * really returns for that class of failure — an injected error must look like a real provider
- * error or the paths it exists to exercise are being exercised against a fiction. */
+/* The error envelopes a scenario can arm BY NAME (`envelope` on POST /__control__/scenarios),
+ * each sent by the builder above that the mock itself uses where the envelope was OBSERVED. A test
+ * that arms a copy of a captured body keeps that copy when a new capture changes the builder, and
+ * stays green against a shape the provider no longer sends; a test that arms the name gets
+ * whatever the builder sends now. `status` is the builder's own, listed so the control plane can
+ * say what is armed. */
+const ENVELOPES = new Map([
+  /* 500 `{StatusCode, ErrorMessage}`, captured on the TRF endpoint. */
+  ['trfUnavailable', { status: 500, send: (res) => sendTrfUnavailable(res, 'armed scenario') }],
+  /* 404 `{statusCode, message}`, captured for an unknown path. */
+  ['unknownPath', { status: 404, send: (res) => sendNotFound(res, 'armed scenario') }],
+])
+
+/* An injected scenario short-circuits a handler with a canned status/body, or with a named
+ * envelope. `once: true` consumes it, so a test can stage exactly one transient failure — and only
+ * the call it short-circuits consumes it, so a one-shot armed for a call that never comes stays
+ * armed until GET /__control__/scenarios shows it and DELETE /__control__/scenarios/:key clears
+ * it. The default body is whatever the endpoint really returns for that class of failure — an
+ * injected error must look like a real provider error or the paths it exists to exercise are being
+ * exercised against a fiction. */
 function takeScenario (key) {
   const scenario = state.scenarios[key]
   if (scenario == null) return null
@@ -645,6 +686,10 @@ function takeScenario (key) {
 }
 
 function sendScenario (res, scenario, fallback) {
+  if (scenario.envelope != null) {
+    ENVELOPES.get(scenario.envelope).send(res)
+    return
+  }
   if (scenario.body != null) {
     sendJson(res, scenario.status, scenario.body)
     return
@@ -1741,14 +1786,55 @@ function handleControlResultState (req, res, params) {
   })
 }
 
+/* Arm a scenario: `{key, status, body, once}`, or `{key, envelope, once}` with `envelope` naming
+ * one of `ENVELOPES`, whose builder then sends its own status and body. Arming a key that is
+ * already armed replaces it. */
 async function handleControlScenario (req, res) {
   const body = await readJson(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
     return
   }
-  state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+  if (body.envelope !== undefined) {
+    const envelope = ENVELOPES.get(body.envelope)
+    if (envelope === undefined) {
+      sendJson(res, 400, {
+        message: `unknown envelope '${body.envelope}'; the mock's named envelopes are ${[...ENVELOPES.keys()].join(', ')}`,
+      })
+      return
+    }
+    if (body.status !== undefined || body.body !== undefined) {
+      sendJson(res, 400, {
+        message: 'a scenario takes an "envelope" OR a "status"/"body", not both: the named envelope\'s builder sends its own',
+      })
+      return
+    }
+    state.scenarios[body.key] = { status: envelope.status, body: undefined, envelope: body.envelope, once: body.once === true }
+  } else {
+    state.scenarios[body.key] = { status: body.status || 500, body: body.body, envelope: null, once: body.once === true }
+  }
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
+}
+
+/* What is still armed, per key. A one-shot that is listed here after the test that armed it has
+ * finished was never consumed: the call it was armed for did not happen. */
+function handleControlListScenarios (req, res) {
+  sendJson(res, 200, {
+    scenarios: Object.fromEntries(
+      Object.entries(state.scenarios).map(([key, scenario]) => [
+        key,
+        { status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null },
+      ]),
+    ),
+  })
+}
+
+/* Disarm one scenario. 200 either way; `cleared` says whether one was armed. */
+function handleControlClearScenario (req, res, params) {
+  const cleared = Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
+  delete state.scenarios[params.key]
+  if (cleared) log(`control: scenario '${params.key}' cleared`)
+  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios) })
 }
 
 function handleControlReset (req, res) {
@@ -1835,6 +1921,8 @@ const routes = [
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)$/, handleControlGetOrder],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
+  ['GET', /^\/__control__\/scenarios$/, handleControlListScenarios],
+  ['DELETE', /^\/__control__\/scenarios\/(?<key>[^/]+)$/, handleControlClearScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
 
@@ -1864,8 +1952,11 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  /* OBSERVED: an unknown path is `{statusCode, message}` — neither key one the integration's error
-   * mapper reads, so a typo'd endpoint surfaces to an operator as a bare `Failed to GET <url>`. */
+  /* OBSERVED: an unknown path is `{statusCode, message}`. Until
+   * nominal-systems/dmi-engine-antech-v6-integration#86 neither key was one the integration's
+   * error mapper read, so a typo'd endpoint surfaced to an operator as a bare
+   * `Failed to GET <url>`; it now reads the lowercase `message`, so `Resource not found` follows
+   * that line. */
   sendNotFound(res, `no route for ${req.method} ${pathname}`)
 })
 
