@@ -9,6 +9,15 @@
  * (`/__control__/*`) lets tests seed results, promote a draft, inspect what the mock received and
  * inject error scenarios, so the order -> result -> report loop is deterministic and CI-safe.
  *
+ * Error scenarios are armed per operation (`placeOrder`, `getStatus`, … — see `freshState`) with
+ * `POST /__control__/scenarios`: `{key, status, body, once}` for a body the test spells out, or
+ * `{key, envelope, once}` for one of the mock's own error envelopes by name (`ENVELOPES`:
+ * `trfUnavailable`, `unknownPath`), sent by the same builder the mock uses where that envelope was
+ * observed, so a test that arms it cannot keep an old copy after a new capture. `GET
+ * /__control__/scenarios` lists what is still armed (per key: `status`, `once`, `envelope`) and
+ * `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot answer and never
+ * reached it can be named and cleaned up instead of leaving that answer for the next call.
+ *
  * It NEVER talks to a live Antech host and never authenticates for real. All canned patient,
  * client, doctor and clinic data is SYNTHETIC — invented values shaped like Antech responses, never
  * captured clinic or patient data. What IS genuine is Antech's published CATALOGUE vocabulary: the
@@ -461,9 +470,9 @@ function freshState () {
     /* LabAccessionID -> { clinicAccessionId, document, acknowledged, servedCount, ackCount }. The
      * GetAllResults feed. */
     results: new Map(),
-    /* Error/edge injection: { [key]: { status, body, once } }. Keys are logical operation names —
-     * 'login', 'getStatus', 'getAllResults', 'ackStatus', 'testGuide', 'placeOrder',
-     * 'placePreOrder', 'trf'. */
+    /* Error/edge injection: { [key]: { status, body, envelope, once } }, `envelope` naming one of
+     * `ENVELOPES` (and then no `body`). Keys are logical operation names — 'login', 'getStatus',
+     * 'getAllResults', 'ackStatus', 'testGuide', 'placeOrder', 'placePreOrder', 'trf'. */
     scenarios: {},
     /* Per-endpoint call counts, so a scenario can assert on what the integration DID (a TRF that
      * was never fetched, a test guide that was), not only on what it ended up with. */
@@ -560,7 +569,8 @@ function sendBadCredentials (res, why) {
 }
 
 /* 404 JSON. OBSERVED for an unknown path, and (load-bearing detail 5) for /Tests/v6 reached with
- * header auth instead of query auth. */
+ * header auth instead of query auth. The router's fall-through sends it for every path the mock
+ * does not have, and a scenario can arm it on another operation by name (`unknownPath`). */
 function sendNotFound (res, why) {
   if (why !== undefined) log(`404: ${why}`)
   sendJson(res, 404, { statusCode: 404, message: 'Resource not found' })
@@ -614,9 +624,9 @@ function sendBarePocFlagError (res, value) {
  * undefined, so this degrades cleanly; a mock that answered 404 would not be reproducing the
  * endpoint. Neither key (`StatusCode`, `ErrorMessage`) was one the error mapper read until
  * nominal-systems/dmi-engine-antech-v6-integration#86; it now reads `ErrorMessage`. The scenario
- * arms it at placement, whose errors do reach an operator, because production has shown failed
- * order sends reaching the caller with nothing from Antech, though the logs do not say which
- * envelope they met. */
+ * arms it at placement by name (`trfUnavailable`), so this builder is what answers there, because
+ * placement's errors do reach an operator and production has shown failed order sends reaching
+ * the caller with nothing from Antech, though the logs do not say which envelope they met. */
 function sendTrfUnavailable (res, why) {
   log(`TRF unavailable: ${why}`)
   sendJson(res, 500, { StatusCode: 500, ErrorMessage: 'Internal server error' })
@@ -648,10 +658,26 @@ function sendPlacementRejection (res, message) {
   })
 }
 
-/* An injected scenario short-circuits a handler with a canned status/body. `once: true` consumes
- * it, so a test can stage exactly one transient failure. The default body is whatever the endpoint
- * really returns for that class of failure — an injected error must look like a real provider
- * error or the paths it exists to exercise are being exercised against a fiction. */
+/* The error envelopes a scenario can arm BY NAME (`envelope` on POST /__control__/scenarios),
+ * each sent by the builder above that the mock itself uses where the envelope was OBSERVED. A test
+ * that arms a copy of a captured body keeps that copy when a new capture changes the builder, and
+ * stays green against a shape the provider no longer sends; a test that arms the name gets
+ * whatever the builder sends now. `status` is the builder's own, listed so the control plane can
+ * say what is armed. */
+const ENVELOPES = new Map([
+  /* 500 `{StatusCode, ErrorMessage}`, captured on the TRF endpoint. */
+  ['trfUnavailable', { status: 500, send: (res) => sendTrfUnavailable(res, 'armed scenario') }],
+  /* 404 `{statusCode, message}`, captured for an unknown path. */
+  ['unknownPath', { status: 404, send: (res) => sendNotFound(res, 'armed scenario') }],
+])
+
+/* An injected scenario short-circuits a handler with a canned status/body, or with a named
+ * envelope. `once: true` consumes it, so a test can stage exactly one transient failure — and only
+ * the call it short-circuits consumes it, so a one-shot armed for a call that never comes stays
+ * armed until GET /__control__/scenarios shows it and DELETE /__control__/scenarios/:key clears
+ * it. The default body is whatever the endpoint really returns for that class of failure — an
+ * injected error must look like a real provider error or the paths it exists to exercise are being
+ * exercised against a fiction. */
 function takeScenario (key) {
   const scenario = state.scenarios[key]
   if (scenario == null) return null
@@ -660,6 +686,10 @@ function takeScenario (key) {
 }
 
 function sendScenario (res, scenario, fallback) {
+  if (scenario.envelope != null) {
+    ENVELOPES.get(scenario.envelope).send(res)
+    return
+  }
   if (scenario.body != null) {
     sendJson(res, scenario.status, scenario.body)
     return
@@ -1756,14 +1786,55 @@ function handleControlResultState (req, res, params) {
   })
 }
 
+/* Arm a scenario: `{key, status, body, once}`, or `{key, envelope, once}` with `envelope` naming
+ * one of `ENVELOPES`, whose builder then sends its own status and body. Arming a key that is
+ * already armed replaces it. */
 async function handleControlScenario (req, res) {
   const body = await readJson(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
     return
   }
-  state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+  if (body.envelope !== undefined) {
+    const envelope = ENVELOPES.get(body.envelope)
+    if (envelope === undefined) {
+      sendJson(res, 400, {
+        message: `unknown envelope '${body.envelope}'; the mock's named envelopes are ${[...ENVELOPES.keys()].join(', ')}`,
+      })
+      return
+    }
+    if (body.status !== undefined || body.body !== undefined) {
+      sendJson(res, 400, {
+        message: 'a scenario takes an "envelope" OR a "status"/"body", not both: the named envelope\'s builder sends its own',
+      })
+      return
+    }
+    state.scenarios[body.key] = { status: envelope.status, body: undefined, envelope: body.envelope, once: body.once === true }
+  } else {
+    state.scenarios[body.key] = { status: body.status || 500, body: body.body, envelope: null, once: body.once === true }
+  }
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
+}
+
+/* What is still armed, per key. A one-shot that is listed here after the test that armed it has
+ * finished was never consumed: the call it was armed for did not happen. */
+function handleControlListScenarios (req, res) {
+  sendJson(res, 200, {
+    scenarios: Object.fromEntries(
+      Object.entries(state.scenarios).map(([key, scenario]) => [
+        key,
+        { status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null },
+      ]),
+    ),
+  })
+}
+
+/* Disarm one scenario. 200 either way; `cleared` says whether one was armed. */
+function handleControlClearScenario (req, res, params) {
+  const cleared = Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
+  delete state.scenarios[params.key]
+  if (cleared) log(`control: scenario '${params.key}' cleared`)
+  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios) })
 }
 
 function handleControlReset (req, res) {
@@ -1850,6 +1921,8 @@ const routes = [
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)$/, handleControlGetOrder],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
+  ['GET', /^\/__control__\/scenarios$/, handleControlListScenarios],
+  ['DELETE', /^\/__control__\/scenarios\/(?<key>[^/]+)$/, handleControlClearScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
 
