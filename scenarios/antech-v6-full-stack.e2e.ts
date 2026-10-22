@@ -358,7 +358,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
    * An order is acknowledged only after a full orders-poll cycle, and the integration emits
    * `external_orders` to dmi-api BEFORE it acknowledges, so once the ack has landed, dmi-api has
    * been handed the status the poll saw. The one copy of this wait in the file; a red names the
-   * acknowledgement the mock held when the budget ran out. */
+   * order and the acknowledgement the mock held when the budget ran out. */
   async function waitForOrderAck (clinicAccessionId: string, status = 'Submitted'): Promise<MockOrder> {
     const entry = await pollUntil(
       async () => await mockOrder(clinicAccessionId),
@@ -366,7 +366,11 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       ORDER_ACK_WAIT_MS,
       1_000,
     )
-    expect({ acked: entry.orderAcked, at: entry.orderAckedStatus }).toEqual({ acked: true, at: status })
+    expect({ order: clinicAccessionId, acked: entry.orderAcked, at: entry.orderAckedStatus }).toEqual({
+      order: clinicAccessionId,
+      acked: true,
+      at: status,
+    })
     return entry
   }
 
@@ -2010,7 +2014,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         STATUS_APPLIED_WAIT_MS,
         1_000,
       )
-      return order.body.status
+      return order.body?.status ?? `HTTP ${order.status}`
     }
 
     /* The results channel did nothing for this order: the mock holds no result for it (its control
@@ -2049,27 +2053,30 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       await expectNothingFromTheResultsChannel(orderId, requisitionId)
     }, ORDER_ACK_WAIT_MS * 2 + STATUS_APPLIED_WAIT_MS + 30_000)
 
-    it('a COMPLETED order stays COMPLETED when its provider status moves back to Received', async () => {
-      /* `Received` reaches dmi-api as SUBMITTED, and `isValidStatusChange` applies SUBMITTED only to
-       * an order at WAITING_FOR_INPUT or ACCEPTED (and never a status equal to the current one), so
-       * a provider status that moves back after `Final` must leave a completed order where it is.
-       * That is dmi-api's rule, not the integration's; it is pinned here because it is what the two
-       * together do end to end, now that the orders channel carries statuses that can move back at
-       * all. Waiting for the re-acknowledgement at `Received` is what makes the wait after it mean
-       * "refused", not "not seen yet".
+    it('a COMPLETED order stays COMPLETED when its provider status moves back to Partial', async () => {
+      /* `Partial` reaches dmi-api as PARTIAL, and `isValidStatusChange` applies PARTIAL only to an
+       * order at SUBMITTED, PARTIAL or ACCEPTED (and never a status equal to the current one), so a
+       * completed order stays where it is. `Partial` after `Final` is the realistic move back — an
+       * add-on test reopening the order at the lab — and the one that tests that rule: `Received` or
+       * `In Progress` arrive as SUBMITTED, which dmi-api refuses from anything but WAITING_FOR_INPUT
+       * or ACCEPTED, so they would leave a completed order alone even if COMPLETED were a source for
+       * PARTIAL. That is dmi-api's rule, not the integration's; it is pinned here because it is what
+       * the two together do end to end, now that the orders channel carries statuses that can move
+       * back at all. Waiting for the re-acknowledgement at `Partial` is what makes the wait after it
+       * mean "refused", not "not seen yet".
        *
        * It runs on the order the `Final` test completed, so when that test left none, it fails at
        * once saying so, rather than reading `completedBeforehand: undefined`. */
       if (finalOrderId === '') {
         throw new Error(
           "the 'Final' test did not leave a completed order for this guard to run on: " +
-            'its acknowledgement wait failed, or this test ran on its own',
+            'its placement or acknowledgement wait failed, or this test ran on its own',
         )
       }
       const before = await org.api.get(`/orders/${finalOrderId}`)
       expect({ completedBeforehand: before.body?.status }).toEqual({ completedBeforehand: 'COMPLETED' })
 
-      await advanceProviderStatus(finalRequisitionId, 'Received')
+      await advanceProviderStatus(finalRequisitionId, 'Partial')
       await new Promise((resolve) => setTimeout(resolve, NEGATIVE_WAIT_MS))
 
       const order = await org.api.get(`/orders/${finalOrderId}`)
