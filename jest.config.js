@@ -1,8 +1,8 @@
 /* Two jest projects, mutually exclusive because they run dmi-api under different NODE_ENVs (seed vs
  * normal) and so cannot share one app process:
  *
- *   - fast (default):      smoke + tenant-isolation + event-store-throttling, dmi-api alone under
- *                          NODE_ENV=seed.
+ *   - fast (default):      smoke + tenant-isolation + event-store-throttling + engine-failures,
+ *                          dmi-api alone under NODE_ENV=seed.
  *   - full-stack:          a real provider loop, dmi-api under a normal NODE_ENV against the real
  *                          engine/provider stack. Selected by HARNESS_FULL_STACK=1; HARNESS_STACK then
  *                          picks WHICH loop, by its key in the stack registry (src/stacks.js), which
@@ -58,6 +58,7 @@ const fastProject = {
     '<rootDir>/scenarios/smoke.e2e.ts',
     '<rootDir>/scenarios/tenant-isolation.e2e.ts',
     '<rootDir>/scenarios/event-store-throttling.e2e.ts',
+    '<rootDir>/scenarios/engine-failures.e2e.ts',
   ],
 }
 

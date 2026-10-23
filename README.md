@@ -396,7 +396,9 @@ closely enough for the real integration to drive it unmodified:
 - **Ordering** (`/api/v1/*`): `POST /order`, `GET/DELETE /order/:id`, the external-orders poll, auth
   validate, and reference data — including the test catalogue (`/ref/tests`) and the clinic's one
   IVLS analyzer (`/ivls/devices`). The catalogue carries one in-house code and one genuine
-  reference-lab code, so both halves of the integration's device rule execute. The integration reads
+  reference-lab code, so both halves of the integration's device rule execute. The device list
+  is also what `GET /providers/idexx/devices` returns through dmi-api, and its `ivlsDevices` scenario
+  fails it with the `ErrorResponse` IDEXX's spec gives that endpoint's 500. The integration reads
   the `inHouse` flag to decide whether an order must carry a device, and the mock enforces the
   in-house half at placement: an in-house order without an `ivls` serial, or with one the clinic does
   not own, is refused. The reference-lab half — the integration strips the devices it was given — is
@@ -639,7 +641,8 @@ which are:
   `demo` provider, configured with an unreachable URL — so this is how orders get created through
   the real HTTP endpoint. It is a pre-existing dmi-api code path, not one added for testing.
 - **`ENGINE_RESPONSE_TIMEOUT=2000`** — anything that *does* reach for the absent engine fails in 2s
-  rather than hanging for dmi-api's 90s default.
+  rather than hanging for dmi-api's 90s default. `engine-failures.e2e.ts` relies on it: that
+  timeout is the outage it asserts dmi-api reports as one.
 - **`STATSIG_ENABLED=false`**, **`DATABASE_RUN_MIGRATIONS=false`** — no network for feature flags;
   migrations run as an explicit, observable step.
 
@@ -695,6 +698,7 @@ scenarios/
   event-store-throttling.e2e.ts an order survives the event store throttling its order:created write
                               (dmi-api#371): the insert and its sequence-counter write are retried,
                               and an event that still fails no longer fails the request
+  engine-failures.e2e.ts      an engine that does not answer is a 504 (devices and refs), not a 404
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, and an order
                               throttled on every event write is still sent to the provider (dmi-api#371)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
