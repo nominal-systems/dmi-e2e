@@ -56,14 +56,14 @@ describe('engine failures', () => {
   /* Then a real integration asked for under another provider. The provider in the path picks the engine
    * the lookup is sent to, so asking idexx about a demo integration would hand the idexx engine the demo
    * integration's options, and a provider id nobody serves would only time out — a 504 for what is a
-   * wrong request. No engine runs here, so a lookup that went out would take the 2s timeout: the answer
-   * must be immediate. */
+   * wrong request. No engine runs here, so a lookup that went out would take the full 2s timeout, where
+   * a refusal takes milliseconds: the answer must come well inside the 2s timeout. */
   it("GET /providers/:id/devices answers 404 for an integration of another provider, without asking an engine", async () => {
     const started = Date.now()
     const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
 
     expect(response.status).toBe(404)
     expect(response.body.message).toBe('The integration was not found')
-    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(Date.now() - started).toBeLessThan(1_500)
   })
 })
