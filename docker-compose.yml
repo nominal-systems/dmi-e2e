@@ -19,7 +19,7 @@
 # full-system suite (HARNESS_FULL_STACK=1) additionally starts one provider loop, selected by
 # HARNESS_STACK and mapped to a compose profile:
 #   - `idexx` (default): redis (Bull queues), the VetConnect Plus mock (built from this repo's
-#     src/idexx-mock, zero deps), and the REAL dmi-engine-idexx-integration container.
+#     src/idexx-mock, zero deps), and the REAL dmi-engine-idexx-integration container, twice.
 #   - `antech-v3`: redis, the antech-v3 mock (built from this repo's src/antech-v3-mock, zero deps),
 #     and the REAL dmi-engine-antech-integration container — classic Antech, dmi-api provider id
 #     `antech`; the harness key carries the generation so nothing collides with the antech-v6 loop.
@@ -49,7 +49,7 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
 
-  # Test commands on, for scenarios/event-store-throttling.e2e.ts and the idexx loop's last test:
+  # Test commands on, for scenarios/event-store-throttling.e2e.ts and the idexx loop's dmi-api#371 test:
   # both arm the `failCommand` failpoint (src/mongo.ts) so that dmi-api's event writes fail with code
   # 16500, the error the production event store (Azure Cosmos DB's Mongo API) raises when it
   # throttles a write. The flag makes the server's test-only commands available (configureFailPoint
@@ -112,12 +112,12 @@ services:
     ports:
       - '${HARNESS_IDEXX_MOCK_PORT:-3012}:3000'
 
-  # The REAL idexx provider integration (standalone NestJS microservice, one container per provider,
-  # matching production). Needs only ActiveMQ (MQTT) + Redis (Bull); no database. Reaches the mock
-  # provider over HTTP using the orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the
-  # provider configuration). Built from its own (Node-20) Dockerfile's `production` stage, as the
-  # repo ships it. The polling intervals are dialed down from the 30s default so the results loop
-  # closes quickly in the harness.
+  # The REAL idexx provider integration (standalone NestJS microservice, its own service per
+  # provider, matching production), run as two replicas (see `deploy` below). Needs only ActiveMQ
+  # (MQTT) + Redis (Bull); no database. Reaches the mock provider over HTTP using the
+  # orderingBaseUrl/resultBaseUrl carried inside each MQTT message (the provider configuration).
+  # Built from its own (Node-20) Dockerfile's `production` stage, as the repo ships it. The polling
+  # intervals are dialed down from the 30s default so the results loop closes quickly in the harness.
   dmi-engine-idexx-integration:
     profiles: ['idexx']
     build:
@@ -134,6 +134,14 @@ services:
       REDIS_PORT: '6379'
       IDEXX_RESULTS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
       IDEXX_ORDERS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
+    # Two replicas, each with the integration's default of one results worker. When the integration
+    # runs as more than one replica, two results polls of one integration can be in flight at once;
+    # one replica's single worker runs its polls one after another, so with one replica the loop
+    # could never show that. With two, a poll held in flight occupies one replica's only worker, and
+    # the next tick can only be taken by the other replica (the scenario's overlapping-polls test).
+    # The service publishes no port, so its replicas need none of their own.
+    deploy:
+      replicas: ${HARNESS_IDEXX_REPLICAS:-2}
     depends_on:
       - activemq
       - redis
