@@ -79,7 +79,7 @@ HARNESS_BASE_URL=http://127.0.0.1:3000 HARNESS_MANAGE_CONTAINERS=0 npm run test:
 
 With `HARNESS_MANAGE_CONTAINERS=0` the databases and the broker are yours as well, and your Mongo must
 be started with `--setParameter enableTestCommands=1`: `scenarios/event-store-throttling.e2e.ts`
-and the idexx loop's last test arm a `failCommand` failpoint in it, and without the flag they fail,
+and the idexx loop's dmi-api#371 test arm a `failCommand` failpoint in it, and without the flag they fail,
 naming the flag.
 
 **Full-system re-runs with `HARNESS_KEEP_UP=1`.** A loop's integration (see "Full-system mode"
@@ -263,7 +263,8 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
 
 - **`idexx`** (default) — the loop for **IDEXX VetConnect Plus** (provider id `idexx`). dmi-api +
   ActiveMQ + Redis + the **VetConnect Plus mock** (`src/idexx-mock`, built from this repo) + the
-  **real `dmi-engine-idexx-integration`** container, behind the `idexx` compose profile. Runs
+  **real `dmi-engine-idexx-integration`** container, as two replicas, behind the `idexx` compose
+  profile. Runs
   `scenarios/idexx-full-stack.e2e.ts`.
 - **`antech-v3`** — the loop for **classic Antech**, API generation V3. dmi-api's provider id
   is the bare `antech` (it predates V6); the harness key carries the generation so nothing derived
@@ -352,10 +353,15 @@ results poll picks up a result the scenario seeds at the mock → dmi-api writes
 test results and moves the order to `COMPLETED`, and `/events` shows the `order:*`/`report:*`
 sequence. The harness talks **only to the mock**, never to live `*.vetconnectplus.com`, so runs are
 deterministic, need no credentials, and place no real orders. See "The idexx mock (VetConnect Plus)"
-below. Its last test is the full-system half of dmi-api#371: the fast suite's event-store throttling
-scenario proves a throttled event write is retried, but runs dmi-api in seed mode, where no order
-reaches an engine; here, with every `events_v2` insert refused, the order is still sent to the mock
-and comes back `SUBMITTED`, while the feed has no `order:created` for it.
+below. One of its tests is the full-system half of dmi-api#371: the fast suite's event-store
+throttling scenario proves a throttled event write is retried, but runs dmi-api in seed mode, where
+no order reaches an engine; here, with every `events_v2` insert refused, the order is still sent to
+the mock and comes back `SUBMITTED`, while the feed has no `order:created` for it. Its last test pins
+dmi-engine-idexx-integration#88: the integration runs here as two replicas with one results worker
+each (`HARNESS_IDEXX_REPLICAS`), the mock holds one poll's answer for three poll intervals so that
+the next ticks fall due meanwhile — and with the held poll occupying its replica's only worker, only
+the other replica can take them — and the batch must still be fetched once and confirmed once, with
+one `report:updated` for it.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -408,9 +414,20 @@ closely enough for the real integration to drive it unmodified:
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
   integration issues to submit the order.
 - **Results** (`/api/v3/*`): the latest-results batch poll, its `confirm/:batchId` ack, and search.
+  A batch stays on the poll until it is confirmed — a result that arrives meanwhile joins the next
+  batch, formed after the confirm, as IDEXX's spec has each batch acknowledged before the next can be
+  downloaded — and only the batch being served can be confirmed: a confirm of any other id — one
+  already confirmed, or one never served — answers IDEXX's own 404
+  `{"error":"INVALID_BATCH_ID","message":"Invalid batch ID: <id>","status":"NOT_FOUND"}`, as its
+  live API does, so an integration that confirms one batch twice sees what it would in production.
 - **Control plane** (`/__control__/*`, host-facing): tests seed a (synthetic) result for an order,
   list the orders the mock received, reset state, and inject error scenarios. This is how the
   order→result→report loop is made deterministic — the mock holds no results until a test seeds one.
+  `GET /__control__/batches` is the ledger of every results batch the mock formed: the requisition
+  ids its results carry, how many poll answers carried it, and how each confirm of it was answered.
+  The `resultsLatestDelay` scenario (`{ delayMs, once }`) holds the next poll answer that carries a
+  batch for `delayMs`, its content fixed on arrival, and the ledger counts the polls that reached
+  the mock meanwhile: it is how the loop puts two polls of one integration in flight at once.
 
 All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
 captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
@@ -597,6 +614,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_IDEXX_ORDERING_URL` / `_RESULT_URL` | `http://idexx-mock:3000` | idexx only. Compose-network base URLs stored in the provider config; the integration reaches the mock here. Never point at live `*.vetconnectplus.com`. |
 | `HARNESS_IDEXX_PIMS_ID` / `_PIMS_VERSION` / `_USERNAME` / `_PASSWORD` / `_LOCALE` | `dmi-e2e-harness` / `1.0.0` / `harness-user` / `harness-pass` / `en` | idexx only. Dummy provider-config PIMS headers and integration credentials; the mock never authenticates for real. |
 | `HARNESS_IDEXX_POLL_MS` | `3000` | idexx only. The integration's Bull results/orders polling interval (dialed down from its 30s default so the loop closes quickly). |
+| `HARNESS_IDEXX_REPLICAS` | `2` | idexx only. How many replicas of the integration container compose runs, each with the integration's default of one results worker. When the integration runs as more than one replica, two results polls of one integration can be in flight at once; with one replica the loop could never show that. The overlapping-polls test needs at least 2 and refuses to run with fewer. It reads the variable from its own environment, so set it there: a value in a slot tree's `.env` reaches compose but not the test. |
 | `HARNESS_ANTECH_V3_MOCK_PORT` | `3013` | antech-v3 only. Host port for the antech-v3 mock (its `/__control__` plane and `/status`). |
 | `HARNESS_ANTECH_V3_MOCK_URL` | `http://$HARNESS_HOST:3013` | antech-v3 only. Host-facing mock base URL the scenario drives. |
 | `HARNESS_ANTECH_V3_BASE_URL` | `http://antech-v3-mock:3000` | antech-v3 only. Compose-network base URL stored in the provider config; the integration appends `/api/v1.1/<endpoint>` to it. Never point at a live Antech host. |
@@ -699,8 +717,10 @@ scenarios/
                               (dmi-api#371): the insert and its sequence-counter write are retried,
                               and an event that still fails no longer fails the request
   engine-failures.e2e.ts      an engine that does not answer is a 504 (devices and refs), not a 404
-  idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, and an order
-                              throttled on every event write is still sent to the provider (dmi-api#371)
+  idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, an order
+                              throttled on every event write is still sent to the provider (dmi-api#371),
+                              and two results polls in flight deliver a batch once
+                              (dmi-engine-idexx-integration#88)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
