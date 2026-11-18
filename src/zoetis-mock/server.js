@@ -72,7 +72,8 @@ function log (message) {
  * Every order is born WAITING-FOR-SAMPLE — verified against the live Zoetis sandbox. The provider
  * never emits a SUBMITTED status; that word exists only on the dmi side of the fence. An order
  * moves to COMPLETED when a final result exists and to PARTIAL-RESULTS when a pending one does
- * (see handleControlSeedResult).
+ * (see handleControlSeedResult), and to CANCELLED when the practice cancels it through the API
+ * (handleCancelOrder) or the provider cancels it on its own (handleControlCancelOrder).
  *
  * How the integration maps this vocabulary, because it maps it TWICE and differently:
  * ZoetisMapper.getOrderStatus (the orders poll) has an explicit case for every value here —
@@ -114,6 +115,14 @@ function freshState () {
      * (the leftover order is then the only one pending, so it is served alone and correctly), which
      * would otherwise hide the failure entirely. */
     maxDistinctOrdersInOneAck: 0,
+    /* How many orders-feed responses (GET /orders, 200) this mock has served — one per orders-poll
+     * cycle that got as far as reading the feed — and, on each order, the number of the last feed
+     * that listed it (`lastOrdersFeed`). Together they answer two questions a test cannot otherwise
+     * ask from outside: were two orders delivered in the SAME feed (the integration emits one
+     * `external_orders` message per feed, so dmi-api handles them in one call), and has a LATER
+     * poll cycle run since — an observable bound to wait on, where the alternative is a bare sleep.
+     * Read-only, exposed through /__control__/feeds and the order's control-plane view. */
+    ordersFeedsServed: 0,
   }
 }
 
@@ -933,6 +942,9 @@ async function handleCreateOrder (req, res) {
      * WAITING-FOR-SAMPLE -> COMPLETED transition, instead of replaying the same order every 30s
      * forever. */
     acknowledgedStatus: null,
+    /* The number of the last orders feed that listed this order (see state.ordersFeedsServed); null
+     * until a feed has. */
+    lastOrdersFeed: null,
     /* Echoed straight back from the request. Everything here was validated above, so none of it is
      * a mock-invented value the scenario could accidentally be asserting against itself. */
     reportType: textAt(document, 'Identification/ReportType'),
@@ -981,6 +993,8 @@ function handleBatchOrders (req, res) {
 
   const pending = [...state.orders.values()].filter((order) => order.acknowledgedStatus !== order.status)
   state.maxOrdersInOneFeed = Math.max(state.maxOrdersInOneFeed, pending.length)
+  state.ordersFeedsServed += 1
+  for (const order of pending) order.lastOrdersFeed = state.ordersFeedsServed
   sendXml(res, 200, buildOrdersXml(req, pending))
 }
 
@@ -1111,6 +1125,15 @@ function handleOrderAcknowledge (req, res, params) {
   sendEmpty(res, 204)
 }
 
+/* The one state change behind both ways an order is cancelled here: by the practice through the
+ * provider API (handleCancelOrder) and by the provider on its own (handleControlCancelOrder). The
+ * orders feed then re-lists the order (status != acknowledgedStatus) and its link set loses `cancel`
+ * (linkRelsFor). */
+function markCancelled (order) {
+  order.status = STATUS_CANCELLED
+  order.updatedAt = new Date()
+}
+
 function handleCancelOrder (req, res, params) {
   if (requireBasicAuth(req, res) == null) return
 
@@ -1119,8 +1142,7 @@ function handleCancelOrder (req, res, params) {
     sendProviderError(res, 404, 'order', `no order for client_order_id '${params.practiceRef}'`)
     return
   }
-  order.status = STATUS_CANCELLED
-  order.updatedAt = new Date()
+  markCancelled(order)
   log(`cancelled order ${order.practiceRef}`)
   /* The cancel RESPONSE shape was not captured live; a status-only 204 is the minimal
    * extrapolation, and the integration discards cancel response bodies anyway (makeDeleteRequest
@@ -1231,6 +1253,35 @@ async function handleControlSeedResult (req, res, params) {
   })
 }
 
+/* The provider cancels an order on its own — a lab calling off an order whose sample never came —
+ * with no call from the practice. The state change is the one the practice's DELETE makes
+ * (markCancelled), so the orders feed reports it exactly as it reports a practice cancellation; what
+ * differs is that dmi-api has not been told, and the orders channel is the only way it can learn.
+ * That is what lets a scenario prove dmi-api ACCEPTS a CANCELLED reading: an order dmi-api cancelled
+ * itself already holds that state, so its CANCELLED delivery changes nothing there.
+ *
+ * Refused unless the order is WAITING-FOR-SAMPLE, the one state in which this mock advertises
+ * `cancel` (linkRelsFor). Whether the provider can cancel from another state was not observed, and a
+ * control plane that accepted any transition would let a scenario stage one the provider never makes. */
+function handleControlCancelOrder (req, res, params) {
+  const order = state.orders.get(params.practiceRef)
+  if (order == null) {
+    sendJson(res, 404, { message: `no order for client_order_id ${params.practiceRef}` })
+    return
+  }
+  if (order.status !== STATUS_WAITING_FOR_SAMPLE) {
+    sendJson(res, 409, {
+      message:
+        `order ${order.practiceRef} is ${order.status}: the provider cancels only an order still ` +
+        `${STATUS_WAITING_FOR_SAMPLE}, the one state that advertises cancel`,
+    })
+    return
+  }
+  markCancelled(order)
+  log(`provider cancelled order ${order.practiceRef}`)
+  sendJson(res, 200, publicOrder(order))
+}
+
 /* What a test can see of a received order. The ref-mapped fields (species, gender, breed) are here
  * deliberately: they are the ones dmi-api transforms on the way through, and without exposing them
  * a scenario can only assert that SOME order arrived, not that it carried the right vocabulary. */
@@ -1243,6 +1294,7 @@ function publicOrder (order) {
      * builds the document, so an asserting scenario and the provider dialect cannot drift apart. */
     linkRels: linkRelsFor(order.status),
     acknowledgedStatus: order.acknowledgedStatus,
+    lastOrdersFeed: order.lastOrdersFeed,
     resultAcknowledged: order.resultAcknowledged,
     hasResult: order.result != null,
     reportType: order.reportType,
@@ -1376,7 +1428,7 @@ const routes = [
 
   /* Feed high-water marks, so a test can assert a multi-document batch really was served rather
    * than inferring it from two orders both completing (which two single-document batches satisfy
-   * equally well). Read-only. */
+   * equally well), and the orders-feed count, so a test can wait on a later poll cycle. Read-only. */
   [
     'GET',
     /^\/__control__\/feeds$/,
@@ -1385,10 +1437,12 @@ const routes = [
         maxLabReportsInOneBatch: state.maxLabReportsInOneBatch,
         maxOrdersInOneFeed: state.maxOrdersInOneFeed,
         maxDistinctOrdersInOneAck: state.maxDistinctOrdersInOneAck,
+        ordersFeedsServed: state.ordersFeedsServed,
       }),
   ],
 
   ['POST', /^\/__control__\/orders\/(?<practiceRef>[^/]+)\/results$/, handleControlSeedResult],
+  ['POST', /^\/__control__\/orders\/(?<practiceRef>[^/]+)\/cancel$/, handleControlCancelOrder],
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<practiceRef>[^/]+)$/, handleControlGetOrder],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],

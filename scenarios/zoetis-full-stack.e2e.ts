@@ -951,19 +951,60 @@ describe('zoetis full-stack (Zoetis mock)', () => {
     }, ORDER_ACK_WAIT_MS * 2 + 30_000)
   })
 
-  describe('cancel paths: one test off an order, then the order itself', () => {
+  describe('cancel paths: one test off an order, the order itself, and an order the provider cancels', () => {
     /* Both DELETE routes dmi-api exposes, end to end — never driven by any test before this block.
      * dmi-api's DELETE /orders/:id/tests/:testCode RPCs `tests.cancel`, and the integration's
      * cancelOrderTest turns it into `DELETE {base}/vetsync/v1/orders/{id}/{code}` — the test code a
      * bare second path segment, with NO /tests/ on the wire (that segment exists only on dmi-api's
      * public route). DELETE /orders/:id RPCs `cancel` and lands as `DELETE .../orders/{id}`. A
      * dedicated order, isolated from every other block's assertions: it is never seeded and never
-     * completes. */
+     * completes.
+     *
+     * Then the orders channel's half of a cancellation, which takes TWO orders since
+     * nominal-systems/dmi-api#409: an order delivered again in the state dmi-api already holds is
+     * left alone (no save, no order:updated). So the order dmi-api cancels itself proves only that
+     * its CANCELLED delivery is a no-op there, and a second order, cancelled by the provider on its
+     * own, is the one that shows the CANCELLED branch of ZoetisMapper.getOrderStatus reaching
+     * dmi-api and being accepted. Both cancellations travel in ONE orders feed, so dmi-api decides
+     * both in one handler call, and the second order's order:updated is the evidence that the
+     * first order's delivery was handled too — see the last test. */
     let cancelOrderId: string
     let cancelRequisitionId: string
-    /* Highest event seq at the moment the dmi-side cancel completed, so the propagation test below
-     * can prove the ORDERS channel produced a further order:updated AFTER it — see there. */
+    /* The second order, which dmi-api never cancels: the provider does (the mock's control plane). */
+    let providerCancelOrderId: string
+    let providerCancelRequisitionId: string
+    /* Highest event seq at the moment the dmi-side cancel completed. Both orders were placed before
+     * it, so any order:updated above it for either is the orders channel's doing — see the last two
+     * tests. */
     let seqAfterCancel = 0
+
+    type OrderEvent = { seq: number, type: string, data?: { orderId?: string, status?: string } }
+
+    /* The order:updated events for one order above a watermark, oldest first, reduced to what a
+     * failure should show (seq and the status the event carried). */
+    async function orderUpdatesAfter (id: string, seq: number): Promise<Array<{ seq: number, status?: string }>> {
+      const events = expectOk<{ data: OrderEvent[] }>(
+        await org.api.get('/events', { start_seq: seq, limit: 1000 }),
+        'read the event stream after the cancel watermark',
+      )
+      return events.data
+        .filter((event) => event.type === 'order:updated' && event.data?.orderId === id && event.seq > seq)
+        .sort((a, b) => a.seq - b.seq)
+        .map((event) => ({ seq: event.seq, status: event.data?.status }))
+    }
+
+    /* Wait until the mock has served an orders feed later than `feed`: the next poll cycle, one
+     * interval on. An observable bound on "nothing more is coming", where the alternative is a
+     * bare sleep. Returns the feed count reached, for the caller to assert on. */
+    async function ordersFeedAfter (feed: number): Promise<number> {
+      const feeds = await pollUntil(
+        async () => await mock.get('/__control__/feeds'),
+        (r) => typeof r.body?.ordersFeedsServed === 'number' && r.body.ordersFeedsServed > feed,
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+      return feeds.body?.ordersFeedsServed
+    }
 
     /* CDP + T4: the first two-element <LabRequests> any run has produced. T4 is a genuine catalogue
      * mnemonic the mock enforces; resolved from the mock's own catalogue so the two cannot drift. */
@@ -1025,13 +1066,37 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect((order.body.tests as Array<{ code: string }>).map((test) => test.code)).toEqual([serviceCode])
     })
 
+    it('a second order, for the provider to cancel on its own, is placed and is SUBMITTED in dmi-api', async () => {
+      const placed = await placeOrder()
+      providerCancelOrderId = placed.orderId
+      providerCancelRequisitionId = placed.requisitionId
+
+      /* The status the CANCELLED reading must move it FROM. SUBMITTED is what the create response
+       * gives a zoetis order (see the two-readings pin), and an incoming CANCELLED is a valid change
+       * from it — so dmi-api accepting the reading is observable as SUBMITTED -> CANCELLED. */
+      const order = await org.api.get(`/orders/${providerCancelOrderId}`)
+      expect(order.body.status).toBe('SUBMITTED')
+
+      /* Line both cancellations up for ONE orders feed, deterministically rather than by hoping no
+       * tick lands between them: a one-shot failure on the orders poll, armed BEFORE either
+       * cancellation. The next tick consumes it and serves nothing; by the tick after, both orders
+       * are CANCELLED and unacknowledged, and are served together. (Same device as the two-orders
+       * block's results batch. The two cancellations below take about a second, so the one way this
+       * misses — two ticks inside that second — cannot happen at a 30s cadence; the last test asserts
+       * the shared feed rather than assume it.) */
+      expectOk(
+        await mock.post('/__control__/scenarios', { key: 'batchOrders', status: 500, once: true }),
+        'arm a one-shot orders-poll failure to put both cancellations in one feed',
+      )
+    }, 60_000)
+
     it('cancelling the order flips the provider to CANCELLED and strips its cancel link', async () => {
       const response = await org.api.delete(`/orders/${cancelOrderId}`)
       expect(response.status).toBe(204)
 
       /* Watermark AFTER the DELETE returned: cancelOrder emits its own order:updated synchronously
        * before responding, so every event above this seq is someone else's doing — which is what
-       * lets the next test attribute a later event to the orders channel. (A poll tick could in
+       * lets the tests below attribute a later event to the orders channel. (A poll tick could in
        * principle fire in the gap between the DELETE and this read; the window is milliseconds
        * against a 30s cadence.) */
       const events = expectOk<{ data: Array<{ seq: number }> }>(
@@ -1057,36 +1122,110 @@ describe('zoetis full-stack (Zoetis mock)', () => {
       expect(received.linkRels).not.toContain('cancel')
     }, 30_000)
 
-    it('the orders channel reports the cancellation: acked at CANCELLED, and dmi-api accepts the update', async () => {
-      /* The CANCELLED branch of ZoetisMapper.getOrderStatus has never run before this test. The ack
-       * gate proves the poll served and processed the CANCELLED order (poll -> fetch -> emit -> ack,
-       * the same argument as the WAITING-FOR-SAMPLE test above)... */
+    it('the provider cancels the second order on its own: CANCELLED there, and dmi-api not told', async () => {
+      const cancelled = expectOk<{ status: string, linkRels: string[] }>(
+        await mock.post(`/__control__/orders/${providerCancelRequisitionId}/cancel`),
+        'cancel the second order at the provider',
+      )
+      /* The provider state the practice's cancellation above produced, link set included, so the
+       * orders feed reports the two orders in the same words. */
+      expect(cancelled.status).toBe('CANCELLED')
+      expect(cancelled.linkRels).toContain('acknowledged')
+      expect(cancelled.linkRels).not.toContain('cancel')
+
+      /* No dmi-api route was called for this order, so dmi-api still holds what the create response
+       * gave it: from here the orders channel is the only way the cancellation can reach it. */
+      const order = await org.api.get(`/orders/${providerCancelOrderId}`)
+      expect(order.body.status).toBe('SUBMITTED')
+    }, 30_000)
+
+    it('the orders channel carries the provider\'s cancellation: SUBMITTED -> CANCELLED, with exactly one order:updated', async () => {
+      /* The CANCELLED branch of ZoetisMapper.getOrderStatus, on the order whose CANCELLED reading is
+       * news to dmi-api. The ack gate proves the poll served and processed it (poll -> fetch -> emit
+       * -> ack, the same argument as the WAITING-FOR-SAMPLE test above). Two ticks at most: the
+       * first is the one armed to fail. */
       const received = await pollUntil(
-        async () => await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        async () => await mock.get(`/__control__/orders/${providerCancelRequisitionId}`),
         (r) => r.body?.acknowledgedStatus === 'CANCELLED',
-        ORDER_ACK_WAIT_MS,
+        COMPLETION_WAIT_MS,
         2_000,
       )
       expect(received.body.acknowledgedStatus).toBe('CANCELLED')
 
-      /* ...and the event proves dmi-api ACCEPTED what was emitted, which the WAITING_FOR_INPUT case
-       * cannot show (its change is refused). isValidStatusChange returns true unconditionally for an
-       * incoming CANCELLED, so handleExternalOrders saves the order and emits order:updated — an
-       * event later than the post-DELETE watermark, for this order, that only the orders channel can
-       * have produced (the results channel never runs here: nothing was ever seeded). If the
-       * CANCELLED mapping broke, the emitted status would fall to SUBMITTED, the guard would refuse
-       * it, no save and no event would happen — and this wait would time out red. */
-      const events = await pollUntil(
-        async () => await org.api.get('/events', { start_seq: 0, limit: 1000 }),
-        (r) => ((r.body?.data ?? []) as Array<{ seq: number, type: string, data?: { orderId?: string } }>)
-          .some((event) => event.type === 'order:updated' && event.data?.orderId === cancelOrderId && event.seq > seqAfterCancel),
+      /* ...and dmi-api ACCEPTED what was emitted, which the WAITING_FOR_INPUT case cannot show (its
+       * change is refused). isValidStatusChange accepts an incoming CANCELLED from any status, and
+       * this order is SUBMITTED, so handleExternalOrders saves it and emits order:updated: an event
+       * above the watermark, for this order, that only the orders channel can have produced —
+       * nothing was seeded for it, and no dmi-api route touched it after placement. If the CANCELLED
+       * mapping broke, the emitted status would fall to SUBMITTED, which the guard refuses from
+       * SUBMITTED: no save, no event, and this wait times out red. The integration acks after it
+       * emits and dmi-api handles the message on its own time, so the event may trail the ack. */
+      await pollUntil(
+        async () => await orderUpdatesAfter(providerCancelOrderId, seqAfterCancel),
+        (updates) => updates.length > 0,
         ORDER_ACK_WAIT_MS,
         2_000,
       )
-      const laterUpdates = ((events.body?.data ?? []) as Array<{ seq: number, type: string, data?: { orderId?: string } }>)
-        .filter((event) => event.type === 'order:updated' && event.data?.orderId === cancelOrderId && event.seq > seqAfterCancel)
-      expect(laterUpdates.length).toBeGreaterThanOrEqual(1)
-    }, ORDER_ACK_WAIT_MS * 2 + 30_000)
+
+      /* Exactly one, counted after a LATER orders feed: the order is acknowledged, so no feed lists
+       * it again, and a whole poll cycle on, anything its delivery set off has landed. A second
+       * order:updated would be a redelivery taken for an update. */
+      const feed = received.body.lastOrdersFeed as number
+      expect(await ordersFeedAfter(feed)).toBeGreaterThan(feed)
+      expect(await orderUpdatesAfter(providerCancelOrderId, seqAfterCancel)).toEqual([
+        { seq: expect.any(Number), status: 'CANCELLED' },
+      ])
+
+      const order = await org.api.get(`/orders/${providerCancelOrderId}`)
+      expect(order.body.status).toBe('CANCELLED')
+    }, COMPLETION_WAIT_MS + ORDER_ACK_WAIT_MS * 2 + 30_000)
+
+    it('the orders channel redelivers dmi-api\'s own cancellation unchanged: acked at CANCELLED, and no order:updated', async () => {
+      /* The first order's CANCELLED delivery. dmi-api cancelled this order itself (above) and holds
+       * it CANCELLED, so the delivery tells dmi-api what it already has, and since
+       * nominal-systems/dmi-api#409 that leaves the order alone: no save, no order:updated. "No
+       * event" is only evidence once the delivery was made AND handled, so three things come first.
+       * The ack gate: the poll served and processed the CANCELLED order... */
+      const received = await pollUntil(
+        async () => await mock.get(`/__control__/orders/${cancelRequisitionId}`),
+        (r) => r.body?.acknowledgedStatus === 'CANCELLED',
+        COMPLETION_WAIT_MS,
+        2_000,
+      )
+      expect(received.body.acknowledgedStatus).toBe('CANCELLED')
+
+      /* ...in the same feed as the provider-cancelled order, so in the same external_orders message,
+       * which dmi-api decides in one handleExternalOrders call: every order in it is judged changed
+       * or unchanged before any order:updated is written. The provider-cancelled order's
+       * order:updated (previous test) is therefore evidence that this order's delivery was handled,
+       * not merely sent... */
+      expect(received.body.lastOrdersFeed).toEqual(expect.any(Number))
+      const witness = expectOk<{ acknowledgedStatus: string, lastOrdersFeed: number | null }>(
+        await mock.get(`/__control__/orders/${providerCancelRequisitionId}`),
+        'read the provider-cancelled order from the mock control plane',
+      )
+      expect(witness).toMatchObject({ acknowledgedStatus: 'CANCELLED', lastOrdersFeed: received.body.lastOrdersFeed })
+      const witnessUpdates = await pollUntil(
+        async () => await orderUpdatesAfter(providerCancelOrderId, seqAfterCancel),
+        (updates) => updates.length > 0,
+        ORDER_ACK_WAIT_MS,
+        2_000,
+      )
+      expect(witnessUpdates.map((update) => update.status)).toContain('CANCELLED')
+
+      /* ...and a LATER orders feed has been served, a whole poll interval after the delivery. That
+       * is the bound on anything still in flight, which the handler's ordering alone does not give:
+       * where both orders ARE updates, their two events are written one after the other, in either
+       * order. This order is acknowledged, so no feed after that one lists it again. */
+      const feed = received.body.lastOrdersFeed as number
+      expect(await ordersFeedAfter(feed)).toBeGreaterThan(feed)
+
+      /* The substance: nothing for this order above the post-DELETE watermark (the order:updated the
+       * DELETE itself emitted is below it), and the order is still CANCELLED. */
+      expect(await orderUpdatesAfter(cancelOrderId, seqAfterCancel)).toEqual([])
+      const order = await org.api.get(`/orders/${cancelOrderId}`)
+      expect(order.body.status).toBe('CANCELLED')
+    }, COMPLETION_WAIT_MS + ORDER_ACK_WAIT_MS * 2 + 30_000)
   })
 
   describe('placement edges: the VOY- fallback id and the duplicate-PracticeRef refusal', () => {
