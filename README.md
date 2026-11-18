@@ -292,7 +292,8 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   labOrder status feed, each fetched with a freshly generated order form (TRF), whose bytes differ
   on every fetch. The mock models both, from what production showed (load-bearing details 8 and 9
   in its header): its TRF endpoint serves a new document per fetch and keeps each one's digest
-  (`trfDigests` on `GET /__control__/orders/<id>`), and
+  (`trfDigests` on `GET /__control__/orders/<id>`), beside the provider status of the delivery it
+  went out with (`trfOrderStatuses`), and
   `POST /__control__/orders/<id>/redelivery` with `{results, orders}`, each `true` or `false`,
   switches one order into that redelivery, per feed, and out again. While a feed is on, the
   order's record is served on every poll whether or not it was acknowledged, its acknowledgements
@@ -303,7 +304,11 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   result writes nothing and sends no `report:updated` or `order:updated`; an amendment made while
   the result is being redelivered still reaches the report, and is reported once however often it
   is redelivered after; an order re-offered with a regenerated order form sends no `order:updated`
-  and keeps the form first stored; and once the redelivery stops, both records stay off the feeds.
+  and keeps the form first stored, while another order's status change read in the same poll is
+  still applied (so the silence is not a handler that failed); a status change to the re-offered
+  order itself is one `order:updated`, stored with the form fetched for it, however often the
+  changed order is re-offered after; and once the redelivery stops, both records stay off the
+  feeds.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
