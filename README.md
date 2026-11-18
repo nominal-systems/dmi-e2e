@@ -361,7 +361,9 @@ dmi-engine-idexx-integration#88: the integration runs here as two replicas with 
 each (`HARNESS_IDEXX_REPLICAS`), the mock holds one poll's answer for three poll intervals so that
 the next ticks fall due meanwhile — and with the held poll occupying its replica's only worker, only
 the other replica can take them — and the batch must still be fetched once and confirmed once, with
-one `report:updated` for it.
+one `report:updated` for it. Compose also gives the integration's results poll lock a lifetime shorter
+than that hold (`HARNESS_IDEXX_RESULTS_LOCK_TTL_MS`), so the test fails as well on a lock that is not
+extended while its poll runs.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -615,6 +617,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_IDEXX_PIMS_ID` / `_PIMS_VERSION` / `_USERNAME` / `_PASSWORD` / `_LOCALE` | `dmi-e2e-harness` / `1.0.0` / `harness-user` / `harness-pass` / `en` | idexx only. Dummy provider-config PIMS headers and integration credentials; the mock never authenticates for real. |
 | `HARNESS_IDEXX_POLL_MS` | `3000` | idexx only. The integration's Bull results/orders polling interval (dialed down from its 30s default so the loop closes quickly). |
 | `HARNESS_IDEXX_REPLICAS` | `2` | idexx only. How many replicas of the integration container compose runs, each with the integration's default of one results worker. When the integration runs as more than one replica, two results polls of one integration can be in flight at once; with one replica the loop could never show that. The overlapping-polls test needs at least 2 and refuses to run with fewer. It reads the variable from its own environment, so set it there: a value in a slot tree's `.env` reaches compose but not the test. |
+| `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS` | `5000` | idexx only. How long the integration's results poll lock lasts as first taken (its `IDEXX_RESULTS_LOCK_TTL_MS`), dialed down from the integration's default so that it runs out while the overlapping-polls test still holds a poll in flight: the test then also fails on a lock that is not extended while its poll runs. It has to stay under two poll intervals, and the test refuses to run otherwise. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
 | `HARNESS_ANTECH_V3_MOCK_PORT` | `3013` | antech-v3 only. Host port for the antech-v3 mock (its `/__control__` plane and `/status`). |
 | `HARNESS_ANTECH_V3_MOCK_URL` | `http://$HARNESS_HOST:3013` | antech-v3 only. Host-facing mock base URL the scenario drives. |
 | `HARNESS_ANTECH_V3_BASE_URL` | `http://antech-v3-mock:3000` | antech-v3 only. Compose-network base URL stored in the provider config; the integration appends `/api/v1.1/<endpoint>` to it. Never point at a live Antech host. |

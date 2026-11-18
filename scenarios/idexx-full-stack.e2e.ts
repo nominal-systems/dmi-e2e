@@ -765,16 +765,20 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * with one results worker each, and the mock's `resultsLatestDelay` scenario holds one poll's
    * answer in flight while the next ticks fall due. The held poll occupies its replica's only
    * worker, so the next tick can only be taken by the other replica: a guard that held within one
-   * process only would let it through. Last in the file, and with an order of its own, so that
-   * nothing above sees the held answer. */
+   * process only would let it through. Compose also gives the integration's results poll lock a
+   * lifetime shorter than the hold, so the lock as first taken runs out under the held poll: a lock
+   * that is not extended while its poll runs would let the other replica through as well. Last in
+   * the file, and with an order of its own, so that nothing above sees the held answer. */
   describe('two results polls in flight deliver one batch once (dmi-engine-idexx-integration#88)', () => {
-    /* The integration's results poll interval and its replica count. src/env.ts carries neither, so
-     * each is read the way docker-compose.yml reads it: from the environment, with compose's default
-     * when it is unset or empty (HARNESS_IDEXX_POLL_MS, 3000; HARNESS_IDEXX_REPLICAS, 2). Compose
-     * also reads a slot tree's .env, which the harness does not load into this process (src/slots.js
-     * only checks the project name there), so a value set in that file alone is not seen here. */
+    /* The integration's results poll interval, its replica count and the lifetime of its results poll
+     * lock. src/env.ts carries none of them, so each is read the way docker-compose.yml reads it: from
+     * the environment, with compose's default when it is unset or empty (HARNESS_IDEXX_POLL_MS, 3000;
+     * HARNESS_IDEXX_REPLICAS, 2; HARNESS_IDEXX_RESULTS_LOCK_TTL_MS, 5000). Compose also reads a slot
+     * tree's .env, which the harness does not load into this process (src/slots.js only checks the
+     * project name there), so a value set in that file alone is not seen here. */
     const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
     const replicas = Number(process.env.HARNESS_IDEXX_REPLICAS || 2)
+    const lockTtlMs = Number(process.env.HARNESS_IDEXX_RESULTS_LOCK_TTL_MS || 5_000)
     /* Three intervals, so at least two later ticks fall due while the first poll's answer is held. */
     const delayMs = 3 * pollMs
     /* The integration's HTTP timeout, which compose leaves at its default. The integration must
@@ -793,7 +797,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     it('a batch held in flight past the next ticks is fetched once, confirmed once and reported once', async () => {
       /* Refused at once, saying why, when the stack cannot show the defect: with one replica the next
        * tick waits for the held poll and this test would pass on a build that lets polls overlap; a
-       * hold that outlasts the integration's HTTP timeout fails the held poll instead. */
+       * hold that outlasts the integration's HTTP timeout fails the held poll instead; and a lock that
+       * lasts until the last tick inside the hold would pass without ever being extended. */
       if (!(replicas >= 2)) {
         throw new Error(
           `HARNESS_IDEXX_REPLICAS is ${process.env.HARNESS_IDEXX_REPLICAS}: this test needs at least two integration ` +
@@ -804,6 +809,16 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         throw new Error(
           `the held answer would last ${delayMs} ms (3 × HARNESS_IDEXX_POLL_MS=${pollMs}), but the integration gives up on ` +
             `an answer after ${integrationHttpTimeoutMs} ms: this test needs a poll interval under ${integrationHttpTimeoutMs / 3} ms`,
+        )
+      }
+      /* The ticks one and two intervals after the held poll started fall due inside the hold; the one
+       * after three races its end. So the lock as first taken has to be gone by the second. */
+      if (!(lockTtlMs < delayMs - pollMs)) {
+        throw new Error(
+          `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS is ${lockTtlMs}: the results poll lock as first taken would last past the ` +
+            `last tick sure to fall due while the answer is held (${delayMs - pollMs} ms after the held poll started, ` +
+            `2 × HARNESS_IDEXX_POLL_MS=${pollMs}), so this test would pass on a lock that is never extended: ` +
+            `it needs a lock lifetime under ${delayMs - pollMs} ms`,
         )
       }
 

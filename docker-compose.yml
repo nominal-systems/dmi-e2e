@@ -134,6 +134,10 @@ services:
       REDIS_PORT: '6379'
       IDEXX_RESULTS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
       IDEXX_ORDERS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
+      # How long the results poll lock lasts as first taken. Shorter than the overlapping-polls
+      # test holds a poll in flight (three poll intervals), so the lock would run out under that
+      # poll: only a lock that is extended while its poll runs still keeps the other replica out.
+      IDEXX_RESULTS_LOCK_TTL_MS: '${HARNESS_IDEXX_RESULTS_LOCK_TTL_MS:-5000}'
     # Two replicas, each with the integration's default of one results worker. When the integration
     # runs as more than one replica, two results polls of one integration can be in flight at once;
     # one replica's single worker runs its polls one after another, so with one replica the loop
