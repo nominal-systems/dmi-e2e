@@ -136,7 +136,10 @@
  *    integration or a dmi-api that compared the PDF's bytes look as if it recognised a redelivered
  *    form, which production shows it cannot. Each fetch's digest is kept on the order
  *    (`trfDigests` on `GET /__control__/orders/:id`), so a test can prove the bytes really
- *    differed.
+ *    differed, and beside it the `OrderStatus` the labOrder feed last served the order at
+ *    (`trfOrderStatuses`, harness bookkeeping): the integration reads the feed, then fetches each
+ *    order's TRF, then emits, one poll at a time, so that is the status the form went out with, and
+ *    a test can tell which fetch's form dmi-api stored.
  *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL
@@ -908,6 +911,8 @@ function handleGetStatus (req, res, params, query) {
     /* An order whose orders-channel redelivery is on stays in the unacknowledged view however
      * often it is acknowledged (load-bearing detail 8). */
     const served = records.filter((order) => overrideAck || !order.orderAcked || order.redelivery.orders.on)
+    /* The status the form fetched next goes out with (load-bearing detail 9). */
+    for (const order of served) order.lastServedOrderStatus = order.orderStatus
     if (!overrideAck) {
       for (const order of served) {
         if (!order.redelivery.orders.on) continue
@@ -1283,6 +1288,7 @@ function handleTrf (req, res, params) {
     `% ${'x'.repeat(randomInt(0, 240))}\n` +
     `trailer\n<< /Root 1 0 R /Info 3 0 R /ID [<${randomUUID().replace(/-/g, '')}>] >>\n%%EOF\n`
   order.trfDigests.push(createHash('sha256').update(pdf).digest('hex'))
+  order.trfOrderStatuses.push(order.lastServedOrderStatus)
   sendPdf(res, 200, pdf)
 }
 
@@ -1392,8 +1398,11 @@ function recordPlacement (body, kind) {
     resultStatusAcked: false,
     resultAckCount: 0,
     trfFetches: 0,
-    /* sha256 of each TRF served for this order, in order (load-bearing detail 9). */
+    /* sha256 of each TRF served for this order, in order, and beside each the OrderStatus the
+     * labOrder feed last served the order at (load-bearing detail 9). */
     trfDigests: [],
+    trfOrderStatuses: [],
+    lastServedOrderStatus: null,
     /* The production redelivery of load-bearing detail 8, per channel: off until a test switches
      * it on with POST /__control__/orders/:id/redelivery. `served`/`acked` count only while on, and
      * start again from zero each time the channel is switched on. */
@@ -1524,6 +1533,9 @@ function publicOrder (order) {
     /* The sha256 of each TRF document served for it, oldest first: regenerated per fetch, so
      * distinct (load-bearing detail 9). A TRF the mock refused is not listed. */
     trfDigests: [...order.trfDigests],
+    /* Beside each digest, the OrderStatus the labOrder feed last served the order at when that
+     * TRF was fetched: the status of the delivery the form went out with. Harness bookkeeping. */
+    trfOrderStatuses: [...order.trfOrderStatuses],
     /* The redelivery switch and its window counters, per channel (load-bearing detail 8). */
     redelivery: {
       results: { ...order.redelivery.results },
