@@ -770,20 +770,21 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * that is not extended while its poll runs would let the other replica through as well. Last in
    * the file, and with an order of its own, so that nothing above sees the held answer. */
   describe('two results polls in flight deliver one batch once (dmi-engine-idexx-integration#88)', () => {
-    /* The integration's results poll interval, its replica count and the lifetime of its results poll
-     * lock. src/env.ts carries none of them, so each is read the way docker-compose.yml reads it: from
-     * the environment, with compose's default when it is unset or empty (HARNESS_IDEXX_POLL_MS, 3000;
-     * HARNESS_IDEXX_REPLICAS, 2; HARNESS_IDEXX_RESULTS_LOCK_TTL_MS, 5000). Compose also reads a slot
-     * tree's .env, which the harness does not load into this process (src/slots.js only checks the
-     * project name there), so a value set in that file alone is not seen here. */
+    /* The integration's results poll interval, its replica count, the lifetime of its results poll
+     * lock and its HTTP timeout. src/env.ts carries none of them, so each is read the way
+     * docker-compose.yml reads it: from the environment, with compose's default when it is unset or
+     * empty (HARNESS_IDEXX_POLL_MS, 3000; HARNESS_IDEXX_REPLICAS, 2; HARNESS_IDEXX_RESULTS_LOCK_TTL_MS,
+     * 5000; HARNESS_IDEXX_HTTP_TIMEOUT_MS, 30000). Compose also reads a slot tree's .env, which the
+     * harness does not load into this process (src/slots.js only checks the project name there), so a
+     * value set in that file alone is not seen here. */
     const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
     const replicas = Number(process.env.HARNESS_IDEXX_REPLICAS || 2)
     const lockTtlMs = Number(process.env.HARNESS_IDEXX_RESULTS_LOCK_TTL_MS || 5_000)
     /* Three intervals, so at least two later ticks fall due while the first poll's answer is held. */
     const delayMs = 3 * pollMs
-    /* The integration's HTTP timeout, which compose leaves at its default. The integration must
-     * still be waiting for the held answer when it comes, so the hold has to stay under this. */
-    const integrationHttpTimeoutMs = 30_000
+    /* The integration's HTTP timeout, as compose sets it. The integration must still be waiting for
+     * the held answer when it comes, so the hold has to stay under this. */
+    const integrationHttpTimeoutMs = Number(process.env.HARNESS_IDEXX_HTTP_TIMEOUT_MS || 30_000)
 
     /* One batch as the mock's ledger records it (GET /__control__/batches). */
     type LedgerBatch = {
@@ -808,7 +809,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       if (!(delayMs < integrationHttpTimeoutMs)) {
         throw new Error(
           `the held answer would last ${delayMs} ms (3 × HARNESS_IDEXX_POLL_MS=${pollMs}), but the integration gives up on ` +
-            `an answer after ${integrationHttpTimeoutMs} ms: this test needs a poll interval under ${integrationHttpTimeoutMs / 3} ms`,
+            `an answer after ${integrationHttpTimeoutMs} ms (HARNESS_IDEXX_HTTP_TIMEOUT_MS): this test needs a poll interval ` +
+            `under ${integrationHttpTimeoutMs / 3} ms`,
         )
       }
       /* The ticks one and two intervals after the held poll started fall due inside the hold; the one
@@ -878,7 +880,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * INVALID_BATCH_ID (confirms [200, 404]); the poll that reached the provider while the first
        * was held is counted too. One poll at a time: served once, confirmed once with a 200, and no
        * results poll reached the provider while the held one was in flight, because each tick
-       * meanwhile skipped. */
+       * meanwhile skipped.
+       *
+       * That last count is of every results poll that reaches the mock during the hold, whichever
+       * integration sent it: every integration here uses the same harness credentials, so the mock
+       * cannot tell them apart. It is 0 because this file has one idexx integration polling. A second
+       * one would make it non-zero with the fix in place, while the other two values stayed right. */
       expect(batches.map((batch) => ({
         pollsThatFetchedTheBatch: batch.served,
         confirmsOfTheBatch: batch.confirms,

@@ -134,6 +134,9 @@ services:
       REDIS_PORT: '6379'
       IDEXX_RESULTS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
       IDEXX_ORDERS_POLLING_INTERVAL_MS: '${HARNESS_IDEXX_POLL_MS:-3000}'
+      # The integration's own default, set here so that the overlapping-polls test, whose held
+      # answer has to come inside it, reads the same value instead of repeating the default.
+      IDEXX_HTTP_TIMEOUT_MS: '${HARNESS_IDEXX_HTTP_TIMEOUT_MS:-30000}'
       # How long the results poll lock lasts as first taken. Shorter than the overlapping-polls
       # test holds a poll in flight (three poll intervals), so the lock would run out under that
       # poll: only a lock that is extended while its poll runs still keeps the other replica out.
