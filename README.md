@@ -285,6 +285,24 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
   `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
+  In November 2026 production twice saw Antech V6 return records the integration had already
+  acknowledged, unchanged, on every poll and on both feeds, while answering every `AckStatus` 200,
+  until it stopped by itself: the same results from `GetAllResults`, and the same orders from the
+  labOrder status feed, each fetched with a freshly generated order form (TRF), whose bytes differ
+  on every fetch. The mock models both, from what production showed (load-bearing details 8 and 9
+  in its header): its TRF endpoint serves a new document per fetch and keeps each one's digest
+  (`trfDigests` on `GET /__control__/orders/<id>`), and
+  `POST /__control__/orders/<id>/redelivery` with `{results, orders}`, each `true` or `false`,
+  switches one order into that redelivery, per feed, and out again. While a feed is on, the
+  order's record is served on every poll whether or not it was acknowledged, its acknowledgements
+  are answered and recorded, and the window's counters (`redelivery.results` /
+  `redelivery.orders`: `served`, `acked`) count both; switched off, a record acknowledged in the
+  window leaves the feed. Re-seeding a result leaves the switch as it is. With it, the loop asserts
+  [dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409): an identical redelivered
+  result writes nothing and sends no `report:updated` or `order:updated`; an amendment made while
+  the result is being redelivered still reaches the report, and is reported once however often it
+  is redelivered after; an order re-offered with a regenerated order form sends no `order:updated`
+  and keeps the form first stored; and once the redelivery stops, both records stay off the feeds.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
@@ -703,7 +721,9 @@ scenarios/
                               throttled on every event write is still sent to the provider (dmi-api#371)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
-  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
+  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
+                              and a result or order the provider redelivers unchanged changes nothing
+                              (dmi-api#409)
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
                               end to end
                               (which scenarios carry `it.failing` tripwires, and for what: the table under "Tripwires")
