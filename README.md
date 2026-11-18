@@ -540,6 +540,14 @@ the integration's own source (`zoetis.service.ts`, `helpers/zoetis-order.helper.
   provider, so an endpoint would be fiction.
 - **Control plane** (`/__control__/*`, host-facing): seed a result, list/inspect received orders, read
   the catalogue, reset, inject error scenarios — the same determinism story as the other two mocks.
+  Two more are Zoetis's own. `POST /__control__/orders/<ref>/cancel` cancels an order as the provider
+  would of its own accord, with no call from the practice. Since dmi-api#409, dmi-api leaves alone an
+  order delivered in the state it already holds, so the order dmi-api cancels itself only shows that
+  its CANCELLED delivery changes nothing. The provider-cancelled order is the one that shows dmi-api
+  accepting the orders poll's CANCELLED reading (SUBMITTED → CANCELLED, one `order:updated`). The
+  feeds view counts the orders feeds served, and each order records the last feed that listed it. A
+  scenario can then tell that two orders arrived in one `external_orders` message, and wait for a
+  later poll cycle instead of sleeping.
 
 **Element multiplicity is the fussy part here**, where Antech's was CDATA and attribute sensitivity.
 `xmlbuilder2`'s object format gives an object for a lone child and an array for repeated ones, and
