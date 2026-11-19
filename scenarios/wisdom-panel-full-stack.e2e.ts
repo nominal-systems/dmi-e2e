@@ -1503,7 +1503,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
       /* The guard: the engine's orders poll served the three in ONE page, the nameless kit between
        * the other two, so they were one batch and one of them came after it. The scenario's own
-       * probes carry the probe bearer and are left out. */
+       * probes carry the probe bearer and are left out. The page is read back as kit codes, so a
+       * page that split the batch says which of the three it held. */
       const page = await pollUntil(
         async () =>
           (await mockCalls({ path: '/api/v1/kits', method: 'GET', since })).calls.find(
@@ -1517,8 +1518,12 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       if (page === undefined) {
         throw new Error(`the orders poll did not serve kit ${KIT_BATCH_NAMELESS_OWNER} (${nameless.id}) within ${ORDER_WAIT_MS}ms`)
       }
-      const batchIds = [before.id, nameless.id, after.id]
-      expect((page.servedKitIds ?? []).filter((id) => batchIds.includes(id))).toEqual(batchIds)
+      const codeOf = new Map(kits.map((kit) => [kit.id, kit.code]))
+      expect((page.servedKitIds ?? []).filter((id) => codeOf.has(id)).map((id) => codeOf.get(id))).toEqual([
+        KIT_BATCH_BEFORE,
+        KIT_BATCH_NAMELESS_OWNER,
+        KIT_BATCH_AFTER,
+      ])
 
       /* And the integration finished with that batch: it acknowledges every kit after emitting it,
        * the nameless one included, so nothing will deliver any of them again. */
@@ -1530,20 +1535,27 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       )
       expect(acknowledged).toEqual([true, true, true])
 
-      /* What dmi-api made of the batch: an order and one order:created for each healthy kit, and no
-       * order for the nameless one. Waited on until both healthy orders are announced, then compared
+      /* What dmi-api made of the batch: an order and one order:created for each healthy kit, and
+       * neither for the nameless one. Waited on until both healthy orders are announced, then compared
        * whole, so a red run shows every half of the outcome at once. Once both are announced the
        * whole batch has been saved, so the nameless kit's absence is final, not "not yet". */
       const outcome = async (): Promise<Record<string, { order: boolean, created: number }>> => {
-        const feed = expectOk<{ data: Array<{ type: string, data?: { orderId?: string } }> }>(
+        const feed = expectOk<{
+          data: Array<{ type: string, data?: { orderId?: string, order?: { externalId?: string } } }>
+        }>(
           await org.api.get('/events', { start_seq: 0, limit: 1000 }),
           'list the organization\'s events',
         ).data
         const of = async (kit: MockKit): Promise<{ order: boolean, created: number }> => {
           const order = await orderByExternalId(kit.id)
-          const created = order === undefined
-            ? 0
-            : feed.filter((event) => event.type === 'order:created' && event.data?.orderId === order.id).length
+          /* Counted by the KIT, not only through a stored order: an order:created announcing an
+           * order that was never stored carries the kit id as its order's externalId, and must count
+           * as much as one for a stored order. */
+          const created = feed.filter(
+            (event) =>
+              event.type === 'order:created' &&
+              (event.data?.order?.externalId === kit.id || (order !== undefined && event.data?.orderId === order.id)),
+          ).length
           return { order: order !== undefined, created }
         }
         return { before: await of(before), nameless: await of(nameless), after: await of(after) }

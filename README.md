@@ -314,8 +314,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   (`{"kits": [<one kit's body>, …]}`, each naming its `code`): the mock checks every kit before it
   creates any and creates them in one go, so they reach the integration in one orders poll, and so in
   one `external_orders` batch, in the order given. A pet provisioned with `ownerLastName: null` is
-  served with `owner-last-name: null`, as the vendor sends for an owner it holds no last name for
-  (the mock's header comment, load-bearing detail 10); leaving the field out is still refused. The
+  served with `owner-last-name: null`; leaving the field out is still refused. What production
+  showed is dmi-api refusing orders from this feed for a null client last name, which the integration
+  takes from that attribute; that the vendor sends it as an explicit null, not a missing key, is
+  inferred from the error (the mock's header comment, load-bearing detail 10). The
   call log (`GET /__control__/calls`) records on each kits-feed request the ids of the kits that page
   served (`servedKitIds`), so a scenario can prove which kits travelled in one batch. The loop uses
   both to assert that one order dmi-api cannot save costs only that order

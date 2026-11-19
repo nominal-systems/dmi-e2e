@@ -1289,9 +1289,10 @@ function provisionRefusal (body, code) {
     for (const field of ['name', 'ownerFirstName']) {
       if (typeof pet[field] !== 'string' || pet[field] === '') return `pet.${field} is required`
     }
-    /* A pet whose owner has no last name: the vendor sends `owner-last-name: null` for some pets
-     * (load-bearing detail 10). Only an explicit null selects it; an absent key is still refused,
-     * so a scenario cannot get a nameless owner by leaving the field out. */
+    /* A pet whose owner has no last name, served as `owner-last-name: null` (load-bearing detail
+     * 10: that the vendor sends an explicit null is INFERRED). Only an explicit null selects it; an
+     * absent key is still refused, so a scenario cannot get a nameless owner by leaving the field
+     * out. */
     if (pet.ownerLastName !== null && (typeof pet.ownerLastName !== 'string' || pet.ownerLastName === '')) {
       return 'pet.ownerLastName is required: a non-empty string, or null for an owner the vendor holds no last name for'
     }
