@@ -136,6 +136,11 @@ const KIT_PROVIDER_FOREIGN = 'WPKIT-P003'
 const KIT_PROVIDER_RESUMED = 'WPKIT-P004'
 const KIT_PETLESS = 'WPKIT-P005'
 const KIT_PROBE_PENDING = 'WPKIT-P006'
+/* One orders batch of three provider-side kits: the middle one's owner has no last name, which
+ * dmi-api cannot store, and a healthy kit sits on either side of it. */
+const KIT_BATCH_BEFORE = 'WPKIT-P007'
+const KIT_BATCH_NAMELESS_OWNER = 'WPKIT-P008'
+const KIT_BATCH_AFTER = 'WPKIT-P009'
 
 /* A hospital the seeded integration is not configured for. The mock holds its kits and its feeds
  * scope them away, which is what the negative below proves. */
@@ -218,7 +223,7 @@ interface MockPet {
   sex: string
   species: string
   ownerFirstName: string | null
-  ownerLastName: string
+  ownerLastName: string | null
 }
 
 interface MockKit {
@@ -250,6 +255,8 @@ interface MockCall {
   accept: string | null
   authorization: string | null
   body: any
+  /* On a kits-feed request: the kits that page served, in its order. */
+  servedKitIds?: string[]
 }
 
 interface MockCallLog {
@@ -1450,6 +1457,120 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       expect(foreign?.activated).toBe(true)
       expect(foreign?.pet?.name).toBe('Juniper')
     }, NEGATIVE_WAIT_MS + 30_000)
+
+    it('a kit whose order dmi-api cannot save costs only that order: the kits before and after it in its batch become orders, each announced', async () => {
+      /* nominal-systems/dmi-api#411. The integration emits ONE `external_orders` batch per page of
+       * the orders poll, and acknowledges every kit of the page right after emitting it, whatever
+       * dmi-api then does with the batch. So an order dmi-api cannot save must cost that order and
+       * nothing else. Before the fix, the save's error left dmi-api's handler: the orders after it in
+       * the batch were never created, and the ones before it were created but never announced (their
+       * order:created is sent once the whole batch is saved). The kits are acknowledged either way,
+       * so none of them came back.
+       *
+       * The middle kit's pet has an owner with no last name (load-bearing detail 10 of the mock),
+       * which the integration maps to the client's last name and dmi-api's database requires. A
+       * healthy kit sits on EACH side of it, because the one before it was created even before the
+       * fix: the one after it is the order the fix restores. One control-plane call provisions all
+       * three, so they reach the integration in one poll, in this order.
+       *
+       * Not asserted here: dmi-api's error line for the nameless kit and the failed count in its
+       * summary line. The harness hands dmi-api's output to the run's own output, where they can be
+       * read, but a scenario has no access to it. */
+      const since = (await mockCalls()).lastSeq
+      const providerKit = (code: string, pet: Record<string, unknown>): Record<string, unknown> => ({
+        code,
+        hospitalNumber: env.wisdomPanel.hospitalNumber,
+        hospitalName: env.wisdomPanel.hospitalName,
+        veterinarianName: 'Kim Vet',
+        activated: true,
+        stage: 'processing',
+        acknowledged: false,
+        pet: { sex: 'female', species: 'cat', ownerFirstName: 'Robin', ...pet },
+      })
+      const { kits } = expectOk<{ kits: MockKit[] }>(
+        await mock.post('/__control__/kits/batch', {
+          kits: [
+            providerKit(KIT_BATCH_BEFORE, { name: 'Pip', ownerLastName: 'Ashby' }),
+            providerKit(KIT_BATCH_NAMELESS_OWNER, { name: 'Wren', ownerLastName: null }),
+            providerKit(KIT_BATCH_AFTER, { name: 'Moss', ownerLastName: 'Crane' }),
+          ],
+        }),
+        'provision one orders batch of three kits at the mock',
+      )
+      const [before, nameless, after] = kits
+      expect(kits.map((kit) => kit.code)).toEqual([KIT_BATCH_BEFORE, KIT_BATCH_NAMELESS_OWNER, KIT_BATCH_AFTER])
+      expect(kits.map((kit) => kit.pet?.ownerLastName)).toEqual(['Ashby', null, 'Crane'])
+
+      /* The guard: the engine's orders poll served the three in ONE page, the nameless kit between
+       * the other two, so they were one batch and one of them came after it. The scenario's own
+       * probes carry the probe bearer and are left out. */
+      const page = await pollUntil(
+        async () =>
+          (await mockCalls({ path: '/api/v1/kits', method: 'GET', since })).calls.find(
+            (call) =>
+              call.authorization !== `Bearer ${probeToken}` && (call.servedKitIds ?? []).includes(nameless.id),
+          ),
+        (call) => call !== undefined,
+        ORDER_WAIT_MS,
+        1_000,
+      )
+      if (page === undefined) {
+        throw new Error(`the orders poll did not serve kit ${KIT_BATCH_NAMELESS_OWNER} (${nameless.id}) within ${ORDER_WAIT_MS}ms`)
+      }
+      const batchIds = [before.id, nameless.id, after.id]
+      expect((page.servedKitIds ?? []).filter((id) => batchIds.includes(id))).toEqual(batchIds)
+
+      /* And the integration finished with that batch: it acknowledges every kit after emitting it,
+       * the nameless one included, so nothing will deliver any of them again. */
+      const acknowledged = await pollUntil(
+        async () => await Promise.all(kits.map(async (kit) => (await mockKit(kit.code)).acknowledged)),
+        (flags) => flags.every(Boolean),
+        ORDER_WAIT_MS,
+        1_000,
+      )
+      expect(acknowledged).toEqual([true, true, true])
+
+      /* What dmi-api made of the batch: an order and one order:created for each healthy kit, and no
+       * order for the nameless one. Waited on until both healthy orders are announced, then compared
+       * whole, so a red run shows every half of the outcome at once. Once both are announced the
+       * whole batch has been saved, so the nameless kit's absence is final, not "not yet". */
+      const outcome = async (): Promise<Record<string, { order: boolean, created: number }>> => {
+        const feed = expectOk<{ data: Array<{ type: string, data?: { orderId?: string } }> }>(
+          await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+          'list the organization\'s events',
+        ).data
+        const of = async (kit: MockKit): Promise<{ order: boolean, created: number }> => {
+          const order = await orderByExternalId(kit.id)
+          const created = order === undefined
+            ? 0
+            : feed.filter((event) => event.type === 'order:created' && event.data?.orderId === order.id).length
+          return { order: order !== undefined, created }
+        }
+        return { before: await of(before), nameless: await of(nameless), after: await of(after) }
+      }
+      const result = await pollUntil(
+        outcome,
+        (found) => found.before.created > 0 && found.after.created > 0,
+        ORDER_WAIT_MS,
+        1_000,
+      )
+      expect(result).toEqual({
+        before: { order: true, created: 1 },
+        nameless: { order: false, created: 0 },
+        after: { order: true, created: 1 },
+      })
+
+      /* The right kits became the right orders: each carries its own pet and owner. */
+      for (const [kit, patient, lastName] of [[before, 'Pip', 'Ashby'], [after, 'Moss', 'Crane']] as const) {
+        const found = await orderByExternalId(kit.id)
+        const order = expectOk<any>(await org.api.get(`/orders/${String(found?.id)}`), `read the order for kit ${kit.code}`)
+        expect({ status: order.status, patient: order.patient?.name, lastName: order.client?.lastName }).toEqual({
+          status: 'PARTIAL',
+          patient,
+          lastName,
+        })
+      }
+    }, 3 * ORDER_WAIT_MS + 30_000)
   })
 
   describe('refusals surface end to end', () => {
