@@ -310,6 +310,19 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   [dmi-engine-wisdom-panel-integration#51](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/pull/51).
   `e2e-wisdom-panel.yml` builds the integration at its `main`, so the loop's job is red on those
   tests until that change merges.
+  Kits activated at the provider rather than through dmi are provisioned with
+  `POST /__control__/kits`, or several at once with `POST /__control__/kits/batch`
+  (`{"kits": [<one kit's body>, …]}`, each naming its `code`): the mock checks every kit before it
+  creates any and creates them in one go, so they reach the integration in one orders poll, and so in
+  one `external_orders` batch, in the order given. A pet provisioned with `ownerLastName: null` is
+  served with `owner-last-name: null`; leaving the field out is still refused. What production
+  showed is dmi-api refusing orders from this feed for a null client last name, which the integration
+  takes from that attribute; that the vendor sends it as an explicit null, not a missing key, is
+  inferred from the error (the mock's header comment, load-bearing detail 10). The
+  call log (`GET /__control__/calls`) records on each kits-feed request the ids of the kits that page
+  served (`servedKitIds`), so a scenario can prove which kits travelled in one batch. The loop uses
+  both to assert that one order dmi-api cannot save costs only that order
+  ([dmi-api#411](https://github.com/nominal-systems/dmi-api/issues/411)).
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
@@ -729,7 +742,8 @@ scenarios/
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
-                              end to end
+                              end to end, and one order dmi-api cannot save does not cost the rest of its
+                              batch (dmi-api#411)
                               (which scenarios carry `it.failing` tripwires, and for what: the table under "Tripwires")
 ```
 

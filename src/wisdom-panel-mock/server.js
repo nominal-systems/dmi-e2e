@@ -6,10 +6,10 @@
  * container — to drive it unmodified: the OAuth2 password grant, the two JSON:API polling feeds
  * (kits and result-sets), the simplified genetic results, the binary vet report, both acknowledge
  * channels, and kit ACTIVATION (which is what an "order" is for this provider). A separate control
- * plane (`/__control__/*`) lets tests provision provider-side kits, seed result sets (with their
- * kit's report ready, or still pending until the test finishes it), fail the PDF generator, revoke
- * bearers and inspect what the mock received, so the
- * order -> result -> report loop is deterministic and CI-safe.
+ * plane (`/__control__/*`) lets tests provision provider-side kits (one at a time, or several in
+ * one orders batch), seed result sets (with their kit's report ready, or still pending until the
+ * test finishes it), fail the PDF generator, revoke bearers and inspect what the mock received, so
+ * the order -> result -> report loop is deterministic and CI-safe.
  *
  * It NEVER talks to a live Wisdom Panel host and never authenticates for real. Every kit code,
  * hospital, veterinarian, pet, owner and genetic finding here is SYNTHETIC — invented values shaped
@@ -137,6 +137,17 @@
  *    `report-ready-on` (OBSERVED on every kit of the staging captures of 2026-09-11; the public API
  *    spec names only `-on`). The mock keeps one field and sends it under both, so the two cannot
  *    disagree here — an integration that reads either one meets the vendor's value.
+ *
+ * 10. A PET'S OWNER CAN HAVE NO LAST NAME. OBSERVED in production, through dmi-api: orders from this
+ *    provider's orders feed refused by its database with `Column 'lastName' cannot be null`
+ *    (nominal-systems/dmi-api#411). The integration's `mapClient` takes the dmi client's last name
+ *    straight off the pet's `owner-last-name`, so that is the attribute that arrived without a
+ *    value. That it arrives as an explicit `null` rather than a missing key is INFERRED from the
+ *    error: MySQL raises that one for a NULL written to the column, while an order whose client
+ *    lacked the key would have left the column to its default, which is a different error. A pet
+ *    provisioned with `ownerLastName: null` is served that way, and `POST /__control__/kits/batch`
+ *    puts such a kit into one orders page beside others, the way several kits activated between two
+ *    polls reach the integration.
  *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL, because the vendor's behaviour is unverified
@@ -824,6 +835,10 @@ function handleKits (req, res, params, query) {
     ? kits.map((kit) => state.pets.get(kit.petId)).filter((pet) => pet !== undefined).map((pet) => petItem(req, pet))
     : []
 
+  /* Which kits this page served, in its order, on the request's own entry in the call log. The
+   * integration emits one `external_orders` batch per page of the orders poll, so this is what
+   * shows which kits travelled together, and in what order. */
+  if (req.callRecord !== undefined) req.callRecord.servedKitIds = kits.map((kit) => kit.id)
   sendPage(req, res, kits.map((kit) => kitItem(req, kit)), included)
 }
 
@@ -1249,32 +1264,87 @@ function controlError (res, message) {
   sendJson(res, 400, { error: message })
 }
 
-async function handleControlProvisionKit (req, res) {
-  const body = await readJson(req)
+/* The kit code a provisioning body names, or the next free one. */
+function provisionedCode (body) {
+  return typeof body.code === 'string' && body.code !== '' ? body.code : `WPKIT-${String(state.kits.size + 1).padStart(4, '0')}`
+}
 
-  const code = typeof body.code === 'string' && body.code !== '' ? body.code : `WPKIT-${String(state.kits.size + 1).padStart(4, '0')}`
-  if (findKit(code) !== undefined) return controlError(res, `a kit with code '${code}' already exists`)
+/* Why the control plane refuses to provision this kit, or null when it does not. Separate from the
+ * provisioning itself so that a batch can check every kit before it creates any. */
+function provisionRefusal (body, code) {
+  if (findKit(code) !== undefined) return `a kit with code '${code}' already exists`
   if (!KIT_STAGES.includes(body.stage ?? null)) {
-    return controlError(res, `stage must be one of ${KIT_STAGES.map((stage) => String(stage)).join(', ')}; got '${String(body.stage)}'`)
+    return `stage must be one of ${KIT_STAGES.map((stage) => String(stage)).join(', ')}; got '${String(body.stage)}'`
   }
   if (!KIT_FAILURES.includes(body.failure ?? null)) {
-    return controlError(res, `failure must be one of ${KIT_FAILURES.map((failure) => String(failure)).join(', ')}; got '${String(body.failure)}'`)
+    return `failure must be one of ${KIT_FAILURES.map((failure) => String(failure)).join(', ')}; got '${String(body.failure)}'`
   }
   if (!PDF_FAILURE_MODES.includes(body.pdfFailure ?? null)) {
-    return controlError(res, `pdfFailure must be one of ${PDF_FAILURE_MODES.map((mode) => String(mode)).join(', ')}; got '${String(body.pdfFailure)}'`)
+    return `pdfFailure must be one of ${PDF_FAILURE_MODES.map((mode) => String(mode)).join(', ')}; got '${String(body.pdfFailure)}'`
   }
-
-  let petId = null
   if (body.pet !== undefined && body.pet !== null) {
     const pet = body.pet
-    if (!PET_SPECIES.includes(pet.species)) return controlError(res, `pet.species must be one of ${PET_SPECIES.join(', ')}`)
-    if (!PET_SEXES.includes(pet.sex)) return controlError(res, `pet.sex must be one of ${PET_SEXES.join(', ')}`)
-    for (const field of ['name', 'ownerFirstName', 'ownerLastName']) {
-      if (typeof pet[field] !== 'string' || pet[field] === '') return controlError(res, `pet.${field} is required`)
+    if (!PET_SPECIES.includes(pet.species)) return `pet.species must be one of ${PET_SPECIES.join(', ')}`
+    if (!PET_SEXES.includes(pet.sex)) return `pet.sex must be one of ${PET_SEXES.join(', ')}`
+    for (const field of ['name', 'ownerFirstName']) {
+      if (typeof pet[field] !== 'string' || pet[field] === '') return `pet.${field} is required`
+    }
+    /* A pet whose owner has no last name, served as `owner-last-name: null` (load-bearing detail
+     * 10: that the vendor sends an explicit null is INFERRED). Only an explicit null selects it; an
+     * absent key is still refused, so a scenario cannot get a nameless owner by leaving the field
+     * out. */
+    if (pet.ownerLastName !== null && (typeof pet.ownerLastName !== 'string' || pet.ownerLastName === '')) {
+      return 'pet.ownerLastName is required: a non-empty string, or null for an owner the vendor holds no last name for'
     }
     /* The pet exists only because the kit was activated, at the provider or here; provisioning a
      * pet on an unactivated kit would be a state the vendor does not produce. */
-    if (body.activated !== true) return controlError(res, 'a kit with a pet must be provisioned as activated')
+    if (body.activated !== true) return 'a kit with a pet must be provisioned as activated'
+  }
+  return null
+}
+
+async function handleControlProvisionKit (req, res) {
+  const body = await readJson(req)
+  const code = provisionedCode(body)
+  const refusal = provisionRefusal(body, code)
+  if (refusal !== null) return controlError(res, refusal)
+  sendJson(res, 201, publicKit(provisionKit(body, code)))
+}
+
+/* `POST /__control__/kits/batch` — several kits at once, `{kits: [<the body of POST
+ * /__control__/kits>, ...]}`: the clinic activating several kits at the provider between two polls
+ * of the orders feed. Every kit is checked before any is created, so a refused batch provisions
+ * nothing, and all of them are created in ONE tick, so no feed request can be answered between two
+ * of them: they reach the integration in the same poll, and so in one `external_orders` batch, in
+ * the order given (the feed lists kits in the order they were provisioned). Provisioning them one
+ * request at a time could put a poll between two. Each kit names its code, because the default
+ * code is the next free number and a batch would collide with itself. */
+async function handleControlProvisionKitBatch (req, res) {
+  const body = await readJson(req)
+  const entries = body.kits
+  if (!Array.isArray(entries) || entries.length < 2) {
+    return controlError(res, 'kits must be an array of at least two kits (provision one with POST /__control__/kits)')
+  }
+  const codes = []
+  for (const [index, entry] of entries.entries()) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.code !== 'string' || entry.code === '') {
+      return controlError(res, `kits[${index}] names no code: every kit of a batch needs one`)
+    }
+    if (codes.includes(entry.code)) return controlError(res, `kits[${index}]: code '${entry.code}' is in the batch twice`)
+    const refusal = provisionRefusal(entry, entry.code)
+    if (refusal !== null) return controlError(res, `kits[${index}]: ${refusal}`)
+    codes.push(entry.code)
+  }
+  const kits = entries.map((entry) => provisionKit(entry, entry.code))
+  log(`provisioned a batch of ${kits.length} kits: ${codes.join(', ')}`)
+  sendJson(res, 201, { kits: kits.map(publicKit) })
+}
+
+/* Creates the kit, and its pet, that a body provisionRefusal let through describes. */
+function provisionKit (body, code) {
+  let petId = null
+  if (body.pet !== undefined && body.pet !== null) {
+    const pet = body.pet
     petId = randomUUID()
     state.pets.set(petId, {
       id: petId,
@@ -1321,8 +1391,7 @@ async function handleControlProvisionKit (req, res) {
     pdfFailure: body.pdfFailure ?? null,
   })
   log(`provisioned kit ${code} (${id}): activated=${body.activated === true}, stage=${String(body.stage ?? null)}, hospital=${String(body.hospitalNumber ?? null)}`)
-
-  sendJson(res, 201, publicKit(state.kits.get(id)))
+  return state.kits.get(id)
 }
 
 function handleControlDeleteKit (req, res, params) {
@@ -1603,7 +1672,7 @@ function handleControlReset (req, res) {
 
 function recordCall (req, url, body) {
   state.nextCallSeq += 1
-  state.calls.push({
+  const call = {
     seq: state.nextCallSeq,
     at: nowIso(),
     method: req.method,
@@ -1613,8 +1682,10 @@ function recordCall (req, url, body) {
     authorization: req.headers.authorization ?? null,
     contentType: req.headers['content-type'] ?? null,
     body,
-  })
+  }
+  state.calls.push(call)
   if (state.calls.length > MAX_CALL_LOG) state.calls.splice(0, state.calls.length - MAX_CALL_LOG)
+  return call
 }
 
 /* ---- router ---- */
@@ -1677,6 +1748,7 @@ const routes = [
     },
   ],
   ['POST', /^\/__control__\/kits$/, handleControlProvisionKit],
+  ['POST', /^\/__control__\/kits\/batch$/, handleControlProvisionKitBatch],
   ['DELETE', /^\/__control__\/kits\/(?<key>[^/]+)$/, handleControlDeleteKit],
   ['POST', /^\/__control__\/kits\/(?<key>[^/]+)\/pdf$/, handleControlSetPdfFailure],
   ['POST', /^\/__control__\/kits\/(?<key>[^/]+)\/result-sets$/, handleControlSeedResultSet],
@@ -1756,7 +1828,8 @@ const server = http.createServer(async (req, res) => {
        * drained: replace it with a resolved value rather than re-reading. */
       req.parsedBody = body
     }
-    if (isProviderCall) recordCall(req, url, body)
+    /* Parked on the request so a handler can add what it answered (the kits feed does). */
+    if (isProviderCall) req.callRecord = recordCall(req, url, body)
 
     try {
       await handler(req, res, params, url.searchParams)
