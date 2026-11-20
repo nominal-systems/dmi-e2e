@@ -799,7 +799,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       /* Refused at once, saying why, when the stack cannot show the defect: with one replica the next
        * tick waits for the held poll and this test would pass on a build that lets polls overlap; a
        * hold that outlasts the integration's HTTP timeout fails the held poll instead; and a lock that
-       * lasts until the last tick inside the hold would pass without ever being extended. */
+       * lasts until the last tick inside the hold would pass without ever being extended, as would a
+       * lifetime the integration does not keep. */
       if (!(replicas >= 2)) {
         throw new Error(
           `HARNESS_IDEXX_REPLICAS is ${process.env.HARNESS_IDEXX_REPLICAS}: this test needs at least two integration ` +
@@ -814,13 +815,17 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         )
       }
       /* The ticks one and two intervals after the held poll started fall due inside the hold; the one
-       * after three races its end. So the lock as first taken has to be gone by the second. */
-      if (!(lockTtlMs < delayMs - pollMs)) {
+       * after three races its end. So the lock as first taken has to be gone by the second. It also
+       * has to be a lifetime the integration keeps: one that is not a positive number of milliseconds
+       * (0, a negative one) is replaced there by the integration's own default, which outlasts the
+       * hold. */
+      if (!(Number.isFinite(lockTtlMs) && lockTtlMs > 0 && lockTtlMs <= 2 ** 31 - 1 && lockTtlMs < delayMs - pollMs)) {
         throw new Error(
-          `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS is ${lockTtlMs}: the results poll lock as first taken would last past the ` +
-            `last tick sure to fall due while the answer is held (${delayMs - pollMs} ms after the held poll started, ` +
-            `2 × HARNESS_IDEXX_POLL_MS=${pollMs}), so this test would pass on a lock that is never extended: ` +
-            `it needs a lock lifetime under ${delayMs - pollMs} ms`,
+          `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS is ${lockTtlMs}: this test needs a lock lifetime that is a positive number of ` +
+            `milliseconds under ${delayMs - pollMs}. A longer one lasts past the last tick sure to fall due while the answer ` +
+            `is held (${delayMs - pollMs} ms after the held poll started, 2 × HARNESS_IDEXX_POLL_MS=${pollMs}), and one that ` +
+            `is not a positive number is replaced by the integration's own, longer default: either way this test would ` +
+            `pass on a lock that is never extended`,
         )
       }
 
@@ -885,7 +890,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * That last count is of every results poll that reaches the mock during the hold, whichever
        * integration sent it: every integration here uses the same harness credentials, so the mock
        * cannot tell them apart. It is 0 because this file has one idexx integration polling. A second
-       * one would make it non-zero with the fix in place, while the other two values stayed right. */
+       * one would break all three values with the fix in place: the mock serves its one active batch
+       * to any integration, and its lock has a different key. */
       expect(batches.map((batch) => ({
         pollsThatFetchedTheBatch: batch.served,
         confirmsOfTheBatch: batch.confirms,
