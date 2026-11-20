@@ -9,6 +9,15 @@
  * deterministic and CI-safe. It NEVER talks to real IDEXX and never authenticates for real; the
  * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is.
  *
+ * Control routes: `POST /__control__/orders/:requisitionId/results` seeds a result,
+ * `GET /__control__/orders[/:requisitionId]` lists or reads the orders received,
+ * `GET /__control__/batches` reads the ledger of results batches (each batch the mock formed, the
+ * requisition ids of the results it carried, how many results/latest responses carried it, how
+ * each confirm of it was answered, and — for an answer held by the `resultsLatestDelay` scenario —
+ * how many results/latest requests arrived while it was held), `POST /__control__/scenarios`
+ * injects a canned answer or holds one results answer (see handleControlScenario), and
+ * `POST /__control__/reset` clears all of it.
+ *
  * Data: every patient, client, veterinarian and clinic identifier here is INVENTED — no captured
  * clinic or patient data, ever. Provider vocabulary (analyte numbers, analyzer and test codes,
  * species-level reference ranges) is taken from IDEXX's own catalogue and specs so the payloads are
@@ -66,10 +75,21 @@ function freshState () {
      * integration acks the batch it was served in, after which /api/v3/results/latest omits it. */
     results: [],
     /* The batch currently being served by /api/v3/results/latest, cached so repeated polls before
-     * the ack return a stable batchId (the integration acks exactly that id). */
+     * the ack return a stable batchId and the same results (the integration acks exactly that id).
+     * Only this batch can be confirmed (see handleResultsConfirm), and it stays the batch until it is:
+     * a result seeded meanwhile waits for the next one (see handleControlSeedResult). */
     activeBatch: null,
+    /* The ledger: one entry per batch the mock formed, oldest first, read-only over
+     * GET /__control__/batches. { batchId, requisitionIds, served, confirms: [status, ...], holds:
+     * [{ delayMs, requestsWhileHeld, sent }] }. It is how a scenario sees, from the provider's side,
+     * whether a batch was fetched more than once and how each confirm of it was answered. */
+    batches: [],
+    /* The holds whose answer is still being held (see handleResultsLatest); every results/latest
+     * request that arrives meanwhile is counted on each of them. */
+    held: new Set(),
     /* Error/edge injection: { [key]: { status, body } }. Keys are logical operation names, e.g.
-     * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices'. */
+     * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices' — plus 'resultsLatestDelay',
+     * { delayMs }, which holds an answer instead of replacing it. */
     scenarios: {},
   }
 }
@@ -575,6 +595,10 @@ async function handleUiOrderPut (req, res, params) {
 /* ---- results handlers (/api/v3) ---- */
 
 async function handleResultsLatest (req, res) {
+  /* Counted on arrival, before anything can answer it: a poll that reaches the provider while
+   * another poll's answer is still held is the overlap the delay below exists to expose. */
+  for (const hold of state.held) hold.requestsWhileHeld += 1
+
   const scenario = takeScenario('resultsLatest')
   if (scenario != null) {
     sendJson(res, scenario.status, scenario.body ?? { message: 'results latest failed' })
@@ -590,26 +614,66 @@ async function handleResultsLatest (req, res) {
   }
   /* Cache the batch so repeat polls before the ack return the same id the integration will confirm. */
   if (state.activeBatch == null) {
-    state.activeBatch = { batchId: crypto.randomBytes(16).toString('base64url'), entries: pending }
+    const batchId = crypto.randomBytes(16).toString('base64url')
+    const ledger = {
+      batchId,
+      requisitionIds: pending.map((entry) => entry.idexx.requisitionId),
+      served: 0,
+      confirms: [],
+      holds: [],
+    }
+    state.batches.push(ledger)
+    state.activeBatch = { batchId, entries: pending, ledger }
   }
   const batch = state.activeBatch
-  sendJson(res, 200, {
+  /* The answer is fixed here, when the request arrives, whether or not it is then held. */
+  const body = {
     batchId: batch.batchId,
     count: batch.entries.length,
     hasMoreResults: false,
     timestamp: nowIso(),
     results: batch.entries.map((entry) => entry.idexx),
-  })
+  }
+
+  /* A delayed answer (the `resultsLatestDelay` scenario): the first answer that carries a batch is
+   * held for `delayMs` after it was formed, as when IDEXX has answered and the network is slow. It
+   * holds one poll in flight long enough for the integration's next tick to start, which is how two
+   * polls of one integration come to overlap in production. Only this answer is held: requests that
+   * arrive meanwhile are answered at once, and counted on the hold. An empty poll is never held and
+   * does not consume the scenario. */
+  const delay = takeScenario('resultsLatestDelay')
+  if (delay != null) {
+    const hold = { delayMs: delay.delayMs, requestsWhileHeld: 0, sent: false }
+    batch.ledger.holds.push(hold)
+    state.held.add(hold)
+    log(`holding results batch ${batch.batchId} for ${delay.delayMs}ms`)
+    await new Promise((resolve) => setTimeout(resolve, delay.delayMs))
+    state.held.delete(hold)
+    hold.sent = true
+    log(`sent held results batch ${batch.batchId} (${hold.requestsWhileHeld} results/latest request(s) arrived meanwhile)`)
+  }
+  batch.ledger.served += 1
+  sendJson(res, 200, body)
 }
 
 async function handleResultsConfirm (req, res, params) {
   await readBody(req)
   const batch = state.activeBatch
-  if (batch != null && batch.batchId === params.batchId) {
-    for (const entry of batch.entries) entry.confirmed = true
-    state.activeBatch = null
-    log(`confirmed results batch ${params.batchId} (${batch.entries.length} result(s))`)
+  if (batch == null || batch.batchId !== params.batchId) {
+    /* Only the batch being served can be confirmed. A confirm of any other id — one already
+     * confirmed, or one never served — is refused as IDEXX refuses it: this status and body are
+     * IDEXX's own, as its live API returns them. An integration that confirms one batch twice sees
+     * the 404 here as it would in production. */
+    const ledger = state.batches.find((entry) => entry.batchId === params.batchId)
+    if (ledger != null) ledger.confirms.push(404)
+    log(`refused confirm of results batch ${params.batchId}: ${ledger != null ? 'no longer being served' : 'never served'}`)
+    sendJson(res, 404, { error: 'INVALID_BATCH_ID', message: `Invalid batch ID: ${params.batchId}`, status: 'NOT_FOUND' })
+    return
   }
+  for (const entry of batch.entries) entry.confirmed = true
+  state.activeBatch = null
+  batch.ledger.confirms.push(200)
+  log(`confirmed results batch ${params.batchId} (${batch.entries.length} result(s))`)
   sendJson(res, 200, { batchId: params.batchId, confirmed: true })
 }
 
@@ -652,9 +716,9 @@ function handleIvlsDevices (req, res) {
 /* ---- control plane (/__control__) ---- */
 
 async function handleControlSeedResult (req, res, params) {
-  /* Seed a (synthetic) result for the order placed under `requisitionId`, making the next
-   * results-latest poll deliver it. Body may override `status` or `categories`. Returns the
-   * assembled IDEXX result so a test can assert on what it injected. */
+  /* Seed a (synthetic) result for the order placed under `requisitionId`, for the next batch the
+   * results-latest poll forms. Body may override `status` or `categories`. Returns the assembled
+   * IDEXX result so a test can assert on what it injected. */
   const body = await readBody(req)
   const requisitionId = params.requisitionId
   const idexxOrderId = state.requisitionToOrderId.get(requisitionId)
@@ -665,8 +729,11 @@ async function handleControlSeedResult (req, res, params) {
   const order = state.orders.get(idexxOrderId)
   const idexx = buildResult(order, { status: body.status, categories: body.categories })
   state.results.push({ idexx, confirmed: false })
-  /* A newly-seeded result forms a fresh batch on the next poll. */
-  state.activeBatch = null
+  /* The batch being served is not touched: it stays the batch until it is confirmed, as IDEXX's spec
+   * has it (each batch must be acknowledged before the next can be downloaded). A result seeded
+   * meanwhile joins the next batch, which the first poll after the confirm forms. Re-forming the
+   * served batch here would make the integration's legitimate confirm of it a 404 and serve its
+   * results a second time. */
   log(`seeded result for requisitionId=${requisitionId} (idexxOrderId=${idexxOrderId})`)
   sendJson(res, 201, { seeded: true, requisitionId, idexxOrderId, result: idexx })
 }
@@ -709,15 +776,32 @@ function handleControlGetOrder (req, res, params) {
   sendJson(res, 200, controlOrderView(order))
 }
 
+/* The ledger of results batches (see freshState), oldest first. */
+function handleControlListBatches (req, res) {
+  sendJson(res, 200, { count: state.batches.length, batches: state.batches })
+}
+
 async function handleControlScenario (req, res) {
   /* Inject a canned failure for a logical operation, e.g.
-   * { "key": "createOrder", "status": 500, "body": {...}, "once": true }. */
+   * { "key": "createOrder", "status": 500, "body": {...}, "once": true }.
+   *
+   * `resultsLatestDelay` is the one key that holds an answer instead of replacing it:
+   * { "key": "resultsLatestDelay", "delayMs": 9000, "once": true } holds the next results/latest
+   * answer that carries a batch for `delayMs` (see handleResultsLatest). */
   const body = await readBody(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
     return
   }
-  state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+  if (body.key === 'resultsLatestDelay') {
+    if (typeof body.delayMs !== 'number' || !Number.isFinite(body.delayMs) || body.delayMs <= 0) {
+      sendJson(res, 400, { message: 'the resultsLatestDelay scenario requires a positive number "delayMs"' })
+      return
+    }
+    state.scenarios[body.key] = { delayMs: body.delayMs, once: body.once === true }
+  } else {
+    state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+  }
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
 }
 
@@ -761,6 +845,7 @@ const routes = [
   ['POST', /^\/__control__\/orders\/(?<requisitionId>[^/]+)\/results$/, handleControlSeedResult],
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<requisitionId>[^/]+)$/, handleControlGetOrder],
+  ['GET', /^\/__control__\/batches$/, handleControlListBatches],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]

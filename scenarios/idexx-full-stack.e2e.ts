@@ -640,7 +640,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * and no longer fails the request when the event store keeps refusing it. It runs dmi-api under
    * NODE_ENV=seed, though, where `createOrder` returns before the engine call, so it cannot prove the
    * outcome that matters to the clinic: the order is still sent to the provider. This proves it,
-   * here at the end of the loop so that its main flow above is untouched. */
+   * here after the loop so that its main flow above is untouched. */
   describe('an order survives its event store throttling every event write (dmi-api#371)', () => {
     /* dmi-api's event collection, as its Event schema names it. */
     const EVENTS = 'events_v2'
@@ -747,5 +747,188 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * counted too, so an exact count would depend on timing. */
       expect(refused).toBeGreaterThanOrEqual(9)
     }, 30_000 + 3 * 2_000)
+  })
+
+  /* ---- dmi-engine-idexx-integration#88 guard ----
+   *
+   * The integration polls IDEXX's results with one Bull repeat job per integration. Each run GETs
+   * the latest batch — which stays at IDEXX until it is confirmed — emits its results to dmi-api, then
+   * confirms the batch. Bull schedules a repeat job's next run when the current one STARTS, so when
+   * the integration runs as more than one replica, two results polls of one integration can be in
+   * flight at once: a run still waiting for its answer, and the next tick on another replica. Both
+   * get the same unconfirmed batch and both emit it: dmi-api applies it twice and the PIMS gets a
+   * second `report:updated` for a report that did not change. The first confirm is answered 200; the
+   * second is IDEXX's 404 INVALID_BATCH_ID, and that job fails. The fix lets one results poll per
+   * integration run at a time: a tick that finds one in flight skips, and the next tick fetches.
+   *
+   * The loop reproduces the overlap across replicas: compose runs the integration as two replicas
+   * with one results worker each, and the mock's `resultsLatestDelay` scenario holds one poll's
+   * answer in flight while the next ticks fall due. The held poll occupies its replica's only
+   * worker, so the next tick can only be taken by the other replica: a guard that held within one
+   * process only would let it through. Compose also gives the integration's results poll lock a
+   * lifetime shorter than the hold, so the lock as first taken runs out under the held poll: a lock
+   * that is not extended while its poll runs would let the other replica through as well. Last in
+   * the file, and with an order of its own, so that nothing above sees the held answer. */
+  describe('two results polls in flight deliver one batch once (dmi-engine-idexx-integration#88)', () => {
+    /* The integration's results poll interval, its replica count, the lifetime of its results poll
+     * lock and its HTTP timeout. src/env.ts carries none of them, so each is read the way
+     * docker-compose.yml reads it: from the environment, with compose's default when it is unset or
+     * empty (HARNESS_IDEXX_POLL_MS, 3000; HARNESS_IDEXX_REPLICAS, 2; HARNESS_IDEXX_RESULTS_LOCK_TTL_MS,
+     * 5000; HARNESS_IDEXX_HTTP_TIMEOUT_MS, 30000). Compose also reads a slot tree's .env, which the
+     * harness does not load into this process (src/slots.js only checks the project name there), so a
+     * value set in that file alone is not seen here. */
+    const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
+    const replicas = Number(process.env.HARNESS_IDEXX_REPLICAS || 2)
+    const lockTtlMs = Number(process.env.HARNESS_IDEXX_RESULTS_LOCK_TTL_MS || 5_000)
+    /* Three intervals, so at least two later ticks fall due while the first poll's answer is held. */
+    const delayMs = 3 * pollMs
+    /* The integration's HTTP timeout, as compose sets it. The integration must still be waiting for
+     * the held answer when it comes, so the hold has to stay under this. */
+    const integrationHttpTimeoutMs = Number(process.env.HARNESS_IDEXX_HTTP_TIMEOUT_MS || 30_000)
+
+    /* One batch as the mock's ledger records it (GET /__control__/batches). */
+    type LedgerBatch = {
+      batchId: string
+      requisitionIds: string[]
+      served: number
+      confirms: number[]
+      holds: Array<{ delayMs: number, requestsWhileHeld: number, sent: boolean }>
+    }
+
+    it('a batch held in flight past the next ticks is fetched once, confirmed once and reported once', async () => {
+      /* Refused at once, saying why, when the stack cannot show the defect: with one replica the next
+       * tick waits for the held poll and this test would pass on a build that lets polls overlap; a
+       * hold that outlasts the integration's HTTP timeout fails the held poll instead; and a lock that
+       * lasts until the last tick inside the hold would pass without ever being extended, as would a
+       * lifetime the integration does not keep. */
+      if (!(replicas >= 2)) {
+        throw new Error(
+          `HARNESS_IDEXX_REPLICAS is ${process.env.HARNESS_IDEXX_REPLICAS}: this test needs at least two integration ` +
+            'replicas, because with one the next tick waits for the held poll and two polls can never be in flight at once',
+        )
+      }
+      if (!(delayMs < integrationHttpTimeoutMs)) {
+        throw new Error(
+          `the held answer would last ${delayMs} ms (3 × HARNESS_IDEXX_POLL_MS=${pollMs}), but the integration gives up on ` +
+            `an answer after ${integrationHttpTimeoutMs} ms (HARNESS_IDEXX_HTTP_TIMEOUT_MS): this test needs a poll interval ` +
+            `under ${integrationHttpTimeoutMs / 3} ms`,
+        )
+      }
+      /* The ticks one and two intervals after the held poll started fall due inside the hold; the one
+       * after three races its end. So the lock as first taken has to be gone by the second. It also
+       * has to be a lifetime the integration keeps: one that is not a positive number of milliseconds
+       * (0, a negative one) is replaced there by the integration's own default, which outlasts the
+       * hold. */
+      if (!(Number.isFinite(lockTtlMs) && lockTtlMs > 0 && lockTtlMs <= 2 ** 31 - 1 && lockTtlMs < delayMs - pollMs)) {
+        throw new Error(
+          `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS is ${lockTtlMs}: this test needs a lock lifetime that is a positive number of ` +
+            `milliseconds under ${delayMs - pollMs}. A longer one lasts past the last tick sure to fall due while the answer ` +
+            `is held (${delayMs - pollMs} ms after the held poll started, 2 × HARNESS_IDEXX_POLL_MS=${pollMs}), and one that ` +
+            `is not a positive number is replaced by the integration's own, longer default: either way this test would ` +
+            `pass on a lock that is never extended`,
+        )
+      }
+
+      /* Its own order, never part of the loop above: the same in-house code, device and ref-mapped
+       * patient as the loop's own order. */
+      const payload = refMappedOrderPayload({
+        testCodes: [{ code: serviceCode }],
+        devices: [deviceSerial],
+      })
+      const overlapRequisitionId = payload.requisitionId as string
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place the idexx order whose results batch will be held',
+      )
+      const overlapOrderId = created.id
+
+      /* Armed first, then the result seeded: the hold takes the first answer that carries a batch,
+       * and the polls in between find nothing and pass through untouched. */
+      expectOk(
+        await mock.post('/__control__/scenarios', { key: 'resultsLatestDelay', delayMs, once: true }),
+        'hold the next results answer that carries a batch at the mock',
+      )
+      expectOk(
+        await mock.post(`/__control__/orders/${overlapRequisitionId}/results`, {}),
+        'seed the result whose batch will be held',
+      )
+
+      const completed = await pollUntil(
+        async () => await org.api.get(`/orders/${overlapOrderId}`),
+        (r) => r.body?.status === 'COMPLETED',
+        90_000,
+        2_000,
+      )
+      expect(completed.body.status).toBe('COMPLETED')
+
+      /* The held answer has been sent and the batch confirmed at least once. Then two more poll
+       * intervals, so that a second poll's confirm, racing the first, would have landed too. */
+      const batchesFor = async (): Promise<LedgerBatch[]> => {
+        const ledger = expectOk<{ batches: LedgerBatch[] }>(
+          await mock.get('/__control__/batches'),
+          'read the mock results-batch ledger',
+        )
+        return ledger.batches.filter((batch) => batch.requisitionIds.includes(overlapRequisitionId))
+      }
+      await pollUntil(
+        batchesFor,
+        (batches) => batches.some((batch) => batch.holds.some((hold) => hold.sent) && batch.confirms.length > 0),
+        delayMs + 30_000,
+        500,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 2 * pollMs))
+      const batches = await batchesFor()
+      console.log(`[idexx-scenario] results-batch ledger for the held order -> ${JSON.stringify(batches)}`)
+
+      /* THE POINT OF THIS TEST, read from the provider's side. With two polls in flight, both fetch
+       * the batch (served 2) and both confirm it, and the second confirm is IDEXX's 404
+       * INVALID_BATCH_ID (confirms [200, 404]); the poll that reached the provider while the first
+       * was held is counted too. One poll at a time: served once, confirmed once with a 200, and no
+       * results poll reached the provider while the held one was in flight, because each tick
+       * meanwhile skipped.
+       *
+       * That last count is of every results poll that reaches the mock during the hold, whichever
+       * integration sent it: every integration here uses the same harness credentials, so the mock
+       * cannot tell them apart. It is 0 because this file has one idexx integration polling. A second
+       * one would break all three values with the fix in place: the mock serves its one active batch
+       * to any integration, and its lock has a different key. */
+      expect(batches.map((batch) => ({
+        pollsThatFetchedTheBatch: batch.served,
+        confirmsOfTheBatch: batch.confirms,
+        pollsThatReachedTheProviderWhileItWasHeld: batch.holds.map((hold) => hold.requestsWhileHeld),
+      }))).toEqual([{
+        pollsThatFetchedTheBatch: 1,
+        confirmsOfTheBatch: [200],
+        pollsThatReachedTheProviderWhileItWasHeld: [0],
+      }])
+
+      /* And from the PIMS's side: the report was updated once. A second delivery of the batch is a
+       * second `report:updated` for an unchanged report, which is what the PIMS saw in production. */
+      const report = expectOk<{ id: string }>(
+        await org.api.get(`/orders/${overlapOrderId}/report`),
+        'read the held order report',
+      )
+      /* Polled until the first `report:updated` is in, so that the count below does not race
+       * dmi-api's own write; a second delivery would have been emitted two intervals ago. */
+      const eventTypesFor = async (): Promise<string[]> => {
+        const events = expectOk<{ data: Array<{ type: string, data?: { orderId?: string, reportId?: string } }> }>(
+          await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+          'list events',
+        )
+        return events.data
+          .filter((event) => event.data?.orderId === overlapOrderId || event.data?.reportId === report.id)
+          .map((event) => event.type)
+      }
+      const forTheOrder = await pollUntil(
+        eventTypesFor,
+        (types) => types.includes('report:updated'),
+        30_000,
+        1_000,
+      )
+      console.log(`[idexx-scenario] events for the held order -> ${JSON.stringify(forTheOrder)}`)
+      expect({
+        reportUpdatedEvents: forTheOrder.filter((type) => type === 'report:updated').length,
+      }).toEqual({ reportUpdatedEvents: 1 })
+    }, 30_000 + 90_000 + (delayMs + 30_000) + 2 * pollMs + 30_000 + 10_000)
   })
 })

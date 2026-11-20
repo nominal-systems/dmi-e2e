@@ -22,7 +22,7 @@ import { closePool } from '../src/sql'
  * the fix's no-hint fallback, which is why the throttled tests get a longer timeout. This suite runs
  * under NODE_ENV=seed, where `createOrder` returns before the engine round-trip, so "and is sent" is
  * outside it: what is proven is that the request no longer fails and that the retry really happens.
- * The idexx loop's last test (scenarios/idexx-full-stack.e2e.ts) proves the order is still sent. */
+ * The idexx loop's dmi-api#371 test (scenarios/idexx-full-stack.e2e.ts) proves the order is still sent. */
 
 /* Never sent to a provider under NODE_ENV=seed; it only has to be present (see tenant-isolation). */
 const ANY_TEST_CODE = [{ code: 'HARNESS-EVENT-STORE-THROTTLING' }]
