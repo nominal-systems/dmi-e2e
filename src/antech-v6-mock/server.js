@@ -6,8 +6,9 @@
  * container — to drive it unmodified: per-request login, the two status feeds, the results feed,
  * both acknowledge channels, the species/breed and test-guide reference endpoints, the TRF
  * document, and BOTH placement endpoints (pre-order and order). A separate control plane
- * (`/__control__/*`) lets tests seed results, promote a draft, inspect what the mock received and
- * inject error scenarios, so the order -> result -> report loop is deterministic and CI-safe.
+ * (`/__control__/*`) lets tests seed results, promote a draft, inspect what the mock received,
+ * inject error scenarios and switch on the redelivery production has shown (load-bearing detail
+ * 8), so the order -> result -> report loop is deterministic and CI-safe.
  *
  * Error scenarios are armed per operation (`placeOrder`, `getStatus`, … — see `freshState`) with
  * `POST /__control__/scenarios`: `{key, status, body, once}` for a body the test spells out, or
@@ -52,8 +53,13 @@
  *       wire value of `OrderStatus`, the token-placement split on `/Tests/v6`, the TRF's 500 and
  *       the one observed placement rejection come from. Anything marked OBSERVED below was seen on
  *       that endpoint; anything marked INFERRED or INVENTED was not, and says so.
+ *   (c) Production, as the integration's and dmi-api's logs show it. One behaviour so far, the
+ *       redelivery of acknowledged records (load-bearing detail 8), marked OBSERVED IN
+ *       PRODUCTION: no probe can provoke it, so it is the one thing here that comes from neither
+ *       the source nor the development endpoint.
  *
- * The mock is built from (b) where the two disagree, because (a) is the thing under test.
+ * The mock is built from (b) and (c) where they disagree with (a), because (a) is the thing under
+ * test.
  *
  * ---------------------------------------------------------------------------------------------
  * THE LOAD-BEARING DETAILS, in the order they will bite someone
@@ -99,6 +105,42 @@
  *    fully unmapped patient fails here exactly as it fails at Antech. Trimming the tree so that 49
  *    contained 370 would make the mock green on the one payload the vendor refuses.
  *
+ * 8. AN ACKNOWLEDGED RECORD CAN COME BACK, UNCHANGED, FOR HOURS. OBSERVED IN PRODUCTION, in two
+ *    windows in November 2026 (an evening on the 12th, and two and a quarter hours on the 17th):
+ *    Antech kept returning records the integration had already acknowledged, on BOTH feeds the
+ *    integration polls, while answering every `AckStatus` 200. `GetAllResults` returned the same
+ *    results on every poll, each one re-fetched, re-emitted and re-acknowledged (a median of 11
+ *    times); the labOrder status feed (`overrideAck=false`) returned the same orders, and for each
+ *    the integration fetched the TRF again and re-emitted the order with it. The payloads were
+ *    identical each time, and then it stopped by itself. Nothing is known about why, so the mock
+ *    does not do it on its own — a provider behaviour that comes and goes would make the loop test
+ *    the clock, as the visibility window below would. A test switches it on, per order and per
+ *    channel, with `POST /__control__/orders/:id/redelivery` (`{results, orders}`, each true or
+ *    false), and off again. While a channel is on, the order's record on that feed is served on
+ *    every poll whether or not it was acknowledged, an acknowledgement is still answered 200 and
+ *    still recorded, and the window's own counters (`redelivery.results` / `redelivery.orders` on
+ *    `GET /__control__/orders/:id`: `served`, `acked`) count each serving and each
+ *    acknowledgement. Switched off, the record is governed by its acknowledgement again, so one
+ *    acknowledged during the window leaves the feed, as it did in production. Re-seeding a
+ *    result leaves the switch as it is, which is how a test changes a record while it is being
+ *    redelivered. The labResult status feed is left alone: the integration reads it only with
+ *    `overrideAck=true`, so what its unacknowledged view did in those windows was not seen. What
+ *    dmi-api does with such a redelivery is nominal-systems/dmi-api#409.
+ *
+ * 9. THE TRF IS REGENERATED ON EVERY FETCH. OBSERVED IN PRODUCTION, in the same windows: each
+ *    redelivery of one order carried a TRF whose bytes differed from the last (its base64 length
+ *    wandering by a few hundred characters either way), under the same URL and content type. So
+ *    "the same order form" is the same accession's form, never the same bytes, and the mock serves
+ *    a fresh document per fetch: a generation counter, a creation time and a run of synthetic
+ *    filler of varying length. A mock that served one fixed body per accession would let an
+ *    integration or a dmi-api that compared the PDF's bytes look as if it recognised a redelivered
+ *    form, which production shows it cannot. Each fetch's digest is kept on the order
+ *    (`trfDigests` on `GET /__control__/orders/:id`), so a test can prove the bytes really
+ *    differed, and beside it the `OrderStatus` the labOrder feed last served the order at
+ *    (`trfOrderStatuses`, harness bookkeeping): the integration reads the feed, then fetches each
+ *    order's TRF, then emits, one poll at a time, so that is the status the form went out with, and
+ *    a test can tell which fetch's form dmi-api stored.
+ *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL
  *
@@ -116,7 +158,9 @@
  *   zoetis mock, which does model re-notification — its provider advertises the acknowledged
  *   status in the link it hands back. Assertion strength does not transfer between loops; see
  *   CLAUDE.md.) A test that needs a record re-offered asks for it explicitly, through the control
- *   plane's `replay` flag, which is labelled as a harness action rather than a provider rule.
+ *   plane's `replay` flag, which is labelled as a harness action rather than a provider rule. The
+ *   one way back onto a feed the provider HAS been seen to take is the unchanged redelivery of
+ *   load-bearing detail 8, and that too is off until a test switches it on.
  * - **Whether `POC_FLAG=N` is accepted.** Only `Y` (accepted) and `Z` (rejected) were observed. The
  *   integration only ever sends `Y`. The mock therefore treats any value other than `Y` as invalid,
  *   which is the conservative reading of one data point, not a verified rule.
@@ -130,7 +174,7 @@
  */
 
 const http = require('http')
-const { randomUUID } = require('crypto')
+const { createHash, randomInt, randomUUID } = require('crypto')
 
 const PORT = Number(process.env.PORT || 3000)
 
@@ -864,10 +908,21 @@ function handleGetStatus (req, res, params, query) {
 
   if (serviceType === 'labOrder') {
     state.calls.getStatusLabOrder += 1
-    const entries = records
-      .filter((order) => overrideAck || !order.orderAcked)
-      .map(buildLabOrderStatus)
-    sendJson(res, 200, { LabOrders: entries, LabResults: [] })
+    /* An order whose orders-channel redelivery is on stays in the unacknowledged view however
+     * often it is acknowledged (load-bearing detail 8). */
+    const served = records.filter((order) => overrideAck || !order.orderAcked || order.redelivery.orders.on)
+    /* The status the form fetched next goes out with (load-bearing detail 9). */
+    for (const order of served) order.lastServedOrderStatus = order.orderStatus
+    if (!overrideAck) {
+      for (const order of served) {
+        if (!order.redelivery.orders.on) continue
+        order.redelivery.orders.served += 1
+        if (order.orderAcked) {
+          log(`redelivering acknowledged order ${order.clinicAccessionId} (served ${order.redelivery.orders.served} while on)`)
+        }
+      }
+    }
+    sendJson(res, 200, { LabOrders: served.map(buildLabOrderStatus), LabResults: [] })
     return
   }
 
@@ -951,7 +1006,9 @@ function buildLabResultStatus (order) {
  * No query parameters at all — not even ClinicID (OBSERVED; the token is the whole of the scoping).
  * A BARE ARRAY of result documents not yet acknowledged on the labResult channel. Modelling the
  * acknowledge semantics here is the point: a mock that served results unconditionally forever
- * would leave the integration's ack path untested and would hide a redelivery loop. */
+ * would leave the integration's ack path untested and would hide a redelivery loop. The one
+ * exception is a test's own: a result whose order has its results-channel redelivery switched on
+ * is served whether or not it was acknowledged (load-bearing detail 8). */
 function handleGetAllResults (req, res) {
   if (requireHeaderToken(req, res) == null) return
   state.calls.getAllResults += 1
@@ -962,9 +1019,25 @@ function handleGetAllResults (req, res) {
     return
   }
 
-  const pending = [...state.results.values()].filter((result) => !result.acknowledged)
-  for (const result of pending) result.servedCount += 1
+  const pending = [...state.results.values()].filter(
+    (result) => !result.acknowledged || isRedeliveringResult(result),
+  )
+  for (const result of pending) {
+    result.servedCount += 1
+    if (isRedeliveringResult(result)) {
+      const window = state.orders.get(result.clinicAccessionId).redelivery.results
+      window.served += 1
+      if (result.acknowledged) {
+        log(`redelivering acknowledged result ${result.labAccessionId} (served ${window.served} while on)`)
+      }
+    }
+  }
   sendJson(res, 200, pending.map((result) => result.document))
+}
+
+/* Whether a result's order has its results-channel redelivery switched on. */
+function isRedeliveringResult (result) {
+  return state.orders.get(result.clinicAccessionId)?.redelivery.results.on === true
 }
 
 /* GET /LabResults/v6/OrphanResults
@@ -989,7 +1062,10 @@ function handleOrphanResults (req, res) {
  *
  * Acking an order removes it from the `overrideAck=false` order feed; acking a result removes it
  * from GetAllResults (and from the `overrideAck=false` result feed). That is the whole of the
- * self-quieting behaviour that keeps the loop from replaying every tick. */
+ * self-quieting behaviour that keeps the loop from replaying every tick — except for an order a
+ * test has switched into redelivery (load-bearing detail 8), whose acknowledgement is answered
+ * and recorded the same way and counted in the window, and leaves the record on the feed until
+ * the switch goes off. */
 async function handleAckStatus (req, res) {
   if (requireHeaderToken(req, res) == null) return
 
@@ -1023,6 +1099,7 @@ async function handleAckStatus (req, res) {
         order.orderAckedAt = new Date().toISOString()
         order.orderAckedStatus = order.orderStatus
         order.orderAckCount += 1
+        if (order.redelivery.orders.on) order.redelivery.orders.acked += 1
       } else {
         unknown.push(id)
       }
@@ -1055,6 +1132,7 @@ async function handleAckStatus (req, res) {
         if (order != null) {
           order.resultStatusAcked = true
           order.resultAckCount += 1
+          if (order.redelivery.results.on) order.redelivery.results.acked += 1
         }
       } else {
         unknown.push(id)
@@ -1191,17 +1269,32 @@ function handleTrf (req, res, params) {
     return
   }
 
-  /* A minimal, structurally valid PDF. Synthetic: it carries the accession id and nothing else, so
-   * no captured document is reproduced. The `%PDF-1.7` prefix and the application/pdf content type
-   * are what matter — the latter is also what makes the integration's interceptor replace the
-   * binary body with a stub in the audit record instead of storing it inline. */
+  /* A minimal, structurally valid PDF. Synthetic: it carries the accession id and nothing else of
+   * the order, so no captured document is reproduced. The `%PDF-1.7` prefix and the
+   * application/pdf content type are what matter — the latter is also what makes the
+   * integration's interceptor replace the binary body with a stub in the audit record instead of
+   * storing it inline.
+   *
+   * REGENERATED PER FETCH (load-bearing detail 9): a generation number, a creation time and filler
+   * of a random length make every fetch's bytes, and usually its length, differ from the last, as
+   * production's do. The digest of each fetch is kept so a test can see that they did. */
+  const generation = order.trfDigests.length + 1
   const pdf =
     '%PDF-1.7\n' +
     '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n' +
     '2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n' +
-    `% synthetic harness TRF for ${params.clinicAccessionId}\n` +
-    'trailer\n<< /Root 1 0 R >>\n%%EOF\n'
+    `3 0 obj\n<< /Producer (dmi-e2e antech-v6-mock) /CreationDate (D:${pdfDate(new Date())}) >>\nendobj\n` +
+    `% synthetic harness TRF for ${params.clinicAccessionId}, generation ${generation}\n` +
+    `% ${'x'.repeat(randomInt(0, 240))}\n` +
+    `trailer\n<< /Root 1 0 R /Info 3 0 R /ID [<${randomUUID().replace(/-/g, '')}>] >>\n%%EOF\n`
+  order.trfDigests.push(createHash('sha256').update(pdf).digest('hex'))
+  order.trfOrderStatuses.push(order.lastServedOrderStatus)
   sendPdf(res, 200, pdf)
+}
+
+/* A PDF date string, `YYYYMMDDHHmmSSZ`, to the second. */
+function pdfDate (date) {
+  return date.toISOString().replace(/[-:T]/g, '').replace(/\.\d{3}Z$/, 'Z')
 }
 
 /* ---- placement ----
@@ -1305,6 +1398,18 @@ function recordPlacement (body, kind) {
     resultStatusAcked: false,
     resultAckCount: 0,
     trfFetches: 0,
+    /* sha256 of each TRF served for this order, in order, and beside each the OrderStatus the
+     * labOrder feed last served the order at (load-bearing detail 9). */
+    trfDigests: [],
+    trfOrderStatuses: [],
+    lastServedOrderStatus: null,
+    /* The production redelivery of load-bearing detail 8, per channel: off until a test switches
+     * it on with POST /__control__/orders/:id/redelivery. `served`/`acked` count only while on, and
+     * start again from zero each time the channel is switched on. */
+    redelivery: {
+      results: { on: false, served: 0, acked: 0 },
+      orders: { on: false, served: 0, acked: 0 },
+    },
     clinicId: String(body.ClinicID),
     labId: body.LabID === undefined ? null : Number(body.LabID),
     /* Echoed straight back from the request — every one of these was validated above, so none is a
@@ -1425,6 +1530,17 @@ function publicOrder (order) {
     /* How many times the integration fetched this order's TRF. Zero is the assertion for a
      * POC-only order; >= 1 is the assertion for a reference-lab one. */
     trfFetches: order.trfFetches,
+    /* The sha256 of each TRF document served for it, oldest first: regenerated per fetch, so
+     * distinct (load-bearing detail 9). A TRF the mock refused is not listed. */
+    trfDigests: [...order.trfDigests],
+    /* Beside each digest, the OrderStatus the labOrder feed last served the order at when that
+     * TRF was fetched: the status of the delivery the form went out with. Harness bookkeeping. */
+    trfOrderStatuses: [...order.trfOrderStatuses],
+    /* The redelivery switch and its window counters, per channel (load-bearing detail 8). */
+    redelivery: {
+      results: { ...order.redelivery.results },
+      orders: { ...order.redelivery.orders },
+    },
     clinicId: order.clinicId,
     labId: order.labId,
     petId: order.pet.id,
@@ -1545,6 +1661,54 @@ async function handleControlSetStatus (req, res, params) {
     if (result != null) result.document.OrderStatus = order.orderStatus
   }
   log(`control: ${order.clinicAccessionId} OrderStatus=${order.orderStatus} replay=${body.replay !== false}`)
+  sendJson(res, 200, publicOrder(order))
+}
+
+/* Switch the production redelivery of load-bearing detail 8 on or off for one order, per channel.
+ * Body: `{results, orders}`, each `true` or `false`; a channel left out keeps its setting.
+ *
+ *   results -> GetAllResults serves this order's result on every poll, acknowledged or not
+ *   orders  -> the labOrder status feed (`overrideAck=false`) serves this order on every poll,
+ *              acknowledged or not, so the integration fetches its TRF and emits it each time
+ *
+ * Unlike `replay` above, this IS a claim about the provider: it was OBSERVED IN PRODUCTION, and it
+ * is switched rather than always on only because nothing says when it happens. A channel switched
+ * from off to on starts its window counters (`served`, `acked`) from zero; switching on a channel
+ * that is on already leaves them. Switched off, a record acknowledged during the window stays
+ * acknowledged and leaves the feed. Re-seeding the result does not touch the switch. */
+async function handleControlRedelivery (req, res, params) {
+  const body = await readJson(req)
+  const order = state.orders.get(params.clinicAccessionId)
+  if (order == null) {
+    sendJson(res, 404, { message: `no order for ClinicAccessionID ${params.clinicAccessionId}` })
+    return
+  }
+  const channels = ['results', 'orders'].filter((channel) => body[channel] !== undefined)
+  if (channels.length === 0 || channels.some((channel) => typeof body[channel] !== 'boolean')) {
+    sendJson(res, 400, {
+      message: 'redelivery takes "results" and/or "orders", each true (redeliver on every poll) or false (stop)',
+    })
+    return
+  }
+  if (order.kind !== 'order' && channels.some((channel) => body[channel] === true)) {
+    sendJson(res, 400, {
+      message: `${params.clinicAccessionId} is a pre-order (a draft): it is on neither feed, so there is nothing to redeliver; promote it first`,
+    })
+    return
+  }
+
+  for (const channel of channels) {
+    const window = order.redelivery[channel]
+    if (body[channel] === true && !window.on) {
+      order.redelivery[channel] = { on: true, served: 0, acked: 0 }
+    } else if (body[channel] === false) {
+      window.on = false
+    }
+  }
+  log(
+    `control: ${order.clinicAccessionId} redelivery results=${order.redelivery.results.on} ` +
+      `orders=${order.redelivery.orders.on}`,
+  )
   sendJson(res, 200, publicOrder(order))
 }
 
@@ -1943,6 +2107,7 @@ const routes = [
   ['GET', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)\/result$/, handleControlResultState],
   ['POST', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)\/promote$/, handleControlPromote],
   ['POST', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)\/status$/, handleControlSetStatus],
+  ['POST', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)\/redelivery$/, handleControlRedelivery],
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<clinicAccessionId>[^/]+)$/, handleControlGetOrder],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
