@@ -47,8 +47,8 @@ import { closePool, query } from '../src/sql'
  *    own: the results channel on the order whose result it redelivers, the orders channel on the
  *    promoted draft whose order form it redelivers. Seeding a result moves the mock's provider
  *    status to `Partial` or `Final`, so every result in this file — the headline order's, the
- *    CBC's, the promoted draft's, both of the partial order's deliveries and both of the
- *    redelivered result's — is seeded only once the orders poll has
+ *    CBC's, the promoted draft's, both of the partial order's deliveries, both of the redelivered
+ *    result's and the one delivered beside it — is seeded only once the orders poll has
  *    acknowledged that order at `Submitted`, and the mock refuses a seed for an order it has not
  *    (409, unless the seed passes `allowUnacked`). That wait is what makes the order's PARTIAL or
  *    COMPLETED in those tests the results channel's alone. A report's PARTIAL or FINAL needs no
@@ -2322,6 +2322,20 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       return createHash('sha256').update(Buffer.from(base64, 'base64')).digest('hex')
     }
 
+    /* The mock's record of an order's seeded result: whether it is acknowledged, how often it was
+     * served and acknowledged, and which GetAllResults calls carried it. */
+    async function resultStateOf (requisitionId: string): Promise<{
+      acknowledged: boolean
+      servedCount: number
+      ackCount: number
+      servedInCalls: number[]
+    }> {
+      return expectOk(
+        await mock.get(`/__control__/orders/${encodeURIComponent(requisitionId)}/result`),
+        `read the seeded result state of ${requisitionId}`,
+      )
+    }
+
     afterAll(async () => {
       /* Leave the mock as the later describes expect it: nothing redelivered. */
       for (const requisitionId of switchedOn) {
@@ -2434,6 +2448,97 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         ['GLOB', 3.6],
       ])
     }, ORDER_ACK_WAIT_MS * 2 + COMPLETION_WAIT_MS + STATUS_APPLIED_WAIT_MS + REDELIVERY_WAIT_MS + 30_000)
+
+    it('another order\'s new result goes through in the same poll as the unchanged redelivered result', async () => {
+      /* The positive control for the test above, as the one after the order-form test is for the
+       * orders half. "No report:updated" is also what a dmi-api whose results handler FAILED on the
+       * redelivered result would show, so that test cannot tell a redelivery recognised as unchanged
+       * from one that crashed the handler. The results poll reads GetAllResults once and hands
+       * dmi-api every result it read in ONE `external_results` event, and dmi-api goes through the
+       * reports it already has one after the other and sends their events only after the last of
+       * them, so a throw on any one of them leaves every report's event unsent. A result for a
+       * second order, served in the same GetAllResults response as the redelivered one, gets its
+       * `report:updated` only if the unchanged one was handled. That it was the same response is
+       * checked at the mock, which records the GetAllResults calls that carried each result: while
+       * the redelivery is on, every call carries the redelivered result, and the check makes sure
+       * the one that carried the new result did.
+       *
+       * The second order is point-of-care, placed and acknowledged at `Submitted` before its result
+       * is seeded (the file header, point 3), and its result is a real change: its first, taking
+       * the report from REGISTERED to FINAL and the order from SUBMITTED to COMPLETED. Runs on the
+       * order the test above left in redelivery. */
+      if (resultOrderId === '' || resultReportId === '') {
+        throw new Error('the redelivery test above left no redelivered result for this test to share a poll with')
+      }
+      expect((await mockOrder(resultRequisitionId)).redelivery.results.on).toBe(true)
+
+      const { orderId: mateOrderId, requisitionId: mateRequisitionId } = await placeAcknowledgedOrder('result mate')
+      const mateReportId = expectOk<ReportBody>(
+        await org.api.get(`/orders/${mateOrderId}/report`),
+        'read the empty report of the order whose result changes',
+      ).id
+      const storedBefore = await storedWrites(resultOrderId, resultReportId)
+      const watermark = await latestSeq()
+
+      expectOk(
+        await mock.post(`/__control__/orders/${encodeURIComponent(mateRequisitionId)}/results`, {
+          unitCodeResults: [{ orderCode: KIDNEY_PANEL_CODE, testCodeResults: KIDNEY_PANEL }],
+          pendingTestCount: 0,
+          totalTestCount: 1,
+        }),
+        'seed the second order\'s result while the first is being redelivered',
+      )
+      /* Acknowledged: the poll that served it has emitted it to dmi-api. */
+      const mate = await pollUntil(
+        async () => await resultStateOf(mateRequisitionId),
+        (state) => state.acknowledged && state.ackCount >= 1,
+        ORDER_ACK_WAIT_MS,
+        1_000,
+      )
+
+      /* One poll: the new result was served once, and the GetAllResults call that carried it carried
+       * the redelivered result too. Were they served in polls of their own, a handler that failed
+       * on the unchanged result would fail only its own poll, and this test would pass anyway. */
+      const redelivered = await resultStateOf(resultRequisitionId)
+      expect({
+        order: mateRequisitionId,
+        served: mate.servedInCalls.length,
+        acked: mate.ackCount,
+        servedWithoutTheRedelivered: mate.servedInCalls.filter((call) => !redelivered.servedInCalls.includes(call)),
+      }).toEqual({ order: mateRequisitionId, served: 1, acked: 1, servedWithoutTheRedelivered: [] })
+
+      /* THE POINT OF THIS TEST. The new result is reported, so the batch it came in was handled to
+       * the end: one `report:updated`, carrying its values, and the order's completion. */
+      const told = await pollUntil(
+        async () => await eventsFor(watermark, { orderId: mateOrderId, reportId: mateReportId }),
+        (events) => events.some((event) => event.type === 'report:updated') && events.some((event) => event.type === 'order:updated'),
+        STATUS_APPLIED_WAIT_MS,
+        1_000,
+      )
+      expect({
+        order: mateRequisitionId,
+        events: countByType(told),
+        bunReported: told.filter((event) => event.type === 'report:updated').map(bunIn),
+      }).toEqual({
+        order: mateRequisitionId,
+        events: { 'order:updated': 1, 'report:updated': 1 },
+        bunReported: [24.3],
+      })
+      expect((await org.api.get(`/orders/${mateOrderId}/report`)).body.status).toBe('FINAL')
+      expect((await observationsFor(mateOrderId)).map((observation) => [observation.code, observation.valueQuantity?.value])).toEqual([
+        ['BUN', 24.3],
+        ['CREA', 2.4],
+        ['GLOB', 3.6],
+      ])
+      expect((await org.api.get(`/orders/${mateOrderId}`)).body.status).toBe('COMPLETED')
+
+      /* And the redelivered result, handled in that poll, still changed nothing. */
+      expect({
+        order: resultRequisitionId,
+        eventsWhileRedelivered: countByType(await eventsFor(watermark, { orderId: resultOrderId, reportId: resultReportId })),
+      }).toEqual({ order: resultRequisitionId, eventsWhileRedelivered: {} })
+      expect(await storedWrites(resultOrderId, resultReportId)).toEqual(storedBefore)
+    }, ORDER_ACK_WAIT_MS * 2 + STATUS_APPLIED_WAIT_MS + 30_000)
 
     it('a real change made while the result is being redelivered still goes through', async () => {
       /* The guard against a fix that simply stops applying redelivered results: the lab amends the

@@ -299,9 +299,13 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   order's record is served on every poll whether or not it was acknowledged, its acknowledgements
   are answered and recorded, and the window's counters (`redelivery.results` /
   `redelivery.orders`: `served`, `acked`) count both; switched off, a record acknowledged in the
-  window leaves the feed. Re-seeding a result leaves the switch as it is. With it, the loop asserts
+  window leaves the feed. Re-seeding a result leaves the switch as it is, and each result lists the
+  `GetAllResults` calls that carried it (`servedInCalls` on `GET /__control__/orders/<id>/result`).
+  With it, the loop asserts
   [dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409): an identical redelivered
-  result writes nothing and sends no `report:updated` or `order:updated`; an amendment made while
+  result writes nothing and sends no `report:updated` or `order:updated`, while another order's new
+  result served in the same `GetAllResults` response is still reported (so the silence is not a
+  handler that failed); an amendment made while
   the result is being redelivered still reaches the report, and is reported once however often it
   is redelivered after; an order re-offered with a regenerated order form sends no `order:updated`
   and keeps the form first stored, while another order's status change read in the same poll is

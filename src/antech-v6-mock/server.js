@@ -519,8 +519,8 @@ function freshState () {
      * polled result to its order purely on it (the antech-v6 result mapper attaches no `.order` to
      * a non-orphan result, so dmi-api's patient-matching guard is never consulted). */
     orders: new Map(),
-    /* LabAccessionID -> { clinicAccessionId, document, acknowledged, servedCount, ackCount }. The
-     * GetAllResults feed. */
+    /* LabAccessionID -> { clinicAccessionId, document, acknowledged, servedCount, servedInCalls,
+     * ackCount }. The GetAllResults feed. */
     results: new Map(),
     /* Error/edge injection: { [key]: { status, body, envelope, once } }, `envelope` naming one of
      * `ENVELOPES` (and then no `body`). Keys are logical operation names — 'login', 'getStatus',
@@ -1024,6 +1024,9 @@ function handleGetAllResults (req, res) {
   )
   for (const result of pending) {
     result.servedCount += 1
+    /* Which GetAllResults calls carried it, numbered by the call counter: two results served in
+     * one call reach the integration as one batch. Harness bookkeeping. */
+    result.servedInCalls.push(state.calls.getAllResults)
     if (isRedeliveringResult(result)) {
       const window = state.orders.get(result.clinicAccessionId).redelivery.results
       window.served += 1
@@ -1930,6 +1933,7 @@ async function handleControlSeedResult (req, res, params) {
     acknowledged: false,
     acknowledgedAt: null,
     servedCount: existing?.servedCount ?? 0,
+    servedInCalls: existing?.servedInCalls ?? [],
     ackCount: existing?.ackCount ?? 0,
   })
   order.resultLabAccessionId = order.labAccessionId
@@ -1972,6 +1976,10 @@ function handleControlResultState (req, res, params) {
      * assertion that catches a mock (or an integration) that stopped draining the feed. */
     servedCount: result.servedCount,
     ackCount: result.ackCount,
+    /* The numbers of the GetAllResults calls that carried it (the `getAllResults` counter of
+     * `GET /__control__/calls` as each call made it), oldest first: a test can tell from them that
+     * two results reached the integration in one response, and so in one batch. */
+    servedInCalls: [...result.servedInCalls],
   })
 }
 
