@@ -286,6 +286,33 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
   `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
+  In November 2026 production twice saw Antech V6 return records the integration had already
+  acknowledged, unchanged, on every poll and on both feeds, while answering every `AckStatus` 200,
+  until it stopped by itself: the same results from `GetAllResults`, and the same orders from the
+  labOrder status feed, each fetched with a freshly generated order form (TRF), whose bytes differ
+  on every fetch. The mock models both, from what production showed (load-bearing details 8 and 9
+  in its header): its TRF endpoint serves a new document per fetch and keeps each one's digest
+  (`trfDigests` on `GET /__control__/orders/<id>`), beside the provider status of the delivery it
+  went out with (`trfOrderStatuses`), and
+  `POST /__control__/orders/<id>/redelivery` with `{results, orders}`, each `true` or `false`,
+  switches one order into that redelivery, per feed, and out again. While a feed is on, the
+  order's record is served on every poll whether or not it was acknowledged, its acknowledgements
+  are answered and recorded, and the window's counters (`redelivery.results` /
+  `redelivery.orders`: `served`, `acked`) count both; switched off, a record acknowledged in the
+  window leaves the feed. Re-seeding a result leaves the switch as it is, and each result lists the
+  `GetAllResults` calls that carried it (`servedInCalls` on `GET /__control__/orders/<id>/result`).
+  With it, the loop asserts
+  [dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409): an identical redelivered
+  result writes nothing and sends no `report:updated` or `order:updated`, while another order's new
+  result served in the same `GetAllResults` response is still reported (so the silence is not a
+  handler that failed); an amendment made while
+  the result is being redelivered still reaches the report, and is reported once however often it
+  is redelivered after; an order re-offered with a regenerated order form sends no `order:updated`
+  and keeps the form first stored, while another order's status change read in the same poll is
+  still applied (so the silence is not a handler that failed); a status change to the re-offered
+  order itself is one `order:updated`, stored with the form fetched for it, however often the
+  changed order is re-offered after; and once the redelivery stops, both records stay off the
+  feeds.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
@@ -517,6 +544,14 @@ the integration's own source (`zoetis.service.ts`, `helpers/zoetis-order.helper.
   provider, so an endpoint would be fiction.
 - **Control plane** (`/__control__/*`, host-facing): seed a result, list/inspect received orders, read
   the catalogue, reset, inject error scenarios — the same determinism story as the other two mocks.
+  Two more are Zoetis's own. `POST /__control__/orders/<ref>/cancel` cancels an order as the provider
+  would of its own accord, with no call from the practice. Since dmi-api#409, dmi-api leaves alone an
+  order delivered in the state it already holds, so the order dmi-api cancels itself only shows that
+  its CANCELLED delivery changes nothing. The provider-cancelled order is the one that shows dmi-api
+  accepting the orders poll's CANCELLED reading (SUBMITTED → CANCELLED, one `order:updated`). The
+  feeds view counts the orders feeds served, and each order records the last feed that listed it. A
+  scenario can then tell that two orders arrived in one `external_orders` message, and wait for a
+  later poll cycle instead of sleeping.
 
 **Element multiplicity is the fussy part here**, where Antech's was CDATA and attribute sensitivity.
 `xmlbuilder2`'s object format gives an object for a lone child and an array for repeated ones, and
@@ -740,7 +775,9 @@ scenarios/
                               (dmi-engine-idexx-integration#88)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
-  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end
+  antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
+                              and a result or order the provider redelivers unchanged changes nothing
+                              (dmi-api#409)
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
                               end to end, and one order dmi-api cannot save does not cost the rest of its
                               batch (dmi-api#411)
