@@ -981,12 +981,14 @@ describe('zoetis full-stack (Zoetis mock)', () => {
     type OrderEvent = { seq: number, type: string, data?: { orderId?: string, status?: string } }
 
     /* The order:updated events for one order above a watermark, oldest first, reduced to what a
-     * failure should show (seq and the status the event carried). */
+     * failure should show (seq and the status the event carried). The page must hold every event
+     * above the watermark, or a count of them could be short. */
     async function orderUpdatesAfter (id: string, seq: number): Promise<Array<{ seq: number, status?: string }>> {
-      const events = expectOk<{ data: OrderEvent[] }>(
+      const events = expectOk<{ total: number, data: OrderEvent[] }>(
         await org.api.get('/events', { start_seq: seq, limit: 1000 }),
         'read the event stream after the cancel watermark',
       )
+      expect({ afterSeq: seq, onThePage: events.data.length }).toEqual({ afterSeq: seq, onThePage: events.total })
       return events.data
         .filter((event) => event.type === 'order:updated' && event.data?.orderId === id && event.seq > seq)
         .sort((a, b) => a.seq - b.seq)
