@@ -1,0 +1,81 @@
+# The standalone integrations built against a dmi-engine-common checkout. The harness adds this file
+# to docker-compose.yml (`-f docker-compose.yml -f docker-compose.common-checkout.yml`) only when
+# DMI_ENGINE_COMMON_DIR names a checkout; unset, it is not read at all, and the three images are
+# built from their repos' Dockerfiles exactly as docker-compose.yml says. A slot tree made with
+# `scripts/slot-tree.sh <n> --common` names both files in its .env (COMPOSE_FILE), so a bare
+# `docker compose` there builds what the harness does.
+#
+# Why a second file. The engine image's Dockerfile is inline in docker-compose.yml, so it carries the
+# opt-in as a conditional. The idexx, classic-antech and zoetis images are built from their own
+# repos' Dockerfiles, which this repo does not change and compose cannot make conditional. So here
+# each is built in two steps:
+#   1. `<service>-published`: the service exactly as docker-compose.yml defines it (`extends`), i.e.
+#      its own Dockerfile's `production` stage, published common included. Build-only: no replicas,
+#      so compose builds it and starts nothing.
+#   2. the service itself, FROM that image, with the checkout built and packed and installed over
+#      the published package — one copy, the checkout's, file for file, or the build fails.
+# What this tests, and what not: the integration's code as its own build compiled it (against the
+# common its lockfile pins), RUN against the checkout's. A change in the checkout's types is not seen
+# here; the engine image, which compiles against the checkout, does see one.
+#
+# Keep the common stage in step with stage 0 of the engine image in docker-compose.yml. Every image
+# named here follows the compose project, as src/slots.js requires (the `-published` images take
+# compose's own `<project>-<service>` name).
+
+x-common-checkout-build: &common-checkout-build
+  context: ${DMI_ENGINE_COMMON_DIR:?the harness reads this file only with DMI_ENGINE_COMMON_DIR set}
+  dockerfile_inline: |
+    # The checkout, built and packed (as stage 0 of the engine image). (Doubled dollars: compose
+    # substitutes its own variables in this inline file before Docker sees it.)
+    FROM node:20-alpine AS common
+    WORKDIR /common
+    COPY . .
+    RUN [ -f package.json ] && [ "$$(node -p 'require("./package.json").name')" = @nominal-systems/dmi-engine-common ] \
+        || { echo "DMI_ENGINE_COMMON_DIR names no dmi-engine-common checkout" >&2; exit 1; }; \
+        rm -rf lib node_modules \
+        && npm ci --no-audit --no-fund \
+        && npm run build \
+        && mkdir /packs && npm pack --pack-destination /packs
+    # The integration's production image, with the pack installed over the published package.
+    FROM integration AS production
+    RUN --mount=type=bind,from=common,source=/packs,target=/packs \
+        npm install --no-save --no-audit --no-fund /packs/nominal-systems-dmi-engine-common-*.tgz \
+        && copies=$$(find node_modules -path '*/@nominal-systems/dmi-engine-common/package.json' | wc -l) \
+        && { [ "$$copies" -eq 1 ] || { echo "dmi-engine-common is installed $$copies times, not once:" >&2; \
+             find node_modules -path '*/@nominal-systems/dmi-engine-common/package.json' >&2; exit 1; }; } \
+        && mkdir -p /tmp/common && tar -xzf /packs/nominal-systems-dmi-engine-common-*.tgz -C /tmp/common \
+        && diff -r /tmp/common/package/lib node_modules/@nominal-systems/dmi-engine-common/lib \
+        && cmp /tmp/common/package/package.json node_modules/@nominal-systems/dmi-engine-common/package.json \
+        && rm -rf /tmp/common
+
+x-published: &published
+  deploy:
+    replicas: 0
+
+services:
+  dmi-engine-idexx-integration-published:
+    extends: { file: docker-compose.yml, service: dmi-engine-idexx-integration }
+    <<: *published
+  dmi-engine-idexx-integration:
+    build:
+      <<: *common-checkout-build
+      additional_contexts:
+        integration: service:dmi-engine-idexx-integration-published
+
+  dmi-engine-antech-integration-published:
+    extends: { file: docker-compose.yml, service: dmi-engine-antech-integration }
+    <<: *published
+  dmi-engine-antech-integration:
+    build:
+      <<: *common-checkout-build
+      additional_contexts:
+        integration: service:dmi-engine-antech-integration-published
+
+  dmi-engine-zoetis-integration-published:
+    extends: { file: docker-compose.yml, service: dmi-engine-zoetis-integration }
+    <<: *published
+  dmi-engine-zoetis-integration:
+    build:
+      <<: *common-checkout-build
+      additional_contexts:
+        integration: service:dmi-engine-zoetis-integration-published

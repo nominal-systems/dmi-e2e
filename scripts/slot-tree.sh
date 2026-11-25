@@ -2,12 +2,15 @@
 # scripts/slot-tree.sh — a tree of checkouts for one harness slot, so a change to any repo the
 # harness builds from can be tested while other slots do the same on the same machine.
 #
-#   scripts/slot-tree.sh <n> [suite …]   create slot tree <n> (1–99): a worktree of dmi-e2e, of
+#   scripts/slot-tree.sh <n> [--common] [suite …]
+#                                        create slot tree <n> (1–99): a worktree of dmi-e2e, of
 #                                        dmi-api and of every checkout the named suites are built
 #                                        from (default: every loop in src/stacks.js), each detached
 #                                        at origin's default branch; `.harness-slot` = n and a `.env`
 #                                        naming the slot's compose project in its dmi-e2e; `npm ci`
-#                                        in dmi-e2e and dmi-api
+#                                        in dmi-e2e and dmi-api. --common adds a dmi-engine-common
+#                                        worktree, which the `.env` names as DMI_ENGINE_COMMON_DIR,
+#                                        so every loop run in the tree builds against it
 #   scripts/slot-tree.sh --remove <n>    take slot n's stack down (containers, volumes, the images it
 #                                        built) and remove the tree's worktrees, gitignored files
 #                                        (node_modules, reports/, builds) included. Refused while a
@@ -72,7 +75,15 @@ create() {
   [ -z "$holder" ] || die "a harness run holds slot $n (pid, since, checkout: $holder)"
   [ -n "${GHP_TOKEN:-}" ] || die "GHP_TOKEN is not set: dmi-api's npm ci resolves @nominal-systems/* from GitHub Packages and needs a read:packages token"
 
-  local named=1 suites="$*"
+  # --common: the opt-in dmi-engine-common checkout (src/stacks.js, commonCheckout), for every loop.
+  local common=0 common_repo common_var common_file arg suites=""
+  for arg in "$@"; do
+    if [ "$arg" = --common ]; then common=1; else suites="$suites $arg"; fi
+  done
+  read -r common_repo common_var common_file <<< "$(stacks common)"
+  [ "$common" = 0 ] || [ -e "$REPOS/$common_repo/.git" ] || die "--common needs a $common_repo clone in $REPOS — clone it there first"
+
+  local named=1
   if [ -z "$suites" ]; then named=0; suites=$(stacks list | tr '\n' ' '); fi
 
   # The repos: dmi-e2e and dmi-api always, then every checkout of every suite, once each. A suite
@@ -97,6 +108,7 @@ create() {
       case " $repos " in *" $repo "*) ;; *) repos="$repos $repo" ;; esac
     done <<< "$list"
   done
+  [ "$common" = 0 ] || repos="$repos $common_repo"
 
   echo "slot-tree: slot $n — tree $tree, compose project $project"
   mkdir -p "$tree"
@@ -112,7 +124,14 @@ create() {
   echo "$n" > "$tree/dmi-e2e/.harness-slot"
   { echo "# Written by scripts/slot-tree.sh for slot $n: compose reads this, so a bare \`docker compose\`"
     echo "# here addresses slot $n's stack. The harness refuses to run if it disagrees with .harness-slot."
-    slots env "$n"; } > "$tree/dmi-e2e/.env"
+    slots env "$n"
+    if [ "$common" = 1 ]; then
+      echo "# --common: every image builds against this tree's $common_repo worktree; the harness reads"
+      echo "# $common_var from here too, and a bare \`docker compose\` takes the override it needs."
+      echo "$common_var=$tree/$common_repo"
+      echo "COMPOSE_PATH_SEPARATOR=:"
+      echo "COMPOSE_FILE=docker-compose.yml:$common_file"
+    fi; } > "$tree/dmi-e2e/.env"
 
   # The harness runs these two on the host; the integrations and the engine build inside Docker.
   for repo in dmi-e2e dmi-api; do
@@ -127,7 +146,7 @@ create() {
 
 Slot $n is ready: $tree
   compose project $project; host ports +$((n * 10)) on every default (node src/slots.js ports $n)
-  suites:$kept
+  suites:$kept$([ "$common" = 0 ] || printf '\n  every loop builds against %s (%s in the .env)' "$tree/$common_repo" "$common_var")
 
 Check out a branch in each repo you change, then run the harness from the tree's dmi-e2e:
   cd $tree/<repo> && git switch -c <topic>
@@ -191,8 +210,9 @@ $out"
 }
 
 list() {
-  local tree n holder up dir
+  local tree n holder up dir common_repo common_var named
   if ! ls -d "$SLOTS"/s* >/dev/null 2>&1; then echo "no slot trees in $SLOTS"; return; fi
+  read -r common_repo common_var _ <<< "$(stacks common)"
   for tree in "$SLOTS"/s*/; do
     tree=${tree%/}; n=${tree##*/s}
     case $n in ''|*[!0-9]*) continue ;; esac
@@ -204,13 +224,20 @@ list() {
       [ -e "$dir/.git" ] || continue
       printf '    %-38s %s\n' "${dir##*/}" "$(git -C "$dir" symbolic-ref -q --short HEAD || echo "detached @ $(git -C "$dir" rev-parse --short HEAD)")"
     done
+    # Whether the tree's runs build against a common checkout: only when its .env names one.
+    named=$(sed -n "s/^[[:space:]]*$common_var[[:space:]]*=[[:space:]]*//p" "$tree/dmi-e2e/.env" 2>/dev/null | tail -1)
+    if [ -n "$named" ]; then
+      echo "    every loop builds against $named ($common_var in the .env)"
+    elif [ -e "$tree/$common_repo/.git" ]; then
+      echo "    $common_repo is not in the .env: a run builds against it only with $common_var set"
+    fi
   done
 }
 
 case "${1:-}" in
   --remove) [ $# -eq 2 ] || die "usage: $0 --remove <n>"; remove "$2" ;;
   --list) list ;;
-  ''|-h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ''|-h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
   -*) die "unknown option $1 (see $0 --help)" ;;
   *) create "$@" ;;
 esac

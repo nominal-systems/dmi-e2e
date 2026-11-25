@@ -244,6 +244,14 @@ services:
   # records all three checkouts. Needs a GitHub Packages read token (GHP_TOKEN) for
   # @nominal-systems/dmi-engine-common, like the standalone integration images.
   #
+  # dmi-engine-common comes from GitHub Packages at the version the lockfiles pin, unless
+  # DMI_ENGINE_COMMON_DIR names a dmi-engine-common checkout (opt-in, never a default: the folder
+  # beside the clones exists on most machines, and an implicit default would change every run made
+  # there). Then stage 0 builds and packs that checkout too, each module compiles against it, and the
+  # engine installs it with the modules, so the image's only copy of the package is the checkout's —
+  # stage 2 refuses the build otherwise. Unset, the context is the placeholder src/published-common,
+  # nothing extra is packed, and the image is what it was without the variable.
+  #
   # Two services, one image, as prod runs it: `api` attaches the MQTT message handlers dmi-api's
   # RPCs hit (order create, integration create → it schedules the repeatable Bull jobs) and pauses
   # its own job processing; `worker` processes the polling jobs and attaches no handlers. An order
@@ -282,25 +290,48 @@ services:
       additional_contexts:
         antech-v6-integration: ${DMI_ANTECH_V6_INTEGRATION_DIR:-../dmi-engine-antech-v6-integration}
         wisdom-panel-integration: ${DMI_WISDOM_PANEL_INTEGRATION_DIR:-../dmi-engine-wisdom-panel-integration}
+        engine-common: ${DMI_ENGINE_COMMON_DIR:-./src/published-common}
       args:
         GHP_TOKEN: ${GHP_TOKEN:-}
       dockerfile_inline: |
-        # Stage 1: build and pack each provider module from its checkout.
+        # Stage 0: a dmi-engine-common checkout, when DMI_ENGINE_COMMON_DIR names one, built and packed
+        # into /packs. The placeholder (the variable unset) packs nothing; any other directory is
+        # refused, so a mistyped path cannot quietly fall back to the published package.
+        # (Doubled dollars: compose substitutes its own variables in this inline file before Docker
+        # sees it.)
+        FROM node:20-alpine AS common
+        WORKDIR /common
+        COPY --from=engine-common . .
+        RUN mkdir -p /packs && if [ -f package.json ]; then \
+              [ "$$(node -p 'require("./package.json").name')" = @nominal-systems/dmi-engine-common ] \
+              || { echo "DMI_ENGINE_COMMON_DIR: this package.json is not dmi-engine-common's" >&2; exit 1; }; \
+              rm -rf lib node_modules \
+              && npm ci --no-audit --no-fund \
+              && npm run build \
+              && npm pack --pack-destination /packs; \
+            elif [ "$$(ls -A)" != README.md ]; then \
+              echo "DMI_ENGINE_COMMON_DIR names neither a dmi-engine-common checkout nor the placeholder" >&2; exit 1; \
+            fi
+        # Stage 1: build and pack each provider module from its checkout, compiled against the common
+        # pack when there is one.
         FROM node:20-alpine AS modules
         ARG GHP_TOKEN
         WORKDIR /modules
         COPY --from=antech-v6-integration . antech-v6/
         COPY --from=wisdom-panel-integration . wisdom-panel/
-        # (Doubled dollar on the loop variable: compose substitutes its own variables in this
-        # inline file before Docker sees it.)
-        RUN mkdir -p /packs && for m in antech-v6 wisdom-panel; do \
+        COPY --from=common /packs /packs
+        RUN for m in antech-v6 wisdom-panel; do \
               cd /modules/$$m && rm -rf lib node_modules \
               && npm ci --no-audit --no-fund \
+              && for c in /packs/nominal-systems-dmi-engine-common-*.tgz; do \
+                   [ ! -f "$$c" ] || npm install --no-save --no-audit --no-fund "$$c" || exit 1; \
+                 done \
               && npx tsc -p tsconfig.json \
               && rm -f .npmrc \
               && npm pack --pack-destination /packs; \
             done
-        # Stage 2: the engine's checkout, with the packed modules installed over its published deps.
+        # Stage 2: the engine's checkout, with the packed modules (and common, when packed) installed
+        # over its published deps.
         FROM node:20-alpine
         ARG GHP_TOKEN
         WORKDIR /app
@@ -310,6 +341,18 @@ services:
             && npm install --no-audit --no-fund /packs/*.tgz \
             && rm -f .npmrc \
             && npm run build
+        # A packed common must be the image's only copy of the package, file for file. Its version
+        # number can be the published one's, so npm could otherwise keep a module's nested registry
+        # copy (a range the checkout's version does not satisfy) and nothing would say so.
+        RUN for c in /packs/nominal-systems-dmi-engine-common-*.tgz; do [ -f "$$c" ] || continue; \
+              copies=$$(find node_modules -path '*/@nominal-systems/dmi-engine-common/package.json' | wc -l); \
+              [ "$$copies" -eq 1 ] || { echo "dmi-engine-common is installed $$copies times, not once:" >&2; \
+                find node_modules -path '*/@nominal-systems/dmi-engine-common/package.json' >&2; exit 1; }; \
+              mkdir -p /tmp/common && tar -xzf "$$c" -C /tmp/common \
+              && diff -r /tmp/common/package/lib node_modules/@nominal-systems/dmi-engine-common/lib \
+              && cmp /tmp/common/package/package.json node_modules/@nominal-systems/dmi-engine-common/package.json \
+              && rm -rf /tmp/common || exit 1; \
+            done
         ENV NODE_ENV=production
         EXPOSE 3000
         CMD ["node", "dist/main"]

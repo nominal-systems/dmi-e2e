@@ -13,7 +13,7 @@ import {
 } from 'fs'
 import * as path from 'path'
 import { env } from '../env'
-import { stacks } from '../stacks'
+import { commonCheckout, stacks } from '../stacks'
 
 /* Run reports.
  *
@@ -103,6 +103,8 @@ const HISTORY_MAX = 60
 const HISTORY_SHOWN = 20
 /* Commit links: every checkout under test lives in this GitHub organisation. */
 const GITHUB_ORG = 'nominal-systems'
+/* The "under test" line for the dmi-engine-common dmi-api runs with, kept apart from the images'. */
+const DMI_API_COMMON = 'dmi-engine-common in dmi-api'
 
 function git (dir: string, args: string[]): string | undefined {
   try {
@@ -131,6 +133,12 @@ export function versionsUnderTest (): Record<string, string> {
   /* Every checkout the registry lists for the loop — one for a self-contained integration, the
    * host engine plus the injected provider modules for a loop hosted by a shared container. */
   for (const checkout of env.checkouts) versions[checkout.name] = describeCheckout(checkout.dir)
+  /* dmi-engine-common, when the images installed the published package; a checkout of it is one of
+   * env.checkouts above. */
+  if (env.publishedCommon != null) versions[commonCheckout.repo] = `published ${env.publishedCommon}`
+  /* dmi-api's own copy, a line apart from the images': the harness runs dmi-api from its checkout's
+   * node_modules, so DMI_ENGINE_COMMON_DIR never changes it. */
+  if (env.dmiApiCommon != null) versions[DMI_API_COMMON] = env.dmiApiCommon.version
   return versions
 }
 
@@ -143,6 +151,8 @@ export function locationsUnderTest (): Record<string, string> {
   for (const checkout of env.checkouts) {
     locations[checkout.name] = `${checkout.dir}${checkout.fromVariable != null ? ` (${checkout.fromVariable})` : ''}`
   }
+  if (env.publishedCommon != null) locations[commonCheckout.repo] = `GitHub Packages (${commonCheckout.dirVariable} unset)`
+  if (env.dmiApiCommon != null) locations[DMI_API_COMMON] = env.dmiApiCommon.location
   return locations
 }
 

@@ -37,8 +37,10 @@ const stacks = {
     composeProfile: 'idexx',
     /* The sibling checkouts this loop's containers are built from: for a loop like this one, the
      * real integration's repo; for a loop hosted by a shared engine container, the host repo plus
-     * the provider module(s) injected into it. Each variable overrides that checkout's location,
-     * with the same default docker-compose.yml uses, and the run report records every one of them.
+     * the provider module(s) injected into it. The first is always the repo the image is built
+     * from (the run report reads its lockfile for the published dmi-engine-common version). Each
+     * variable overrides that checkout's location, with the same default docker-compose.yml uses,
+     * and the run report records every one of them.
      * Several loops may list the same checkout (same repo, same variable): the nightly pulls it
      * once, and `verifyStacks()` refuses a variable that names different repos in different loops. */
     checkouts: [{ repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' }],
@@ -141,6 +143,19 @@ const stacks = {
 
 /* The loop HARNESS_FULL_STACK=1 runs when HARNESS_STACK is unset. */
 const defaultStack = 'idexx'
+
+/* dmi-engine-common, the library every loop's integration code is built on. It is no loop's
+ * checkout: each image installs it from GitHub Packages at the version its lockfile pins. It is
+ * built from a checkout only on request, when `dirVariable` names one (README, "Running a common
+ * candidate"), and so it is in no entry's `checkouts` — the nightly would pull it, every workflow
+ * would have to set it, and every slot tree would carry it. Every loop honours the variable:
+ * docker-compose.yml builds the engine image against it itself, and `composeFile` is the override
+ * the harness adds for the images built from their own repos' Dockerfiles. */
+const commonCheckout = {
+  repo: 'dmi-engine-common',
+  dirVariable: 'DMI_ENGINE_COMMON_DIR',
+  composeFile: 'docker-compose.common-checkout.yml',
+}
 
 /* Validates a raw HARNESS_STACK value against the registry. Both parsers — jest.config.js and
  * src/env.ts — go through here, so an unknown value is refused by both; one can no longer
@@ -271,6 +286,16 @@ function verifyStacks () {
     }
   }
 
+  /* The common checkout must be an input to the engine build and to the override, or setting its
+   * variable would record a checkout in the run report that some image was not built from. */
+  const override = path.join(root, commonCheckout.composeFile)
+  if (!compose.includes(`\${${commonCheckout.dirVariable}`)) problems.push(`commonCheckout: ${commonCheckout.dirVariable} is referenced by no build context in docker-compose.yml`)
+  if (!fs.existsSync(override)) {
+    problems.push(`commonCheckout: no ${commonCheckout.composeFile}`)
+  } else if (!fs.readFileSync(override, 'utf8').includes(`\${${commonCheckout.dirVariable}`)) {
+    problems.push(`commonCheckout: ${commonCheckout.composeFile} does not build from ${commonCheckout.dirVariable}`)
+  }
+
   /* The validator itself: a registry whose gate stopped throwing would pass everything above. */
   let refused = false
   try { resolveStack('no-such-stack') } catch { refused = true }
@@ -281,12 +306,15 @@ function verifyStacks () {
   }
 }
 
-module.exports = { stacks, defaultStack, resolveStack, suiteName, verifyStacks }
+module.exports = { stacks, defaultStack, commonCheckout, resolveStack, suiteName, verifyStacks }
 
-/* CLI for shell callers (scripts/nightly.sh), so no script re-derives what the registry knows:
+/* CLI for shell callers (scripts/nightly.sh, scripts/slot-tree.sh), so no script re-derives what
+ * the registry knows:
  *   node src/stacks.js list                → one key per line
  *   node src/stacks.js checkouts <key>     → one "<repo> <dirVariable>" line per checkout the loop
  *                                            is built from — exit 1 naming the key if unknown
+ *   node src/stacks.js common              → "<repo> <dirVariable> <composeFile>" of the opt-in
+ *                                            dmi-engine-common checkout
  *   node src/stacks.js check               → verifyStacks(), exit 1 with the problems if any */
 if (require.main === module) {
   const [command, key] = process.argv.slice(2)
@@ -296,11 +324,13 @@ if (require.main === module) {
     } else if (command === 'checkouts') {
       const { checkouts } = stacks[resolveStack(key)]
       console.log(checkouts.map(({ repo, dirVariable }) => `${repo} ${dirVariable}`).join('\n'))
+    } else if (command === 'common') {
+      console.log(`${commonCheckout.repo} ${commonCheckout.dirVariable} ${commonCheckout.composeFile}`)
     } else if (command === 'check') {
       verifyStacks()
       console.log(`stack registry ok: ${Object.keys(stacks).join(', ')}`)
     } else {
-      throw new Error('usage: node src/stacks.js list | checkouts <key> | check')
+      throw new Error('usage: node src/stacks.js list | checkouts <key> | common | check')
     }
   } catch (error) {
     console.error(error.message)

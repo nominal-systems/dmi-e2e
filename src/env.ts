@@ -1,7 +1,7 @@
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import * as path from 'path'
-import { applySlot } from './slots'
-import { resolveStack, stacks, suiteName } from './stacks'
+import { applySlot, dotEnvValue } from './slots'
+import { commonCheckout, resolveStack, stacks, suiteName } from './stacks'
 
 /* Harness configuration, resolved once from process.env against defaults that match
  * docker-compose.yml. This repo has no dependency on dmi-api's source: it locates a dmi-api
@@ -78,6 +78,17 @@ export interface HarnessEnv {
    * record what was under test in the run report. Empty for the fast suite. `fromVariable` names the
    * DMI_*_DIR that put a checkout somewhere other than beside this one. */
   checkouts: Array<{ name: string, dir: string, fromVariable?: string }>
+  /* The dmi-engine-common checkout the loop's images are built against, when DMI_ENGINE_COMMON_DIR
+   * names one (opt-in: README, "Running a common candidate"); it is then in `checkouts` too.
+   * Undefined for the published package, and always for the fast suite, which builds no image.
+   * Read as compose reads it: from the environment, else from this checkout's .env. */
+  commonDir?: string
+  /* With no commonDir, in full-stack mode: which published version the image installs, from the
+   * lockfile of the repo it is built from ("1.7.0 in the image, as dmi-engine's lockfile pins it"). */
+  publishedCommon?: string
+  /* In full-stack mode: the dmi-engine-common dmi-api itself runs with, which is always its own
+   * checkout's (dmi-api is a host process, not an image) — with where that was read from. */
+  dmiApiCommon?: { version: string, location: string }
   /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
    * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
    * suite that just ran into publishDir on teardown — the directory an nginx serves — and rebuilds
@@ -233,18 +244,96 @@ export function mockBaseUrlFor (stackName: StackName): string {
   return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}`)
 }
 
+/* DMI_ENGINE_COMMON_DIR as compose resolves it — the environment's value wins over .env's, even an
+ * empty one, and a relative path is relative to this checkout — refused unless it names a
+ * dmi-engine-common checkout: an image built from the wrong directory would be a false proof. */
+function commonCheckoutUnderTest (): { dir: string, fromVariable: string } | undefined {
+  if (!fullStack) return undefined
+  const { dirVariable } = commonCheckout
+  const fromEnvironment = process.env[dirVariable] != null
+  const raw = fromEnvironment ? process.env[dirVariable] : dotEnvValue(harnessRoot, dirVariable)
+  if (raw == null || raw === '') return undefined
+  const dir = path.resolve(harnessRoot, raw)
+  let name: unknown
+  try {
+    name = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8')).name
+  } catch {
+    name = undefined
+  }
+  if (name !== '@nominal-systems/dmi-engine-common') {
+    throw new Error(
+      `${dirVariable}${fromEnvironment ? '' : ' (from .env)'} is '${raw}', but ${dir} holds no checkout of ` +
+        '@nominal-systems/dmi-engine-common. Point it at one, or unset it to build against the published package.',
+    )
+  }
+  return { dir, fromVariable: fromEnvironment ? dirVariable : `${dirVariable}, from .env` }
+}
+
+const common = commonCheckoutUnderTest()
+
 function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?: string }> {
   if (!fullStack) return []
-  return stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
+  const loop = stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
     name: repo,
     dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))),
     ...(process.env[dirVariable] != null && process.env[dirVariable] !== '' ? { fromVariable: dirVariable } : {}),
   }))
+  return common == null ? loop : [...loop, { name: commonCheckout.repo, ...common }]
+}
+
+const checkouts = checkoutsUnderTest()
+
+/* The published dmi-engine-common the loop's image installs: the version the lockfile of the repo it
+ * is built from pins (the registry lists that repo first). Only read for the run report. */
+function publishedCommonUnderTest (): string | undefined {
+  if (!fullStack || common != null) return undefined
+  const [root] = checkouts
+  let version: unknown
+  try {
+    version = JSON.parse(readFileSync(path.join(root.dir, 'package-lock.json'), 'utf8'))
+      .packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
+  } catch {
+    version = undefined
+  }
+  return typeof version === 'string' ? `${version} in the image, as ${root.name}'s lockfile pins it` : `in the image, as ${root.name}'s lockfile pins it`
+}
+
+const dmiApiDir = path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api')))
+const manageApp = flag('HARNESS_MANAGE_APP', explicitBaseUrl == null)
+
+function readJson (file: string): any {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+/* The dmi-engine-common dmi-api runs with. dmi-api is a host process started from DMI_API_DIR, never
+ * an image, so it always loads what that checkout's node_modules holds: DMI_ENGINE_COMMON_DIR does
+ * not reach it. Read from the installed copy (and where npm resolved it from), else from the
+ * lockfile, saying which. Only read for the run report. */
+function dmiApiCommonUnderTest (): { version: string, location: string } | undefined {
+  if (!fullStack) return undefined
+  if (!manageApp) return { version: 'unknown: dmi-api is external', location: `external, at ${str('HARNESS_BASE_URL', '')}` }
+  const own = `dmi-api's own; ${commonCheckout.dirVariable} does not reach it`
+  const installedDir = path.join(dmiApiDir, 'node_modules', '@nominal-systems', 'dmi-engine-common')
+  const installed = readJson(path.join(installedDir, 'package.json'))?.version
+  if (typeof installed === 'string') {
+    const resolved = readJson(path.join(dmiApiDir, 'node_modules', '.package-lock.json'))
+      ?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.resolved
+    const from = typeof resolved !== 'string' ? '' : resolved.startsWith('file:') ? ` from ${resolved}` : ' from the registry'
+    return { version: `${installed}, installed in its node_modules${from} (${own})`, location: installedDir }
+  }
+  const locked = readJson(path.join(dmiApiDir, 'package-lock.json'))?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
+  return typeof locked === 'string'
+    ? { version: `${locked}, as its lockfile pins it: none installed in its node_modules (${own})`, location: path.join(dmiApiDir, 'package-lock.json') }
+    : { version: `unknown: neither installed in its node_modules nor in its lockfile (${own})`, location: dmiApiDir }
 }
 
 export const env: HarnessEnv = {
   harnessRoot,
-  dmiApiDir: path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api'))),
+  dmiApiDir,
   composeFile: path.join(harnessRoot, 'docker-compose.yml'),
   slot: slot.slot,
   slotSource: slot.source,
@@ -276,7 +365,10 @@ export const env: HarnessEnv = {
   fullStack,
   stack,
   suite: suiteName(fullStack, stack),
-  checkouts: checkoutsUnderTest(),
+  checkouts,
+  commonDir: common?.dir,
+  publishedCommon: publishedCommonUnderTest(),
+  dmiApiCommon: dmiApiCommonUnderTest(),
   report: {
     /* Mirrored in jest.config.js, which is loaded before ts-jest and cannot import this module. */
     dir: path.resolve(str('HARNESS_REPORT_DIR', path.join(harnessRoot, 'reports'))),
@@ -333,7 +425,7 @@ export const env: HarnessEnv = {
     clientId: str('HARNESS_ZOETIS_CLIENT_ID', 'harness-client'),
   },
   manageContainers: flag('HARNESS_MANAGE_CONTAINERS', true),
-  manageApp: flag('HARNESS_MANAGE_APP', explicitBaseUrl == null),
+  manageApp,
   build: flag('HARNESS_BUILD', true),
   keepUp: flag('HARNESS_KEEP_UP', false),
   timeouts: {

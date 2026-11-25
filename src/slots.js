@@ -38,7 +38,7 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { stacks } = require('./stacks')
+const { commonCheckout, stacks } = require('./stacks')
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 /* Ports move in steps of ten. The 30xx group (dmi-api and the mocks) uses 3010 and 3012–3016
@@ -122,7 +122,7 @@ function applySlot (environment, harnessRoot) {
    * in the tree addresses the tree's stack rather than slot 0's. It must name the same project as
    * the slot, or a hand-typed `down -v` would hit a different stack from the one the harness runs. */
   const dotEnv = path.join(harnessRoot, '.env')
-  const named = fs.existsSync(dotEnv) ? /^[ \t]*COMPOSE_PROJECT_NAME[ \t]*=[ \t]*['"]?([^'"\s#]+)/m.exec(fs.readFileSync(dotEnv, 'utf8'))?.[1] : undefined
+  const named = dotEnvValue(harnessRoot, 'COMPOSE_PROJECT_NAME')
   if (named != null && named !== project) {
     throw new Error(
       `${dotEnv} names the compose project '${named}', but slot ${slot} (from ${source}) runs as '${project}': a bare ` +
@@ -135,6 +135,16 @@ function applySlot (environment, harnessRoot) {
     if (environment[variable] == null || environment[variable] === '') environment[variable] = String(port)
   }
   return { slot, source, project }
+}
+
+/* A variable's value in the checkout's `.env`, which compose reads on its own (a slot tree's names
+ * its project and ports, and DMI_ENGINE_COMMON_DIR when the tree has a common worktree). Undefined
+ * when there is no such file or line, or the value is empty.
+ * @param {string} harnessRoot @param {string} name @returns {string | undefined} */
+function dotEnvValue (harnessRoot, name) {
+  const file = path.join(harnessRoot, '.env')
+  if (!fs.existsSync(file)) return undefined
+  return new RegExp(`^[ \\t]*${name}[ \\t]*=[ \\t]*['"]?([^'"\\s#]+)`, 'm').exec(fs.readFileSync(file, 'utf8'))?.[1]
 }
 
 /* ---- the lock ------------------------------------------------------------------------------ */
@@ -308,7 +318,14 @@ function releaseSlot (slot, environment = process.env) {
  *   - a project `name:` other than slot 0's. */
 function verifySlots () {
   const root = path.resolve(__dirname, '..')
-  const compose = fs.readFileSync(path.join(root, 'docker-compose.yml'), 'utf8')
+  /* With the override the harness adds for a dmi-engine-common checkout (src/stacks.js): whatever it
+   * publishes or names must follow the slot too. It declares no project name, so the `name:` check
+   * below still reads docker-compose.yml's. */
+  const compose = ['docker-compose.yml', commonCheckout.composeFile]
+    .map((file) => path.join(root, file))
+    .filter((file) => fs.existsSync(file))
+    .map((file) => fs.readFileSync(file, 'utf8'))
+    .join('\n')
   const problems = []
   const table = hostPorts()
 
@@ -397,6 +414,7 @@ module.exports = {
   parseSlot,
   resolveSlot,
   applySlot,
+  dotEnvValue,
   lockFile,
   slotHolder,
   acquireSlot,
