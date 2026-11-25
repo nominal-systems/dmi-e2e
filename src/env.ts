@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'fs'
 import * as path from 'path'
-import { applySlot, dotEnvValue } from './slots'
-import { commonCheckout, resolveStack, stacks, suiteName } from './stacks'
+import { applySlot } from './slots'
+import { commonCheckout, composeCommonCheckout, resolveStack, stacks, suiteName } from './stacks'
 
 /* Harness configuration, resolved once from process.env against defaults that match
  * docker-compose.yml. This repo has no dependency on dmi-api's source: it locates a dmi-api
@@ -78,16 +78,9 @@ export interface HarnessEnv {
    * record what was under test in the run report. Empty for the fast suite. `fromVariable` names the
    * DMI_*_DIR that put a checkout somewhere other than beside this one. */
   checkouts: Array<{ name: string, dir: string, fromVariable?: string }>
-  /* The dmi-engine-common checkout the loop's images are built against, when DMI_ENGINE_COMMON_DIR
-   * names one (opt-in: README, "Running a common candidate"); it is then in `checkouts` too.
-   * Undefined for the published package, and always for the fast suite, which builds no image.
-   * Read as compose reads it: from the environment, else from this checkout's .env. */
-  commonDir?: string
-  /* With no commonDir, in full-stack mode: which published version the image installs, from the
-   * lockfile of the repo it is built from ("1.7.0 in the image, as dmi-engine's lockfile pins it"). */
-  publishedCommon?: string
   /* In full-stack mode: the dmi-engine-common dmi-api itself runs with, which is always its own
-   * checkout's (dmi-api is a host process, not an image) — with where that was read from. */
+   * checkout's (dmi-api is a host process, not an image) — with where that was read from. The
+   * images' is commonUnderTest() below, which asks compose. */
   dmiApiCommon?: { version: string, location: string }
   /* Run reports. Every run writes reports/<suite>/ (the jest-html-reporters page, summary.json and
    * run.json) and rebuilds reports/index.html. HARNESS_PUBLISH_REPORT=1 additionally copies the
@@ -244,58 +237,13 @@ export function mockBaseUrlFor (stackName: StackName): string {
   return str(mock.urlVariable, `http://${host}:${port(mock.portVariable)}`)
 }
 
-/* DMI_ENGINE_COMMON_DIR as compose resolves it — the environment's value wins over .env's, even an
- * empty one, and a relative path is relative to this checkout — refused unless it names a
- * dmi-engine-common checkout: an image built from the wrong directory would be a false proof. */
-function commonCheckoutUnderTest (): { dir: string, fromVariable: string } | undefined {
-  if (!fullStack) return undefined
-  const { dirVariable } = commonCheckout
-  const fromEnvironment = process.env[dirVariable] != null
-  const raw = fromEnvironment ? process.env[dirVariable] : dotEnvValue(harnessRoot, dirVariable)
-  if (raw == null || raw === '') return undefined
-  const dir = path.resolve(harnessRoot, raw)
-  let name: unknown
-  try {
-    name = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8')).name
-  } catch {
-    name = undefined
-  }
-  if (name !== '@nominal-systems/dmi-engine-common') {
-    throw new Error(
-      `${dirVariable}${fromEnvironment ? '' : ' (from .env)'} is '${raw}', but ${dir} holds no checkout of ` +
-        '@nominal-systems/dmi-engine-common. Point it at one, or unset it to build against the published package.',
-    )
-  }
-  return { dir, fromVariable: fromEnvironment ? dirVariable : `${dirVariable}, from .env` }
-}
-
-const common = commonCheckoutUnderTest()
-
 function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?: string }> {
   if (!fullStack) return []
-  const loop = stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
+  return stacks[stack].checkouts.map(({ repo, dirVariable }) => ({
     name: repo,
     dir: path.resolve(str(dirVariable, path.join(harnessRoot, '..', repo))),
     ...(process.env[dirVariable] != null && process.env[dirVariable] !== '' ? { fromVariable: dirVariable } : {}),
   }))
-  return common == null ? loop : [...loop, { name: commonCheckout.repo, ...common }]
-}
-
-const checkouts = checkoutsUnderTest()
-
-/* The published dmi-engine-common the loop's image installs: the version the lockfile of the repo it
- * is built from pins (the registry lists that repo first). Only read for the run report. */
-function publishedCommonUnderTest (): string | undefined {
-  if (!fullStack || common != null) return undefined
-  const [root] = checkouts
-  let version: unknown
-  try {
-    version = JSON.parse(readFileSync(path.join(root.dir, 'package-lock.json'), 'utf8'))
-      .packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
-  } catch {
-    version = undefined
-  }
-  return typeof version === 'string' ? `${version} in the image, as ${root.name}'s lockfile pins it` : `in the image, as ${root.name}'s lockfile pins it`
 }
 
 const dmiApiDir = path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api')))
@@ -307,6 +255,55 @@ function readJson (file: string): any {
   } catch {
     return undefined
   }
+}
+
+/* dmi-engine-common as the loop's images get it. */
+export interface CommonUnderTest {
+  /* The checkout DMI_ENGINE_COMMON_DIR names, which every image is built against; `fromVariable`
+   * says where the variable came from. */
+  checkout?: { dir: string, fromVariable: string }
+  /* No checkout: the published version the image installs, as the lockfile of the repo it is built
+   * from pins it (the registry lists that repo first). */
+  published?: string
+  /* Why neither is known. */
+  unknown?: string
+  /* The fast suite builds no image, so a set variable is only logged as ignored. */
+  ignored?: string
+}
+
+let common: CommonUnderTest | undefined
+
+/* What compose resolves DMI_ENGINE_COMMON_DIR to is read back from compose itself
+ * (composeCommonCheckout in src/stacks.js), never re-read from .env here: a reading of its own could
+ * disagree with what compose builds, and the run report would record a common the images did not
+ * get. Asked once per process, on first use — setup and teardown share one, and a scenario worker
+ * never asks. With the variable set, the run is refused unless compose resolves it to a
+ * dmi-engine-common checkout. */
+export function commonUnderTest (): CommonUnderTest {
+  common ??= resolveCommon()
+  return common
+}
+
+function resolveCommon (): CommonUnderTest {
+  const { dirVariable } = commonCheckout
+  if (!env.manageContainers) return env.fullStack ? { unknown: 'unknown: HARNESS_MANAGE_CONTAINERS=0, the harness builds no image' } : {}
+  const dir = composeCommonCheckout(harnessRoot, process.env)
+  if (!env.fullStack) return dir == null ? {} : { ignored: dir }
+  if (dir == null) {
+    const [root] = env.checkouts
+    const version = readJson(path.join(root.dir, 'package-lock.json'))?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
+    return { published: `${typeof version === 'string' ? `${version} ` : ''}in the image, as ${root.name}'s lockfile pins it` }
+  }
+  /* Compose takes a variable from the environment whenever it is there, empty or not. */
+  const fromEnvironment = process.env[dirVariable] != null
+  if (readJson(path.join(dir, 'package.json'))?.name !== '@nominal-systems/dmi-engine-common') {
+    throw new Error(
+      `${dirVariable} (${fromEnvironment ? 'in the environment' : `in ${path.join(harnessRoot, '.env')}`}) resolves, for compose, to ` +
+        `${dir}, which holds no checkout of @nominal-systems/dmi-engine-common. Point it at one, or unset it to build ` +
+        'against the published package.',
+    )
+  }
+  return { checkout: { dir, fromVariable: fromEnvironment ? dirVariable : `${dirVariable}, from .env` } }
 }
 
 /* The dmi-engine-common dmi-api runs with. dmi-api is a host process started from DMI_API_DIR, never
@@ -365,9 +362,7 @@ export const env: HarnessEnv = {
   fullStack,
   stack,
   suite: suiteName(fullStack, stack),
-  checkouts,
-  commonDir: common?.dir,
-  publishedCommon: publishedCommonUnderTest(),
+  checkouts: checkoutsUnderTest(),
   dmiApiCommon: dmiApiCommonUnderTest(),
   report: {
     /* Mirrored in jest.config.js, which is loaded before ts-jest and cannot import this module. */

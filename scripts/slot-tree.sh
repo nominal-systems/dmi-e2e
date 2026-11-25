@@ -224,12 +224,13 @@ list() {
       [ -e "$dir/.git" ] || continue
       printf '    %-38s %s\n' "${dir##*/}" "$(git -C "$dir" symbolic-ref -q --short HEAD || echo "detached @ $(git -C "$dir" rev-parse --short HEAD)")"
     done
-    # Whether the tree's runs build against a common checkout: only when its .env names one.
-    named=$(sed -n "s/^[[:space:]]*$common_var[[:space:]]*=[[:space:]]*//p" "$tree/dmi-e2e/.env" 2>/dev/null | tail -1)
+    # Whether the tree's runs build against a common checkout, as compose resolves the variable
+    # there — what the harness reads too. Blank for a tree whose dmi-e2e predates the variable.
+    named=$(stacks common-dir "$tree/dmi-e2e" 2>/dev/null || true)
     if [ -n "$named" ]; then
-      echo "    every loop builds against $named ($common_var in the .env)"
+      echo "    every loop builds against $named ($common_var, as compose resolves it here)"
     elif [ -e "$tree/$common_repo/.git" ]; then
-      echo "    $common_repo is not in the .env: a run builds against it only with $common_var set"
+      echo "    $common_repo is here, but $common_var is unset for this tree: a run builds against it only with the variable set"
     fi
   done
 }

@@ -459,9 +459,18 @@ scripts/slot-tree.sh 3 --common antech-v6 idexx   # or a tree whose .env sets it
 
 The checkout is built and packed (`npm ci`, `npm run build`, `npm pack`) inside each image build,
 and the pack is the only copy of the package in the image; the build fails if any other copy is
-left (its version number can be the published one's, so npm could otherwise keep one quietly). A
-path that is not a dmi-engine-common checkout is refused before anything is built. How each image
-takes it:
+left (its version number can be the published one's, so npm could otherwise keep one quietly).
+
+The variable may come from the environment or from the checkout's `.env`, in any form compose
+accepts there (`export`, `KEY: value`, quotes, a later line overriding an earlier one), and an
+empty value means unset. The harness does not read `.env` for it: it asks compose
+(`docker compose config` on the engine service) what the engine build will use, and goes by that
+answer for every loop, so the report cannot record the published package while an image builds the
+checkout, or the reverse. A value that compose resolves to anything but a dmi-engine-common
+checkout is refused before anything is built, naming the variable and where it came from; a build
+by hand with such a value fails at its first stage, naming the variable. Whether the variable is
+set is all that decides: unset, the placeholder context `src/published-common` is ignored whatever
+it holds. How each image takes it:
 
 - **The engine image** (`antech-v6`, `wisdom-panel`): both modules compile against the checkout, and
   the engine installs it with them, so engine and modules compile and run against it.
@@ -472,7 +481,9 @@ takes it:
   code is therefore compiled against the version its lockfile pins and run against the checkout: a
   change in the checkout's types shows in the engine image's build, not here. By hand, a bare
   `docker compose` needs `-f docker-compose.yml -f docker-compose.common-checkout.yml`; a tree made
-  with `--common` names both in its `.env`.
+  with `--common` names both in its `.env`. The override relies on compose's `service:` build
+  contexts and the build-only services they reference; it has been run with Docker Compose v5.8.0,
+  and no earlier version has been tried.
 
 **dmi-api is not covered.** It depends on dmi-engine-common too (`ProviderError`, the
 shared-subscription decorators, the result types), but the harness runs it on the host from
@@ -485,8 +496,9 @@ The run report records the checkout like any other (`git describe`, path, and
 `(DMI_ENGINE_COMMON_DIR)`); a run without it records `published <version> in the image`, the version
 the lockfile of the image's repo pins. Either way, a line of its own, `dmi-engine-common in dmi-api`,
 records the copy dmi-api ran with: the version installed in its `node_modules` and where npm
-resolved it from, or its lockfile's when nothing is installed. Expect the tripwires that track a dmi-engine-common defect to
-fire when the checkout fixes it: *"Failing test passed even though it was supposed to fail"* is the
+resolved it from, or its lockfile's when nothing is installed. The fast suite builds no image, so
+it ignores the variable and says so in its setup log. Expect the tripwires that track a
+dmi-engine-common defect to fire when the checkout fixes it: *"Failing test passed even though it was supposed to fail"* is the
 candidate doing what it should, not a broken run. Leave their markers in place: they come out in
 the companion change once the release reaches the loops' own builds (see "Tripwires").
 
@@ -701,7 +713,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_LOCK_DIR` | `~/.cache/dmi-e2e/slot-locks` | Where the per-slot locks live. Must be one directory for every run sharing a Docker daemon. |
 | `DMI_SLOTS_DIR` | `slots/` beside the main dmi-e2e clone | `scripts/slot-tree.sh` only: where slot trees are created. |
 | `DMI_API_DIR` | `../dmi-api` | dmi-api checkout to build, migrate and run. Ignored when `HARNESS_MANAGE_APP=0`. |
-| `DMI_ENGINE_COMMON_DIR` | unset: the published package | full-stack only (every loop). A dmi-engine-common checkout to build every image against instead of the version each lockfile pins; refused unless it is one. Never defaulted to `../dmi-engine-common`. Read from the environment, else from the checkout's `.env`, as compose reads it. See "Running a common candidate before a release". |
+| `DMI_ENGINE_COMMON_DIR` | unset: the published package | full-stack only (every loop). A dmi-engine-common checkout to build every image against instead of the version each lockfile pins; refused unless it is one. Never defaulted to `../dmi-engine-common`. From the environment, else from the checkout's `.env`: the harness asks compose how it resolves it rather than reading `.env` itself. See "Running a common candidate before a release". |
 | `HARNESS_HOST` | `127.0.0.1` | Host that the published container ports are reachable on. A single knob; each per-service `*_HOST` var (and the Mongo URI) defaults to it, so pointing the suite at a remote docker host is one variable. |
 | `HARNESS_FULL_STACK` | `0` | `1` selects a full-system suite instead of the default fast suite. See "Full-system mode". |
 | `HARNESS_STACK` | `idexx` | Which full-system loop `HARNESS_FULL_STACK=1` runs — a key of the stack registry in `src/stacks.js`: `idexx` (real idexx integration + VetConnect Plus mock), `antech-v3` (real classic-Antech integration + antech-v3 mock; dmi-api's provider id is the bare `antech`), `zoetis` (real zoetis integration + Zoetis mock), `antech-v6` (the real dmi-engine as api + worker + antech-v6 mock) or `wisdom-panel` (the same dmi-engine + wisdom-panel mock). Anything else is refused — including the old `antech`. |

@@ -122,7 +122,7 @@ function applySlot (environment, harnessRoot) {
    * in the tree addresses the tree's stack rather than slot 0's. It must name the same project as
    * the slot, or a hand-typed `down -v` would hit a different stack from the one the harness runs. */
   const dotEnv = path.join(harnessRoot, '.env')
-  const named = dotEnvValue(harnessRoot, 'COMPOSE_PROJECT_NAME')
+  const named = fs.existsSync(dotEnv) ? /^[ \t]*COMPOSE_PROJECT_NAME[ \t]*=[ \t]*['"]?([^'"\s#]+)/m.exec(fs.readFileSync(dotEnv, 'utf8'))?.[1] : undefined
   if (named != null && named !== project) {
     throw new Error(
       `${dotEnv} names the compose project '${named}', but slot ${slot} (from ${source}) runs as '${project}': a bare ` +
@@ -135,16 +135,6 @@ function applySlot (environment, harnessRoot) {
     if (environment[variable] == null || environment[variable] === '') environment[variable] = String(port)
   }
   return { slot, source, project }
-}
-
-/* A variable's value in the checkout's `.env`, which compose reads on its own (a slot tree's names
- * its project and ports, and DMI_ENGINE_COMMON_DIR when the tree has a common worktree). Undefined
- * when there is no such file or line, or the value is empty.
- * @param {string} harnessRoot @param {string} name @returns {string | undefined} */
-function dotEnvValue (harnessRoot, name) {
-  const file = path.join(harnessRoot, '.env')
-  if (!fs.existsSync(file)) return undefined
-  return new RegExp(`^[ \\t]*${name}[ \\t]*=[ \\t]*['"]?([^'"\\s#]+)`, 'm').exec(fs.readFileSync(file, 'utf8'))?.[1]
 }
 
 /* ---- the lock ------------------------------------------------------------------------------ */
@@ -414,7 +404,6 @@ module.exports = {
   parseSlot,
   resolveSlot,
   applySlot,
-  dotEnvValue,
   lockFile,
   slotHolder,
   acquireSlot,

@@ -150,11 +150,49 @@ const defaultStack = 'idexx'
  * candidate"), and so it is in no entry's `checkouts` — the nightly would pull it, every workflow
  * would have to set it, and every slot tree would carry it. Every loop honours the variable:
  * docker-compose.yml builds the engine image against it itself, and `composeFile` is the override
- * the harness adds for the images built from their own repos' Dockerfiles. */
+ * the harness adds for the images built from their own repos' Dockerfiles. `service`, `context` and
+ * `setArg` name where compose's own resolution of the variable can be read back (see
+ * composeCommonCheckout below). */
 const commonCheckout = {
   repo: 'dmi-engine-common',
   dirVariable: 'DMI_ENGINE_COMMON_DIR',
   composeFile: 'docker-compose.common-checkout.yml',
+  service: 'dmi-engine-api',
+  context: 'engine-common',
+  setArg: 'COMMON_CHECKOUT',
+}
+
+/* DMI_ENGINE_COMMON_DIR as compose resolves it, read back from compose rather than re-derived: the
+ * engine service rendered by `docker compose config` (a named service renders whatever profiles are
+ * active), its `engine-common` build context and its COMMON_CHECKOUT build arg, which compose sets
+ * to 1 exactly when the variable is set and not empty. Compose takes the variable from the
+ * environment, else from the project's .env in any form it accepts there (`export`, `KEY: value`,
+ * quotes, the last of several definitions), so no second reading of .env can disagree with what it
+ * builds. Every loop honours it, the standalone images included: the harness adds their override
+ * exactly when this says the variable is set, and the override interpolates the same variable with
+ * the same rule for an empty value. Returns the context's absolute path when set, else undefined.
+ * @param {string} harnessRoot @param {NodeJS.ProcessEnv} [environment]
+ * @returns {string | undefined} */
+function composeCommonCheckout (harnessRoot, environment = process.env) {
+  /* eslint-disable-next-line @typescript-eslint/no-var-requires */
+  const { execFileSync } = require('child_process')
+  const { service, context, setArg, dirVariable } = commonCheckout
+  let rendered
+  try {
+    rendered = execFileSync('docker', ['compose', '-f', path.join(harnessRoot, 'docker-compose.yml'), 'config', '--format', 'json', service], {
+      cwd: harnessRoot,
+      env: environment,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    throw new Error(`could not ask compose how it resolves ${dirVariable} (docker compose config ${service}): ${String(error.stderr ?? error.message).trim()}`)
+  }
+  const build = JSON.parse(rendered).services?.[service]?.build
+  if (typeof build?.additional_contexts?.[context] !== 'string') {
+    throw new Error(`docker compose config renders no '${context}' build context on ${service}: the compose file predates ${dirVariable}`)
+  }
+  return build.args?.[setArg] === '1' ? build.additional_contexts[context] : undefined
 }
 
 /* Validates a raw HARNESS_STACK value against the registry. Both parsers — jest.config.js and
@@ -290,6 +328,9 @@ function verifyStacks () {
    * variable would record a checkout in the run report that some image was not built from. */
   const override = path.join(root, commonCheckout.composeFile)
   if (!compose.includes(`\${${commonCheckout.dirVariable}`)) problems.push(`commonCheckout: ${commonCheckout.dirVariable} is referenced by no build context in docker-compose.yml`)
+  if (!compose.includes(`${commonCheckout.setArg}: \${${commonCheckout.dirVariable}:+1}`)) {
+    problems.push(`commonCheckout: docker-compose.yml passes no ${commonCheckout.setArg}: \${${commonCheckout.dirVariable}:+1} build arg, which the harness reads back`)
+  }
   if (!fs.existsSync(override)) {
     problems.push(`commonCheckout: no ${commonCheckout.composeFile}`)
   } else if (!fs.readFileSync(override, 'utf8').includes(`\${${commonCheckout.dirVariable}`)) {
@@ -306,7 +347,7 @@ function verifyStacks () {
   }
 }
 
-module.exports = { stacks, defaultStack, commonCheckout, resolveStack, suiteName, verifyStacks }
+module.exports = { stacks, defaultStack, commonCheckout, composeCommonCheckout, resolveStack, suiteName, verifyStacks }
 
 /* CLI for shell callers (scripts/nightly.sh, scripts/slot-tree.sh), so no script re-derives what
  * the registry knows:
@@ -315,6 +356,9 @@ module.exports = { stacks, defaultStack, commonCheckout, resolveStack, suiteName
  *                                            is built from — exit 1 naming the key if unknown
  *   node src/stacks.js common              → "<repo> <dirVariable> <composeFile>" of the opt-in
  *                                            dmi-engine-common checkout
+ *   node src/stacks.js common-dir [<dir>]  → the checkout compose would build the engine against
+ *                                            from the dmi-e2e checkout <dir> (default: this one),
+ *                                            or nothing when DMI_ENGINE_COMMON_DIR is unset there
  *   node src/stacks.js check               → verifyStacks(), exit 1 with the problems if any */
 if (require.main === module) {
   const [command, key] = process.argv.slice(2)
@@ -326,11 +370,14 @@ if (require.main === module) {
       console.log(checkouts.map(({ repo, dirVariable }) => `${repo} ${dirVariable}`).join('\n'))
     } else if (command === 'common') {
       console.log(`${commonCheckout.repo} ${commonCheckout.dirVariable} ${commonCheckout.composeFile}`)
+    } else if (command === 'common-dir') {
+      const dir = composeCommonCheckout(path.resolve(key ?? path.join(__dirname, '..')))
+      if (dir != null) console.log(dir)
     } else if (command === 'check') {
       verifyStacks()
       console.log(`stack registry ok: ${Object.keys(stacks).join(', ')}`)
     } else {
-      throw new Error('usage: node src/stacks.js list | checkouts <key> | common | check')
+      throw new Error('usage: node src/stacks.js list | checkouts <key> | common | common-dir [<dir>] | check')
     }
   } catch (error) {
     console.error(error.message)

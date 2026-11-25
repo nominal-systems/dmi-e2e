@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'fs'
 import * as path from 'path'
-import { env } from '../env'
+import { commonUnderTest, env } from '../env'
 import { commonCheckout, stacks } from '../stacks'
 
 /* Run reports.
@@ -133,9 +133,12 @@ export function versionsUnderTest (): Record<string, string> {
   /* Every checkout the registry lists for the loop — one for a self-contained integration, the
    * host engine plus the injected provider modules for a loop hosted by a shared container. */
   for (const checkout of env.checkouts) versions[checkout.name] = describeCheckout(checkout.dir)
-  /* dmi-engine-common, when the images installed the published package; a checkout of it is one of
-   * env.checkouts above. */
-  if (env.publishedCommon != null) versions[commonCheckout.repo] = `published ${env.publishedCommon}`
+  /* dmi-engine-common as the images got it: a checkout like the others, or the published package —
+   * as compose resolves DMI_ENGINE_COMMON_DIR (commonUnderTest). */
+  const common = commonUnderTest()
+  if (common.checkout != null) versions[commonCheckout.repo] = describeCheckout(common.checkout.dir)
+  else if (common.published != null) versions[commonCheckout.repo] = `published ${common.published}`
+  else if (common.unknown != null) versions[commonCheckout.repo] = common.unknown
   /* dmi-api's own copy, a line apart from the images': the harness runs dmi-api from its checkout's
    * node_modules, so DMI_ENGINE_COMMON_DIR never changes it. */
   if (env.dmiApiCommon != null) versions[DMI_API_COMMON] = env.dmiApiCommon.version
@@ -151,7 +154,9 @@ export function locationsUnderTest (): Record<string, string> {
   for (const checkout of env.checkouts) {
     locations[checkout.name] = `${checkout.dir}${checkout.fromVariable != null ? ` (${checkout.fromVariable})` : ''}`
   }
-  if (env.publishedCommon != null) locations[commonCheckout.repo] = `GitHub Packages (${commonCheckout.dirVariable} unset)`
+  const common = commonUnderTest()
+  if (common.checkout != null) locations[commonCheckout.repo] = `${common.checkout.dir} (${common.checkout.fromVariable})`
+  else if (common.published != null) locations[commonCheckout.repo] = `GitHub Packages (${commonCheckout.dirVariable} unset)`
   if (env.dmiApiCommon != null) locations[DMI_API_COMMON] = env.dmiApiCommon.location
   return locations
 }
