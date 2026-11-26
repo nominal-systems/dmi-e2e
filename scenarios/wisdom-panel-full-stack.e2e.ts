@@ -2561,6 +2561,31 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
          * accepted; an activation through dmi-api is refused with the sentence production logged for
          * every activation of that outage (nominal-systems/dmi-engine-wisdom-panel-integration#53);
          * and once the revocation is disarmed the polls are answered again. */
+        /* Both engine processes hold a token the revocation will refuse, as they do after any
+         * earlier test: the api process once it has read the service list, the worker once it has
+         * answered a poll of each feed. Done here so that the test does not depend on the ones
+         * before it: run on its own, the revocation could fall before a process's first login,
+         * which would then be accepted. */
+        await services()
+        const workerPolled = await pollUntil(
+          async () => {
+            const log = await mockCalls()
+            const polls = (path: string): number =>
+              log.calls.filter(
+                (call) =>
+                  call.path === path && call.status === 200 && call.query['filter[hospital_number]'] === env.wisdomPanel.hospitalNumber,
+              ).length
+            return { kits: polls('/api/v1/kits'), resultSets: polls('/api/v1/result-sets') }
+          },
+          (polled) => polled.kits >= 1 && polled.resultSets >= 1,
+          ORDER_WAIT_MS,
+          500,
+        )
+        expect({ kitsPolled: workerPolled.kits >= 1, resultSetsPolled: workerPolled.resultSets >= 1 }).toEqual({
+          kitsPolled: true,
+          resultSetsPolled: true,
+        })
+
         const kitsUrl = `${env.wisdomPanel.mockBaseUrl}/api/v1/kits?filter%5Bhospital_number%5D=${PROBE_HOSPITAL_NUMBER}`
         let revocation: Revocation | null = null
         let polls: Revocation | null = null
