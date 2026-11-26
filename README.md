@@ -828,6 +828,10 @@ ones.
   (after a jest timeout) cannot disarm the next test's fault on the same key. The ids come from one
   counter per mock that never restarts while it runs, not on `POST /__control__/reset` either, so an
   id never comes back.
+- This covers the module's faults only. The idexx mock's older `resultsLatestDelay` scenario is not
+  one of them: it holds one results answer for its `delayMs` and ends by itself, it is not listed
+  among the faults, and neither `POST /__control__/reset` nor the key's `DELETE` ends a hold already
+  in progress, whose answer can still go out after the test that armed it has ended.
 
 A scenario that arms a fault disarms it in a `finally` with its id. It then asserts the count the
 `DELETE` returns: a fault that never fired fails the test. A `describe` that arms faults asserts at
