@@ -1682,7 +1682,12 @@ describe('the loop outlives its broker, Redis and engine going away (service con
    *
    * What this asserts is that the answer arrives during the drain, and that dmi-api exits within the
    * bound dmi-api#399 promises, SHUTDOWN_TIMEOUT_MS after the signal; not whether it exits by the
-   * signal or by the deadline.
+   * signal or by the deadline. Every run so far has had the deadline: exit code 1, about 10 s after
+   * the signal, with the lookup answered at about 6.9 s. The lookup's keep-alive connection is busy
+   * when the shutdown begins, so it is not among the idle connections the server closes then, and
+   * the server's close waits on it until the deadline. The same lookup sent with `Connection: close`
+   * lets dmi-api exit by the signal about 20 ms after its answer; with nothing in flight it exits
+   * at about 4 s.
    *
    * The request held in flight is a device lookup: one provider call, which the integration gives
    * IDEXX_HTTP_TIMEOUT_MS (30 s) and dmi-api ENGINE_RESPONSE_TIMEOUT (10 s here). A placement would

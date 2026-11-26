@@ -512,7 +512,12 @@ order placement get their replies again, at worst after one timeout, including t
 at once (dmi-api#367). Its last test sends dmi-api a SIGTERM with a device lookup held in flight at
 the mock: the lookup gets its answer after dmi-api has stopped taking connections, and dmi-api exits
 within `SHUTDOWN_TIMEOUT_MS` and is started again
-([dmi-api#399](https://github.com/nominal-systems/dmi-api/pull/399)).
+([dmi-api#399](https://github.com/nominal-systems/dmi-api/pull/399)). Which way it exits is not
+asserted, and every run so far has had the same one: at the deadline, with code 1, about 10 s after
+the signal, the lookup answered at about 6.9 s. The lookup's keep-alive connection is busy when the
+shutdown begins, so it is not among the idle connections the server closes then, and the server's
+close waits on it until the deadline. Sent with `Connection: close`, the same lookup lets dmi-api
+exit by the signal about 20 ms after its answer; with nothing in flight it exits at about 4 s.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
