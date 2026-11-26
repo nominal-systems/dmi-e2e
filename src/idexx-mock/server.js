@@ -2,12 +2,13 @@
 
 /* VetConnect Plus (IDEXX) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node
  * HTTP server that speaks IDEXX's public, documented dialect closely enough for the REAL
- * `dmi-engine-idexx-integration` container to drive it: ordering (`/api/v1/*`), the confirmOrder
- * browser handshake (`/ui` -> HTML+cookie -> XHR PUT), and results (`/api/v3/*`, latest-batch poll
- * + confirm/ack + search). A separate control plane (`/__control__/*`) lets tests seed results,
- * inspect received orders and inject error scenarios so the order->result->report loop is
- * deterministic and CI-safe. It NEVER talks to real IDEXX and never authenticates for real; the
- * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is.
+ * `dmi-engine-idexx-integration` container to drive it: ordering (`/api/v1/*`, the order's form as
+ * a PDF at its `pdfURL` among it), the confirmOrder browser handshake (`/ui` -> HTML+cookie -> XHR
+ * PUT), and results (`/api/v3/*`, latest-batch poll + confirm/ack + search). A separate control
+ * plane (`/__control__/*`) lets tests seed results, inspect received orders and inject error
+ * scenarios so the order->result->report loop is deterministic and CI-safe. It NEVER talks to real
+ * IDEXX and never authenticates for real; the integration's dummy Basic credentials and X-Pims-*
+ * headers are accepted as-is.
  *
  * Control routes: `POST /__control__/orders/:requisitionId/results` seeds a result,
  * `GET /__control__/orders[/:requisitionId]` lists or reads the orders received,
@@ -63,10 +64,11 @@ function log (message) {
  * scenario on a key no route takes would never fire. */
 const SCENARIO_KEYS = ['authValidate', 'createOrder', 'resultsLatest', 'ivlsDevices', 'resultsLatestDelay']
 
-/* The keys a transport fault can be armed on, each one route: the order create and the device
- * list. A fault is wired on a route only together with a test that uses it; adding one is a line in
- * that route's handler and a name here. */
-const FAULT_KEYS = ['createOrder', 'ivlsDevices']
+/* The keys a transport fault can be armed on, each one route: the order create, the three steps of
+ * the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup, `uiOrderPut` the
+ * submission), the manifest PDF, and the device list. A fault is wired on a route only together
+ * with a test that uses it; adding one is a line in that route's handler and a name here. */
+const FAULT_KEYS = ['createOrder', 'uiPage', 'uiOrderGet', 'uiOrderPut', 'manifest', 'ivlsDevices']
 
 /* Outside the resettable state, like the order ids: POST /__control__/reset disarms every fault and
  * destroys the connections they hold (see src/mock-faults). */
@@ -176,14 +178,17 @@ function takeScenario (key) {
 /* ---- IDEXX response builders (SYNTHETIC data) ---- */
 
 /* The create-order response the integration expects (`IdexxOrder`). `uiURL` points back at this
- * mock so the confirmOrder browser flow lands here; `pdfURL` is intentionally omitted so the
- * integration skips the binary manifest fetch (kept simple — the loop doesn't need a PDF). */
+ * mock so the confirmOrder browser flow lands here, and so does `pdfURL`, the order's form as a PDF
+ * (the integration's manifest), in the shape IDEXX gives it: `/api/v1/pdf/<order id>` with the
+ * order's token and id in the query string. The origin is the one the order was created through,
+ * kept on the order, so the URL the integration was given is the URL the control plane reports. */
 function buildOrderResponse (order, origin) {
   return {
     idexxOrderId: order.idexxOrderId,
     corporateRequisitionId: order.corporateRequisitionId,
     editable: true,
     status: order.status,
+    pdfURL: order.pdfURL,
     uiURL: `${origin}/ui?token=${order.uiToken}&orderId=${order.idexxOrderId}`,
     veterinarian: order.veterinarian,
     patients: order.patients,
@@ -195,6 +200,41 @@ function buildOrderResponse (order, origin) {
     notes: order.notes ?? '',
     technician: order.technician ?? null,
   }
+}
+
+/* The order's form as IDEXX serves it from `pdfURL`: a real PDF (one page, Helvetica, a valid xref
+ * table), whose text names the order and nothing else. SYNTHETIC: the mock's own wording and the
+ * order's ids, no clinic or patient data. The same bytes for every fetch of one order, so the
+ * control plane can report their digest and a test can compare what dmi-api stored with it. */
+function pdfText (value) {
+  return String(value).replace(/[\\()]/g, (character) => `\\${character}`)
+}
+
+function buildManifestPdf (order) {
+  const lines = [
+    'VetConnect Plus (mock) - order form',
+    `IDEXX order ${order.idexxOrderId}`,
+    `Requisition ${order.corporateRequisitionId}`,
+  ]
+  const text = lines.map((line, i) => `BT /F1 12 Tf 72 ${720 - 18 * i} Td (${pdfText(line)}) Tj ET`).join('\n')
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${Buffer.byteLength(text, 'latin1')} >>\nstream\n${text}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = []
+  objects.forEach((body, i) => {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'))
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`
+  })
+  const xref = Buffer.byteLength(pdf, 'latin1')
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf, 'latin1')
 }
 
 /* Default synthetic result for an order: one Chemistry panel with NUMERIC analytes that exercise
@@ -519,10 +559,16 @@ async function handleCreateOrder (req, res) {
       ? String(payload.corporateRequisitionId)
       : `VCP-${idexxOrderId}`
 
+  /* One token per order, in both of its URLs, as IDEXX's own carry one. */
+  const uiToken = uuid().replace(/-/g, '')
   const order = {
     idexxOrderId,
     corporateRequisitionId,
-    uiToken: uuid().replace(/-/g, ''),
+    uiToken,
+    pdfURL: `${originFor(req)}/api/v1/pdf/${idexxOrderId}?token=${uiToken}&orderId=${idexxOrderId}`,
+    /* The order's status at each fetch of its PDF the mock answered, oldest first (see
+     * handleManifest). A fetch a transport fault took is the fault's to count, not this list's. */
+    manifestFetches: [],
     /* CREATED maps to WAITING_FOR_INPUT in the integration until confirmOrder submits it; the
      * confirmOrder PUT flips this to SUBMITTED. */
     status: 'CREATED',
@@ -571,6 +617,7 @@ async function handleExternalOrders (req, res) {
 function handleUiPage (req, res) {
   /* Step 1 of confirmOrder: the integration GETs uiURL and harvests Set-Cookie. The body is
    * irrelevant to it; the cookie is what matters (it replays it on the XHR GET/PUT). */
+  if (faults.intercept('uiPage', req, res)) return
   const session = uuid().replace(/-/g, '')
   sendHtml(res, 200, '<!doctype html><title>VetConnect Plus (mock)</title><body>order setup</body>', {
     'set-cookie': `VCPSESSION=${session}; Path=/`,
@@ -581,6 +628,7 @@ async function handleUiOrderGet (req, res, params) {
   /* Step 2: the integration GETs the order-setup payload it will transform and PUT back. It mutates
    * `notes.collectionDate` (so `notes` must be an object) and maps over `tests` (so `tests` must be
    * an array of `{ code, sd }`); the other fields it simply deletes. */
+  if (faults.intercept('uiOrderGet', req, res)) return
   const order = state.orders.get(params.orderId)
   const tests = (order?.tests || []).map((code) => ({ code: String(code), sd: 'ALL' }))
   sendJson(res, 200, {
@@ -603,7 +651,10 @@ async function handleUiOrderGet (req, res, params) {
 
 async function handleUiOrderPut (req, res, params) {
   /* Step 3: the integration PUTs the transformed order to submit it. We record the submission and
-   * return an empty confirm response (no pdfURL, so the integration skips a manifest fetch). */
+   * answer with the order's `pdfURL`, which the integration reads from this answer
+   * (`IdexxConfirmOrderResponse`) and fetches again once the order is submitted. That the live
+   * confirm answers with one is the integration's reading of it, unprobed here. */
+  if (faults.intercept('uiOrderPut', req, res)) return
   await readBody(req)
   const order = state.orders.get(params.orderId)
   if (order != null) {
@@ -611,7 +662,30 @@ async function handleUiOrderPut (req, res, params) {
     order.confirmedAt = nowIso()
     log(`confirmed (submitted) order idexxOrderId=${params.orderId}`)
   }
-  sendJson(res, 200, {})
+  sendJson(res, 200, order != null ? { pdfURL: order.pdfURL } : {})
+}
+
+/* The order's form, at its `pdfURL`. The integration fetches it the way it makes every ordering
+ * call — HTTP Basic and the X-Pims-* headers — with the token and order id the URL carries. Basic is
+ * required, as on auth/validate, and the token must be the order's: a URL rebuilt without it, or
+ * for another order, is answered 404 like an unknown order. The 404 body is this mock's own, as
+ * handleGetOrder's is; IDEXX's answer to a bad PDF token has not been seen. */
+function handleManifest (req, res, params, query) {
+  if (faults.intercept('manifest', req, res)) return
+  const hasBasic = String(req.headers.authorization || '').toLowerCase().startsWith('basic ')
+  if (!hasBasic) {
+    sendJson(res, 401, { valid: false, message: 'missing Basic credentials' })
+    return
+  }
+  const order = state.orders.get(params.orderId)
+  if (order == null || query.get('token') !== order.uiToken || query.get('orderId') !== order.idexxOrderId) {
+    sendJson(res, 404, { code: '404', message: 'Order not found' })
+    return
+  }
+  order.manifestFetches.push(order.status)
+  const pdf = buildManifestPdf(order)
+  res.writeHead(200, { 'content-type': 'application/pdf', 'content-length': pdf.length })
+  res.end(pdf)
 }
 
 /* ---- results handlers (/api/v3) ---- */
@@ -781,6 +855,12 @@ function controlOrderView (order) {
     speciesCode: patient.speciesCode,
     breedCode: patient.breedCode,
     genderCode: patient.genderCode,
+    /* The order's `pdfURL` as the integration was given it, the order's status at each fetch of it
+     * the mock answered, and the SHA-256 of the PDF it serves there, so a scenario can tell which
+     * fetches ran and that dmi-api stored these bytes. */
+    pdfURL: order.pdfURL,
+    manifestFetches: [...order.manifestFetches],
+    pdfSha256: crypto.createHash('sha256').update(buildManifestPdf(order)).digest('hex'),
   }
 }
 
@@ -908,6 +988,7 @@ const routes = [
     sendJson(res, 200, refList(Object.entries(SPECIES_NAMES).map(([code, name]) => ({ code, name }))))],
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
   ['GET', /^\/api\/v1\/ivls\/devices$/, handleIvlsDevices],
+  ['GET', /^\/api\/v1\/pdf\/(?<orderId>[^/]+)$/, handleManifest],
 
   ['GET', /^\/ui$/, handleUiPage],
   ['GET', /^\/ui\/order\/(?<orderId>[^/]+)$/, handleUiOrderGet],

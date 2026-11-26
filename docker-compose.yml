@@ -145,6 +145,12 @@ services:
       # The integration's own default, set here so that the overlapping-polls test, whose held
       # answer has to come inside it, reads the same value instead of repeating the default.
       IDEXX_HTTP_TIMEOUT_MS: '${HARNESS_IDEXX_HTTP_TIMEOUT_MS:-30000}'
+      # The create POST's own timeout, dialled down from the integration's 80 s to under the 10 s
+      # dmi-api waits for the engine here (src/env.ts), so that a create held past it fails at the
+      # integration, naming its timeout, before dmi-api gives up on the RPC. A create to the mock
+      # answers in milliseconds, so nothing else in the loop comes near it. It differs from
+      # IDEXX_HTTP_TIMEOUT_MS, so the error says which of the two the create waited for.
+      IDEXX_CREATE_ORDER_TIMEOUT_MS: '${HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS:-5000}'
       # How long the results poll lock lasts as first taken. Shorter than the overlapping-polls
       # test holds a poll in flight (three poll intervals), so the lock would run out under that
       # poll: only a lock that is extended while its poll runs still keeps the other replica out.

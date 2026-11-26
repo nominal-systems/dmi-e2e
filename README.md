@@ -413,7 +413,16 @@ the next ticks fall due meanwhile — and with the held poll occupying its repli
 the other replica can take them — and the batch must still be fetched once and confirmed once, with
 one `report:updated` for it. Compose also gives the integration's results poll lock a lifetime shorter
 than that hold (`HARNESS_IDEXX_RESULTS_LOCK_TTL_MS`), so the test fails as well on a lock that is not
-extended while its poll runs.
+extended while its poll runs. Before it, one `describe` fails one IDEXX call of a placement at a time
+with a transport fault (see "Transport faults in the mocks"):
+[dmi-engine-idexx-integration#81](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/81)'s
+create timeout, with a create held past it (`HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS`), and its manifest
+fetch that no longer fails the create;
+[dmi-engine-idexx-integration#83](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/83)'s
+named transport errors, with a create reset or stalled and a device list cut short after its headers;
+a failed confirm step that still reports the created order; and
+[dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s
+tripwire, an order the confirm submitted whose manifest fetch after it fails.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -524,7 +533,19 @@ closely enough for the real integration to drive it unmodified:
   scenario pins the empty device list at the control plane instead.
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
-  integration issues to submit the order.
+  integration issues to submit the order. The `PUT` answers with the order's `pdfURL`, which the
+  integration reads from that answer and fetches once more after the submission. That the live
+  confirm answers with one is the integration's reading of it (`IdexxConfirmOrderResponse`), not
+  something probed here.
+- **Manifest**: the create answer carries a `pdfURL` in IDEXX's shape, `/api/v1/pdf/<order id>?token=
+  <token>&orderId=<order id>`, pointing back at the mock, and the mock serves the order's form there
+  as a real PDF (synthetic text naming the order). Like every ordering call it needs HTTP Basic, and
+  the token must be the order's: a URL rebuilt without it is answered 404, like an unknown order (a
+  body of the mock's own; IDEXX's answer to a bad token has not been seen). So every placement runs
+  the integration's manifest fetch: once after the create, and with autoSubmitOrder once more after
+  the confirm. `GET /__control__/orders/<requisition>` reports the order's `pdfURL`, the order's status
+  at each fetch the mock answered (`manifestFetches`) and the SHA-256 of the PDF (`pdfSha256`), so a
+  test can tell which fetches ran and that dmi-api stored these bytes.
 - **Results** (`/api/v3/*`): the latest-results batch poll, its `confirm/:batchId` ack, and search.
   A batch stays on the poll until it is confirmed — a result that arrives meanwhile joins the next
   batch, formed after the confirm, as IDEXX's spec has each batch acknowledged before the next can be
@@ -542,11 +563,14 @@ closely enough for the real integration to drive it unmodified:
   the mock meanwhile: it is how the loop puts two polls of one integration in flight at once.
   `GET /__control__/scenarios` lists everything armed — the status scenarios (with `hits`; a `once`
   scenario leaves the list when it is used) and the transport faults — and
-  `DELETE /__control__/scenarios/<key>` disarms one key. A status scenario on a key the mock does not
-  have (`authValidate`, `createOrder`, `resultsLatest`, `ivlsDevices`, `resultsLatestDelay`) is
-  refused.
-- **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder` and
-  `ivlsDevices`. `resultsLatestDelay` stays a scenario of its own rather than a `hold`: it waits for
+  `DELETE /__control__/scenarios/<key>` disarms one key. The status-scenario keys are
+  `authValidate`, `createOrder`, `resultsLatest`, `ivlsDevices` and `resultsLatestDelay`; a scenario
+  on any other key is refused.
+- **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder`, the
+  three steps of the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup,
+  `uiOrderPut` the submission), `manifest` (the PDF) and `ivlsDevices`. There is none on the results
+  confirm: no test yet asserts an outcome for a failed one. `resultsLatestDelay` stays a scenario of
+  its own rather than a `hold`: it waits for
   the first answer that carries a batch, letting empty polls through, and the batch ledger counts
   the polls that reach the mock while it holds. The dmi-engine-idexx-integration#88 test reads both.
   A `hold` on a route takes its next request, whatever the answer.
@@ -807,6 +831,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_IDEXX_REPLICAS` | `2` | idexx only. How many replicas of the integration container compose runs, each with the integration's default of one results worker. When the integration runs as more than one replica, two results polls of one integration can be in flight at once; with one replica the loop could never show that. The overlapping-polls test needs at least 2 and refuses to run with fewer. It reads the variable from its own environment, so set it there: a value in a slot tree's `.env` reaches compose but not the test. |
 | `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS` | `5000` | idexx only. How long the integration's results poll lock lasts as first taken (its `IDEXX_RESULTS_LOCK_TTL_MS`), dialed down from the integration's default so that it runs out while the overlapping-polls test still holds a poll in flight: the test then also fails on a lock that is not extended while its poll runs. It has to be a positive number of milliseconds under two poll intervals, and the test refuses to run otherwise: the integration replaces any other value with its own default, which outlasts the hold. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
 | `HARNESS_IDEXX_HTTP_TIMEOUT_MS` | `30000` | idexx only. The integration's HTTP timeout (its `IDEXX_HTTP_TIMEOUT_MS`), at the integration's own default. It is set so that the overlapping-polls test reads the value the integration runs with: the answer that test holds for three poll intervals has to come inside it, and the test refuses to run otherwise. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
+| `HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS` | `5000` | idexx only. The integration's timeout for the create POST (its `IDEXX_CREATE_ORDER_TIMEOUT_MS`, 80 s by default), dialled down to under the 10 s dmi-api waits for the engine here, so that a create held past it fails at the integration, naming its timeout, before dmi-api gives up on the RPC. The held-create test refuses to run unless it is below dmi-api's `ENGINE_RESPONSE_TIMEOUT` and differs from `HARNESS_IDEXX_HTTP_TIMEOUT_MS`, which the error would otherwise not tell apart. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
 | `HARNESS_ANTECH_V3_MOCK_PORT` | `3013` | antech-v3 only. Host port for the antech-v3 mock (its `/__control__` plane and `/status`). |
 | `HARNESS_ANTECH_V3_MOCK_URL` | `http://$HARNESS_HOST:3013` | antech-v3 only. Host-facing mock base URL the scenario drives. |
 | `HARNESS_ANTECH_V3_BASE_URL` | `http://antech-v3-mock:3000` | antech-v3 only. Compose-network base URL stored in the provider config; the integration appends `/api/v1.1/<endpoint>` to it. Never point at a live Antech host. |
@@ -917,8 +942,10 @@ scenarios/
   engine-failures.e2e.ts      an engine that does not answer is a 504 (devices and refs), not a 404
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, an order
                               throttled on every event write is still sent to the provider (dmi-api#371),
-                              and two results polls in flight deliver a batch once
-                              (dmi-engine-idexx-integration#88)
+                              IDEXX calls that time out, reset or stall fail named, and a failed manifest
+                              or confirm step still reports the created order
+                              (dmi-engine-idexx-integration#81, #83, #93), and two results polls in
+                              flight deliver a batch once (dmi-engine-idexx-integration#88)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
@@ -957,6 +984,7 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 |---|---|---|---|
 | fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
 | fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| idexx | `the order is reported SUBMITTED` (under `a confirm that succeeds and a manifest fetch after it that fails`) | An order the confirm submitted is reported `SUBMITTED`, whatever becomes of the manifest fetch after it. Today `WAITING_FOR_INPUT`: the integration sets `SUBMITTED` only after that fetch, in a `try` whose `catch` only logs, so a failed fetch skips it while the order sits submitted at IDEXX | [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93) |
 | zoetis | `the dmi order's local test list shrinks to the remaining code` | Cancelling one test removes it from the dmi order's test list. Today the provider-side cancel happens, but dmi-api appends the cancelled test to the order's list instead of removing it | not yet filed |
 | antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
