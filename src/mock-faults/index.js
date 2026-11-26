@@ -51,12 +51,16 @@
  *
  * Every arming gets an `id`. disarm(key, id) disarms the key's fault only while it is that arming,
  * so a test whose cleanup runs late (after a jest timeout, say) cannot disarm the next test's fault
- * on the same key.
+ * on the same key. The ids come from one counter per mock, which never restarts while the mock runs
+ * (reset() leaves it alone), so an id never comes back. nextArmingId() hands out the counter's next
+ * id for the mock's other switches (a status scenario, a token revocation), which are then disarmed
+ * by id the same way, and no two armings in the mock share one.
  *
  * A mock wires it in three places:
  *   const faults = createFaults({ keys: ['createOrder', …], log })
  *   in a route handler, first:   if (faults.intercept('createOrder', req, res)) return
- *   in its control plane:        faults.arm(spec), faults.list(), faults.disarm(key, id), faults.reset()
+ *   in its control plane:        faults.arm(spec), faults.list(), faults.disarm(key, id), faults.reset(),
+ *                                and faults.nextArmingId() for any switch of its own it disarms by id
  * intercept() answers true only for a reset, which has taken the request: the handler must not
  * answer it. For a hold or a stall it answers false, and the handler answers as it always does: its
  * writes are captured and sent late, or in part. */
@@ -164,7 +168,12 @@ function createFaults (options) {
   const armed = new Map()
   /* Every connection a fault still holds or stalls, across keys: { fault, close(outcome) }. */
   const open = new Set()
+  /* The arming ids, the faults' and the mock's other switches': never rewound, not by reset(). */
   let nextId = 1
+
+  function nextArmingId () {
+    return nextId++
+  }
 
   function view (fault) {
     const { key, fault: kind, times, hits, id, requests, ...rest } = fault
@@ -191,7 +200,7 @@ function createFaults (options) {
     if (checked.error != null) return { error: checked.error }
     const previous = armed.get(checked.fault.key)
     if (previous != null) closeOpen(previous, 'destroyed')
-    const fault = { ...checked.fault, id: nextId++, hits: 0, requests: [] }
+    const fault = { ...checked.fault, id: nextArmingId(), hits: 0, requests: [] }
     armed.set(fault.key, fault)
     log(`fault armed on '${fault.key}': ${JSON.stringify(view(fault))}`)
     return { fault: view(fault) }
@@ -297,7 +306,7 @@ function createFaults (options) {
     return false
   }
 
-  return { arm, disarm, reset, list, intercept }
+  return { arm, disarm, reset, list, intercept, nextArmingId }
 }
 
 module.exports = { createFaults, FAULTS, MAX_OPEN_MS, DEFAULT_STALL_CAP_MS }

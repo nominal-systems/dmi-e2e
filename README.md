@@ -331,12 +331,17 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   take with, at that status (`/Tests/v6` answers with its own 404 whatever the status), and accepts
   every token a later login issues. It counts the calls it refused, per operation, and the logins it
   saw, and it is listed with those counts, on `GET /__control__/revocation` and beside the error
-  scenarios on `GET /__control__/scenarios`, until `DELETE /__control__/revocation` disarms it and
-  answers with the final counts. Disarming makes the refused tokens good again: the integration
-  caches a token for 12 hours in each engine process, and a test that ended with one still held
-  would leave the polls failing for the rest of the run. With it, the loop shows that a placement
-  whose cached token is refused with a 401 logs in again and goes through, and that a refusal
-  answered 500 makes nothing log in; and it pins, as a tripwire, that the two polls do not recover
+  scenarios on `GET /__control__/scenarios`, until `DELETE /__control__/revocation?id=<id>` disarms
+  it and answers with the final counts. Arming it answers with its `id`, from the counter the
+  transport faults' ids come from, and a disarm by id disarms it only while that arming is the one
+  armed, answering `cleared: false` and `revocation: null` otherwise, so a test whose cleanup runs
+  late (after a jest timeout) cannot disarm a later test's revocation; with no id it disarms
+  whatever is armed, which only the sweeps after each test do. Disarming makes the refused tokens
+  good again: the integration caches a token for 12 hours in each engine process, and a test that
+  ended with one still held would leave the polls failing for the rest of the run. With it, the
+  loop shows that a placement whose cached token is refused with a 401 logs in again and goes
+  through, and that a refusal answered 500 makes nothing log in; and it pins, as a tripwire, that
+  the two polls do not recover
   ([dmi-engine-antech-v6-integration#95](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/95)).
   An error scenario answering 429 or 503 can carry a `Retry-After` header (`retryAfter` on
   `POST /__control__/scenarios`: whole seconds, or a string sent as it is, such as an HTTP date);
@@ -411,12 +416,14 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   `WIS_VOY__001: You do not have permission to access these records. Must have a valid token.` 401
   production logged for every activation of that outage. It counts the calls it refused, per
   endpoint, and the logins it saw, and it is listed with those counts, on
-  `GET /__control__/revocation` and on the call log, until `DELETE /__control__/revocation` disarms it
-  and answers with the final counts. Disarming makes the refused tokens good again: the integration
-  caches its token for ten days. Each call-log entry records the status it was answered with. The
-  loop shows the revocation refusing both feeds and an activation and accepting a token issued after
-  it, and pins, as a tripwire, that the integration never logs in again, so that neither feed is read
-  until the revocation is lifted. The revocation always refuses with 401, and takes no options: a
+  `GET /__control__/revocation` and on the call log, until `DELETE /__control__/revocation?id=<id>`
+  disarms it and answers with the final counts. As on the antech-v6 mock, arming it answers with its
+  `id`, a disarm by id takes it only while that arming is the one armed, and with no id, which only
+  the sweep after each test uses, whatever is armed. Disarming makes the refused tokens good again:
+  the integration caches its token for ten days. Each call-log entry records the status it was
+  answered with. The loop shows the revocation refusing both feeds and an activation and accepting
+  a token issued after it, and pins, as a tripwire, that the integration never logs in again, so
+  that neither feed is read until the revocation is lifted. The revocation always refuses with 401, and takes no options: a
   body that names any, a `status` say, is refused with a 400 naming what it takes. No test here
   stages another status, because nothing the integration does today depends on it (it logs in again
   on none, and with dmi-engine-common 1.7.0 its polls see a 500 whatever the vendor answered); a
@@ -808,7 +815,9 @@ ones.
   holds or stalls. The client sees the request fail; it never gets a late answer.
 - Every open connection also has its own end: a hold's `delayMs`, a stall's `capMs`.
 - `DELETE …?id=<id>` disarms the fault only while it is that arming, so a cleanup that runs late
-  (after a jest timeout) cannot disarm the next test's fault on the same key.
+  (after a jest timeout) cannot disarm the next test's fault on the same key. The ids come from one
+  counter per mock that never restarts while it runs, not on `POST /__control__/reset` either, so an
+  id never comes back.
 
 A scenario that arms a fault disarms it in a `finally` with its id. It then asserts the count the
 `DELETE` returns: a fault that never fired fails the test. A `describe` that arms faults asserts at
@@ -818,7 +827,9 @@ its start that nothing is armed, and after each test, that the test left nothing
 
 - `const faults = createFaults({ keys, log })`;
 - `if (faults.intercept('<key>', req, res)) return` as the first line of each route's handler;
-- the control routes above calling `faults.arm`, `faults.list`, `faults.disarm` and `faults.reset`.
+- the control routes above calling `faults.arm`, `faults.list`, `faults.disarm` and `faults.reset`;
+  and `faults.nextArmingId()` for any switch of the mock's own that is disarmed by id the same way
+  (the antech-v6 mock's token revocation), so that no two armings in a mock share an id.
 
 `intercept` answers true only for a reset, which has taken the request. For a hold or a stall the
 handler answers as it always does, and the module sends that answer late or in part. A key is wired

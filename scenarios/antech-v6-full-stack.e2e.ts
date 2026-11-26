@@ -289,9 +289,10 @@ interface RedeliveryWindow {
 }
 
 /* The mock's token revocation, as its control plane lists it (the mock's header, load-bearing
- * detail 10): the status it refuses with, how many tokens it refuses, the calls it refused per
- * operation, and the logins made while it was armed. */
+ * detail 10): the arming's id, the status it refuses with, how many tokens it refuses, the calls it
+ * refused per operation, and the logins made while it was armed. */
 interface Revocation {
+  id: number
   status: number
   armedAt: string
   revokedTokens: number
@@ -554,7 +555,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         `clear what is left armed on '${key}' at the mock`,
       )
     }
-    if (revocation != null) await disarmRevocation()
+    if (revocation != null) await disarmRevocation(null)
     expect({ leftoverScenarios, leftoverFaults, leftoverRevocation: revocation }).toEqual({
       leftoverScenarios: [],
       leftoverFaults: [],
@@ -563,7 +564,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
   }
 
   /* Revoke every token the mock has issued so far, refused with `status` (401 when left out); the
-   * tokens later logins issue are accepted. */
+   * tokens later logins issue are accepted. The answer carries the arming's id, for its disarm. */
   async function armRevocation (status?: number): Promise<Revocation> {
     return expectOk<{ revocation: Revocation }>(
       await mock.post('/__control__/revocation', status === undefined ? {} : { status }),
@@ -578,13 +579,16 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     ).revocation
   }
 
-  /* Disarm the revocation and return what it did, null if none was armed. The tokens it refused are
-   * good again. Safe to call twice: each test disarms as soon as it is done with it, and again in
-   * its `finally`. */
-  async function disarmRevocation (): Promise<Revocation | null> {
+  /* Disarm the revocation armed as `id`, and return what it did: null once that arming is no longer
+   * the one armed (disarmed already, or a later test armed its own). By id, so that a disarm that
+   * runs late, from a `finally` jest reaches after the test timed out, cannot take the next test's
+   * revocation. `null` disarms whatever is armed, and is for the sweep after each test alone. The
+   * tokens it refused are good again. Safe to call twice: each test disarms as soon as it is done
+   * with it, and again in its `finally`. */
+  async function disarmRevocation (id: number | null): Promise<Revocation | null> {
     return expectOk<{ revocation: Revocation | null }>(
-      await mock.delete('/__control__/revocation'),
-      'disarm the revocation at the mock',
+      await mock.delete(id == null ? '/__control__/revocation' : `/__control__/revocation?id=${id}`),
+      id == null ? 'disarm whatever revocation is armed at the mock' : `disarm revocation ${id} at the mock`,
     ).revocation
   }
 
@@ -3390,10 +3394,11 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * integration's calls and that the recovery runs where a 401 reaches it, and does not where
        * the refusal is a 5xx; the tripwire after them is the polls, where the 401 does not reach it.
        *
-       * Each test arms the revocation for as long as it needs it and disarms it in a `finally`, and
-       * this describe checks after each that nothing is left armed. Disarming makes the revoked
-       * tokens good again, so the polls recover whatever the integration did; the tests that follow
-       * would otherwise find an engine holding a dead token for 12 hours. */
+       * Each test arms the revocation for as long as it needs it and disarms it in a `finally`, by
+       * the id its arming answered with, so a `finally` that runs late cannot disarm the next test's;
+       * and this describe checks after each test that nothing is left armed, clearing whatever is.
+       * Disarming makes the revoked tokens good again, so the polls recover whatever the integration
+       * did; the tests that follow would otherwise find an engine holding a dead token for 12 hours. */
       afterEach(expectNothingLeftArmed)
 
       /* Before a revocation, both engine processes must hold a token it will refuse, as they do
@@ -3440,10 +3445,22 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         let oldAnswer: { status: number, body: any } = { status: 0, body: null }
         let newAnswer: { status: number, body: any } = { status: 0, body: null }
         let placed: ApiResponse | undefined
+        const armed = await armRevocation()
         try {
-          const armed = await armRevocation()
           /* At least the worker's, the api process's and this test's. */
           expect(armed.revokedTokens).toBeGreaterThanOrEqual(3)
+
+          /* A disarm naming another arming's id leaves this one armed: what keeps a cleanup that runs
+           * late from disarming a later test's revocation. */
+          const byAnotherId = expectOk<{ cleared: boolean, revocation: Revocation | null }>(
+            await mock.delete(`/__control__/revocation?id=${armed.id + 1}`),
+            'disarm the revocation by an id it does not have',
+          )
+          const stillArmed = await revocationNow()
+          expect({ byAnotherId, stillArmed: stillArmed?.id }).toEqual({
+            byAnotherId: { cleared: false, revocation: null },
+            stillArmed: armed.id,
+          })
 
           /* The worker's next ticks meet it on both feeds the polls read. */
           polls = await pollUntil(
@@ -3462,9 +3479,9 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
            * integration whole (the placement's accession-id extractor reads the request, not the
            * error body), so `withAuthentication` logs in again and the order goes through. */
           placed = await org.api.post('/orders', payload, { autoSubmitOrder: true })
-          revocation = await disarmRevocation()
+          revocation = await disarmRevocation(armed.id)
         } finally {
-          await disarmRevocation()
+          await disarmRevocation(armed.id)
         }
 
         expect({
@@ -3519,8 +3536,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
         let revocation: Revocation | null = null
         let placed: ApiResponse | undefined
+        const armed = await armRevocation(500)
         try {
-          await armRevocation(500)
           placed = await org.api.post('/orders', payload, { autoSubmitOrder: true })
           console.log(
             `[antech-v6-scenario] placement under a 500 revocation -> HTTP ${placed.status}: ${placed.text.slice(0, 300)}`,
@@ -3532,9 +3549,9 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
             NEGATIVE_WAIT_MS,
             500,
           )
-          revocation = await disarmRevocation()
+          revocation = await disarmRevocation(armed.id)
         } finally {
-          await disarmRevocation()
+          await disarmRevocation(armed.id)
         }
 
         expect({ ok: placed?.ok, errors: placed?.body?.errors }).toEqual({
@@ -3603,8 +3620,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         let revocation: Revocation | null = null
         let draftStatus: unknown
         let reportStatus: unknown
+        const armed = await armRevocation()
         try {
-          await armRevocation()
           expectOk(
             await mock.post(`/__control__/orders/${encodeURIComponent(draftRequisitionId)}/promote`, {}),
             'complete the draft at the provider',
@@ -3646,9 +3663,9 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
               .getStatusLabOrder
           const pollsAfter = await ordersPolls()
           await pollUntil(ordersPolls, (polls) => polls >= pollsAfter + 2, NEGATIVE_WAIT_MS, 500)
-          revocation = await disarmRevocation()
+          revocation = await disarmRevocation(armed.id)
         } finally {
-          await disarmRevocation()
+          await disarmRevocation(armed.id)
         }
 
         expect({ draft: draftStatus, report: reportStatus }).toEqual({ draft: 'SUBMITTED', report: 'FINAL' })

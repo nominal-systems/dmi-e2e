@@ -271,9 +271,10 @@ interface MockCall {
 }
 
 /* The mock's token revocation, as its control plane lists it (the mock's header, load-bearing
- * detail 5): how many tokens it refuses (with a 401), the calls it refused per endpoint, and the
- * logins made while it was armed. */
+ * detail 5): the arming's id, how many tokens it refuses (with a 401), the calls it refused per
+ * endpoint, and the logins made while it was armed. */
 interface Revocation {
+  id: number
   armedAt: string
   revokedTokens: number
   refused: Record<string, number>
@@ -545,7 +546,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
   }
 
   /* Revoke every token the mock has issued so far, refused with a 401; the tokens later logins issue
-   * are accepted. */
+   * are accepted. The answer carries the arming's id, for its disarm. */
   async function armRevocation (): Promise<Revocation> {
     return expectOk<{ revocation: Revocation }>(
       await mock.post('/__control__/revocation', {}),
@@ -560,13 +561,16 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     ).revocation
   }
 
-  /* Disarm the revocation and return what it did, null if none was armed. The tokens it refused are
-   * good again. Safe to call twice: each test disarms as soon as it is done with it, and again in
-   * its `finally`. */
-  async function disarmRevocation (): Promise<Revocation | null> {
+  /* Disarm the revocation armed as `id`, and return what it did: null once that arming is no longer
+   * the one armed (disarmed already, or a later test armed its own). By id, so that a disarm that
+   * runs late, from a `finally` jest reaches after the test timed out, cannot take the next test's
+   * revocation. `null` disarms whatever is armed, and is for the sweep after each test alone. The
+   * tokens it refused are good again. Safe to call twice: each test disarms as soon as it is done
+   * with it, and again in its `finally`. */
+  async function disarmRevocation (id: number | null): Promise<Revocation | null> {
     return expectOk<{ revocation: Revocation | null }>(
-      await mock.delete('/__control__/revocation'),
-      'disarm the revocation at the mock',
+      await mock.delete(id == null ? '/__control__/revocation' : `/__control__/revocation?id=${id}`),
+      id == null ? 'disarm whatever revocation is armed at the mock' : `disarm revocation ${id} at the mock`,
     ).revocation
   }
 
@@ -2534,14 +2538,15 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     }, ORDER_WAIT_MS + 60_000)
 
     describe('a token Wisdom revokes (nominal-systems/dmi-engine-wisdom-panel-integration#53)', () => {
-      /* Both tests arm the revocation and disarm it in a `finally`. A test that failed or timed out
-       * before its `finally` ran would leave the engine's token refused for every test after it, so
-       * after each one whatever is still armed (the revocation, or bearer acceptance switched off)
-       * is cleared and then named as a failure; jest reports a failing `afterEach` on the test it
-       * followed. */
+      /* Both tests arm the revocation and disarm it in a `finally`, by the id its arming answered
+       * with, so a `finally` that runs late cannot disarm the next test's. A test that failed or
+       * timed out before its `finally` ran would leave the engine's token refused for every test
+       * after it, so after each one whatever is still armed (the revocation, or bearer acceptance
+       * switched off) is cleared and then named as a failure; jest reports a failing `afterEach` on
+       * the test it followed. */
       afterEach(async () => {
         const log = await mockCalls()
-        if (log.revocation != null) await disarmRevocation()
+        if (log.revocation != null) await disarmRevocation(null)
         if (!log.acceptBearers) {
           expectOk(await mock.post('/__control__/bearer', { accept: true }), 'restore bearer acceptance at the mock')
         }
@@ -2592,10 +2597,22 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         let newStatus = 0
         let activation: { ok: boolean, status: number, errors: unknown } = { ok: true, status: 0, errors: null }
         let disarmedAt = 0
+        const armed = await armRevocation()
         try {
-          const armed = await armRevocation()
           /* At least the worker's, the api process's and the setup probe's. */
           expect(armed.revokedTokens).toBeGreaterThanOrEqual(3)
+
+          /* A disarm naming another arming's id leaves this one armed: what keeps a cleanup that runs
+           * late from disarming a later test's revocation. */
+          const byAnotherId = expectOk<{ cleared: boolean, revocation: Revocation | null }>(
+            await mock.delete(`/__control__/revocation?id=${armed.id + 1}`),
+            'disarm the revocation by an id it does not have',
+          )
+          const stillArmed = await revocationNow()
+          expect({ byAnotherId, stillArmed: stillArmed?.id }).toEqual({
+            byAnotherId: { cleared: false, revocation: null },
+            stillArmed: armed.id,
+          })
 
           polls = await pollUntil(
             revocationNow,
@@ -2617,9 +2634,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
           activation = { ok: refused.ok, status: refused.status, errors: refused.body?.errors }
 
           disarmedAt = (await mockCalls()).lastSeq
-          revocation = await disarmRevocation()
+          revocation = await disarmRevocation(armed.id)
         } finally {
-          await disarmRevocation()
+          await disarmRevocation(armed.id)
         }
 
         expect({
@@ -2708,8 +2725,8 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
 
         let revocation: Revocation | null = null
         let delivered: { orderStatus: unknown, reportStatus: unknown } = { orderStatus: undefined, reportStatus: undefined }
+        const armed = await armRevocation()
         try {
-          await armRevocation()
           const newer = await provisionKit({
             code: KIT_REVOCATION_ORDER,
             hospitalNumber: env.wisdomPanel.hospitalNumber,
@@ -2741,9 +2758,9 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
             1_000,
           )
           delivered = { orderStatus: order?.status, reportStatus: report.body?.status }
-          revocation = await disarmRevocation()
+          revocation = await disarmRevocation(armed.id)
         } finally {
-          await disarmRevocation()
+          await disarmRevocation(armed.id)
         }
 
         /* `processing` maps to PARTIAL. */

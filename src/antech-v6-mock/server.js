@@ -171,10 +171,14 @@
  *    issues after it is accepted. It counts what it refused, per operation (keyed as
  *    `GET /__control__/calls` keys its counters), and the logins it saw, and it is listed with
  *    those counts (`GET /__control__/revocation`, and beside the scenarios) until
- *    `DELETE /__control__/revocation` disarms it, answering with the final counts. Only one can be
- *    armed at a time. Disarming makes the revoked tokens good again — a harness rule, not a provider
- *    one: the integration keeps a token for 12 hours, and a test that ended with an engine process
- *    still holding a refused token would leave every later test's polls failing. How Antech answers
+ *    `DELETE /__control__/revocation?id=<n>` disarms it, answering with the final counts. Only one
+ *    can be armed at a time. Arming it answers with its `id` (from the counter the transport faults'
+ *    ids come from, src/mock-faults), and a disarm by id disarms it only while it is that arming, so
+ *    a test whose cleanup runs late cannot disarm a later test's revocation; with no id the disarm
+ *    takes whatever is armed, which only the sweep after each test does. Disarming makes the revoked
+ *    tokens good again — a harness rule, not a provider one: the integration keeps a token for 12
+ *    hours, and a test that ended with an engine process still holding a refused token would leave
+ *    every later test's polls failing. How Antech answers
  *    a token it revoked is not known (the endpoint was never asked about a token it had not
  *    issued, see `requireHeaderToken`), so the 401 envelope is the mock's answer to an unknown
  *    token, and any other status in it is INVENTED.
@@ -560,8 +564,8 @@ function freshState () {
     /* Tokens the mock has issued, token -> { userId, issuedAt }. A fresh token per login, and a
      * second login does NOT invalidate the first (load-bearing detail 10). */
     tokens: new Map(),
-    /* The armed token revocation, or null (load-bearing detail 10): { status, armedAt, revoked (the
-     * tokens issued before it), refused (per operation), logins }. */
+    /* The armed token revocation, or null (load-bearing detail 10): { id, status, armedAt, revoked
+     * (the tokens issued before it), refused (per operation), logins }. */
     revocation: null,
     /* ClinicAccessionID -> order record. Antech keys everything on this id: the integration sends
      * it at placement, assigns it as BOTH requisitionId and externalId, and dmi-api reconciles a
@@ -2188,6 +2192,8 @@ function handleControlListScenarios (req, res) {
 function publicRevocation (revocation) {
   if (revocation == null) return null
   return {
+    /* The arming's id, which its disarm names. */
+    id: revocation.id,
     status: revocation.status,
     armedAt: revocation.armedAt,
     /* How many tokens it refuses: every one issued before it was armed. */
@@ -2199,8 +2205,9 @@ function publicRevocation (revocation) {
   }
 }
 
-/* Arm a revocation: `{status}`, any HTTP error status, 401 if left out. Refused while one is armed,
- * and while no token has been issued (it would refuse nothing). */
+/* Arm a revocation: `{status}`, any HTTP error status, 401 if left out. Answers with it, and its `id`
+ * from the mock's one arming counter (src/mock-faults' nextArmingId). Refused while one is armed, and
+ * while no token has been issued (it would refuse nothing). */
 async function handleControlArmRevocation (req, res) {
   const body = await readJson(req)
   const unknown = Object.keys(body).filter((key) => key !== 'status')
@@ -2215,7 +2222,7 @@ async function handleControlArmRevocation (req, res) {
   }
   if (state.revocation != null) {
     sendJson(res, 409, {
-      message: `a revocation is already armed (since ${state.revocation.armedAt}); DELETE /__control__/revocation first`,
+      message: `a revocation is already armed (id ${state.revocation.id}, since ${state.revocation.armedAt}); DELETE /__control__/revocation?id=${state.revocation.id} first`,
       revocation: publicRevocation(state.revocation),
     })
     return
@@ -2225,25 +2232,35 @@ async function handleControlArmRevocation (req, res) {
     return
   }
   state.revocation = {
+    id: faults.nextArmingId(),
     status,
     armedAt: new Date().toISOString(),
     revoked: new Set(state.tokens.keys()),
     refused: {},
     logins: 0,
   }
-  log(`control: revocation armed (${status}) over ${state.revocation.revoked.size} token(s)`)
+  log(`control: revocation ${state.revocation.id} armed (${status}) over ${state.revocation.revoked.size} token(s)`)
   sendJson(res, 200, { revocation: publicRevocation(state.revocation) })
 }
 
-/* Disarm it, and answer with what it did. 200 either way; `cleared` says whether one was armed. The
+/* Disarm it, and answer with what it did. `?id=<n>` disarms it only while it is that arming, so a
+ * test whose cleanup runs late (after a jest timeout, say) cannot disarm a later test's revocation;
+ * with no id, whatever is armed is disarmed, which only the sweep after each test does. 200 either
+ * way, as a transport fault's disarm is: `cleared` says whether one was disarmed, and `revocation` is
+ * it with its final counts, or null. An id that is not a number names no arming, as for a fault. The
  * tokens it refused are good again. */
-function handleControlClearRevocation (req, res) {
-  const revocation = publicRevocation(state.revocation)
-  state.revocation = null
-  if (revocation != null) {
-    log(`control: revocation cleared (refused ${JSON.stringify(revocation.refused)}, ${revocation.logins} login(s) while armed)`)
+function handleControlClearRevocation (req, res, params, query) {
+  const id = query.get('id')
+  const armed = state.revocation
+  if (armed == null || (id != null && armed.id !== Number(id))) {
+    if (armed != null) log(`control: revocation ${armed.id} left armed by a disarm naming id ${id}`)
+    sendJson(res, 200, { cleared: false, revocation: null })
+    return
   }
-  sendJson(res, 200, { cleared: revocation != null, revocation })
+  const revocation = publicRevocation(armed)
+  state.revocation = null
+  log(`control: revocation ${revocation.id} cleared (refused ${JSON.stringify(revocation.refused)}, ${revocation.logins} login(s) while armed)`)
+  sendJson(res, 200, { cleared: true, revocation })
 }
 
 /* `GET /__control__/calls/log[?operation=][&since=]`: the provider calls logged after `since` (a
