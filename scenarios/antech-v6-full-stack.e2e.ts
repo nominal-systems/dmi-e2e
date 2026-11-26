@@ -3420,10 +3420,23 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
       it.failing('the integration logs in again when Antech stops accepting its token, and both polls deliver again', async () => {
         /* EXPECTED: when Antech refuses the cached token with a 401, the next orders poll and the
-         * next results poll recover as a placement does: one login, and the records waiting on each
-         * feed are delivered — a draft the clinic completed reaches dmi-api as SUBMITTED, and a
-         * result as a FINAL report. ACTUAL: no poll logs in again, and nothing is delivered for as
-         * long as the token stays refused (up to the cache's 12 hours).
+         * next results poll recover as a placement does: each refused poll logs in again, the new
+         * token is cached, and the records waiting on each feed are delivered — a draft the clinic
+         * completed reaches dmi-api as SUBMITTED, and a result as a FINAL report. ACTUAL: no poll
+         * logs in again, and nothing is delivered for as long as the token stays refused (up to the
+         * cache's 12 hours).
+         *
+         * HOW MANY LOGINS: one or two, one per refused poll. The orders and the results poll are two
+         * Bull queues whose repeat jobs fall on the same instants (Bull 4 schedules an `every` job at
+         * the next multiple of the interval since the epoch), so both read the cached token before
+         * either has replaced it, both are refused, and each logs in: two logins in the same second,
+         * one per poll, measured against dmi-engine-common `main`, where the polls do recover. That
+         * is the recovery working, not the defect. What the upper bound still catches is a token
+         * that is not cached: a login on every tick. So the test watches two more orders polls after
+         * both deliveries, which would bring such an integration to at least four. Nothing else logs
+         * in while the revocation is armed here: this test places its two orders before arming it,
+         * so the api process makes no call in the window, and the scenario logs in to the mock
+         * itself only in the tests above.
          *
          * WHY: on the polls the 401 never reaches `withAuthentication`. With the dmi-engine-common
          * that dmi-engine resolves (1.7.0), the logging interceptor hands the error body to the
@@ -3493,18 +3506,26 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
               1_000,
             )
           ).body?.status
+          /* Two more orders polls answered, with the revocation still armed. */
+          const ordersPolls = async (): Promise<number> =>
+            expectOk<{ getStatusLabOrder: number }>(await mock.get('/__control__/calls'), 'read the mock call counters')
+              .getStatusLabOrder
+          const pollsAfter = await ordersPolls()
+          await pollUntil(ordersPolls, (polls) => polls >= pollsAfter + 2, NEGATIVE_WAIT_MS, 500)
           revocation = await disarmRevocation()
         } finally {
           await disarmRevocation()
         }
 
         expect({ draft: draftStatus, report: reportStatus }).toEqual({ draft: 'SUBMITTED', report: 'FINAL' })
+        const logins = revocation?.logins ?? 0
         expect({
           labOrderFeedRefused: (revocation?.refused.getStatusLabOrder ?? 0) >= 1,
           resultsFeedRefused: (revocation?.refused.getAllResults ?? 0) >= 1,
-          logins: revocation?.logins,
-        }).toEqual({ labOrderFeedRefused: true, resultsFeedRefused: true, logins: 1 })
-      }, ORDER_ACK_WAIT_MS + NEGATIVE_WAIT_MS + COMPLETION_WAIT_MS * 2 + 30_000)
+          oneOrTwoLogins: logins >= 1 && logins <= 2,
+          logins,
+        }).toEqual({ labOrderFeedRefused: true, resultsFeedRefused: true, oneOrTwoLogins: true, logins })
+      }, ORDER_ACK_WAIT_MS + NEGATIVE_WAIT_MS * 2 + COMPLETION_WAIT_MS * 2 + 30_000)
     })
   })
 
