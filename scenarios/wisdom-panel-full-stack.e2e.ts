@@ -271,10 +271,9 @@ interface MockCall {
 }
 
 /* The mock's token revocation, as its control plane lists it (the mock's header, load-bearing
- * detail 5): the status it refuses with, how many tokens it refuses, the calls it refused per
- * endpoint, and the logins made while it was armed. */
+ * detail 5): how many tokens it refuses (with a 401), the calls it refused per endpoint, and the
+ * logins made while it was armed. */
 interface Revocation {
-  status: number
   armedAt: string
   revokedTokens: number
   refused: Record<string, number>
@@ -545,12 +544,12 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     )
   }
 
-  /* Revoke every token the mock has issued so far, refused with `status` (401 when left out); the
-   * tokens later logins issue are accepted. */
-  async function armRevocation (status?: number): Promise<Revocation> {
+  /* Revoke every token the mock has issued so far, refused with a 401; the tokens later logins issue
+   * are accepted. */
+  async function armRevocation (): Promise<Revocation> {
     return expectOk<{ revocation: Revocation }>(
-      await mock.post('/__control__/revocation', status === undefined ? {} : { status }),
-      `revoke the tokens the mock has issued${status === undefined ? '' : `, refusing them with ${status}`}`,
+      await mock.post('/__control__/revocation', {}),
+      'revoke the tokens the mock has issued',
     ).revocation
   }
 
@@ -2644,8 +2643,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         })
         /* Refused once at activation; and the one login in the window is this test's own, though a
          * fixed integration would add its own, so only the floor is pinned. */
-        expect({ status: revocation?.status, activationRefused: revocation?.refused.createPet, loggedIn: (revocation?.logins ?? 0) >= 1 }).toEqual({
-          status: 401,
+        expect({ activationRefused: revocation?.refused.createPet, loggedIn: (revocation?.logins ?? 0) >= 1 }).toEqual({
           activationRefused: 1,
           loggedIn: true,
         })

@@ -84,15 +84,15 @@
  *        tokens valid again, because the engine will never come back for new ones. It stages a
  *        vendor that refuses whatever it is shown, so a new login would not help either: the audit
  *        tripwire and the test that the polls resume use it.
- *      - `POST /__control__/revocation {"status": <n>}` (401 if left out) refuses the tokens issued
- *        BEFORE it, and accepts every token a login issues after it. That is what Wisdom did on
+ *      - `POST /__control__/revocation` (an empty body) refuses the tokens issued BEFORE it, with a
+ *        401, and accepts every token a login issues after it. That is what Wisdom did on
  *        2026-11-23 after a maintenance, OBSERVED IN PRODUCTION
  *        (nominal-systems/dmi-engine-wisdom-panel-integration#53): the tokens the engine held were
  *        refused for more than a day while `/oauth/token` kept working, and the activations dmi-api
  *        logged were answered 401 with the voyager sentence `requireVoyagerAuth` sends. The polls'
  *        status was never logged; the read endpoints answer a made-up bearer with the JSON:API 401
- *        below (OBSERVED, 2026-11-25). The status is a parameter so that another can be staged, in
- *        the same envelope (any status but 401 INVENTED). It counts what it refused, per endpoint
+ *        below (OBSERVED, 2026-11-25). It takes no status: no test here stages another, and an
+ *        option for one comes with the first test that does. It counts what it refused, per endpoint
  *        (keyed as the call log's `counters`), and the logins it saw, and it is listed with those
  *        counts (`GET /__control__/revocation`, and on the call log) until
  *        `DELETE /__control__/revocation` disarms it, answering with the final counts. Only one can
@@ -329,8 +329,8 @@ function freshState () {
     /* The control-plane acceptance switch (load-bearing detail 5). When false every bearer is
      * refused, in each dialect's own shape, and the tokens stay valid for when it is switched back. */
     acceptBearers: true,
-    /* The armed token revocation, or null (load-bearing detail 5): { status, armedAt, revoked (the
-     * tokens issued before it), refused (per endpoint), logins }. */
+    /* The armed token revocation, or null (load-bearing detail 5): { armedAt, revoked (the tokens
+     * issued before it), refused (per endpoint), logins }. */
     revocation: null,
     /* One entry per provider-endpoint call, so a scenario asserts on what the integration DID. */
     calls: [],
@@ -464,15 +464,13 @@ function externalBase (req) {
  * `Failed to POST <url>`. Each builder is used only where its shape was observed. */
 
 /* OBSERVED VERBATIM on `/api/v1/*` for a missing or unknown bearer. Note the asymmetry that a
- * tidier mock would have ironed out: `code` is a NUMBER here and `status` a STRING. A revocation
- * armed with another status sends it in both members (load-bearing detail 5; INVENTED: JSON:API
- * defines `status` as the HTTP status, and the observed `code` carries it too). */
-function sendJsonApiUnauthorized (res, why, status = 401) {
+ * tidier mock would have ironed out: `code` is a NUMBER here and `status` a STRING. */
+function sendJsonApiUnauthorized (res, why) {
   state.counters.unauthorized += 1
-  log(`${status} on /api/v1: ${why}`)
-  sendJsonApi(res, status, {
+  log(`401 on /api/v1: ${why}`)
+  sendJsonApi(res, 401, {
     errors: [
-      { title: 'Permission Denied', detail: 'The access token is invalid', code: status, status: String(status) },
+      { title: 'Permission Denied', detail: 'The access token is invalid', code: 401, status: '401' },
     ],
   })
 }
@@ -601,13 +599,12 @@ function bearerRefusal (req) {
   return null
 }
 
-/* The status a refused bearer is answered with: the revocation's for a token it refuses (and that
- * refusal counted against `operation`), 401 for every other. */
-function refusalStatus (refusal, operation) {
-  if (refusal !== 'revoked bearer') return 401
+/* A refusal of a token the revocation refuses is counted against `operation`, in its `refused`.
+ * Every refused bearer is answered 401, whichever switch refused it. */
+function countRevokedRefusal (refusal, operation) {
+  if (refusal !== 'revoked bearer') return
   const refused = state.revocation.refused
   refused[operation] = (refused[operation] ?? 0) + 1
-  return state.revocation.status
 }
 
 /* `operation` names the endpoint for a revocation's refusal count, as `counters` names it. */
@@ -618,7 +615,8 @@ function requireJsonApiAuth (req, res, operation) {
   }
   const refusal = bearerRefusal(req)
   if (refusal !== null) {
-    sendJsonApiUnauthorized(res, refusal, refusalStatus(refusal, operation))
+    countRevokedRefusal(refusal, operation)
+    sendJsonApiUnauthorized(res, refusal)
     return false
   }
   return true
@@ -635,7 +633,8 @@ function requireVoyagerAuth (req, res, operation) {
   const refusal = bearerRefusal(req)
   if (refusal === null) return true
   state.counters.unauthorized += 1
-  sendVoyagerError(res, refusalStatus(refusal, operation), VOYAGER_INVALID_TOKEN, `${refusal} on a voyager endpoint`)
+  countRevokedRefusal(refusal, operation)
+  sendVoyagerError(res, 401, VOYAGER_INVALID_TOKEN, `${refusal} on a voyager endpoint`)
   return false
 }
 
@@ -1708,7 +1707,6 @@ function handleControlReportReady (req, res, params) {
 function publicRevocation (revocation) {
   if (revocation == null) return null
   return {
-    status: revocation.status,
     armedAt: revocation.armedAt,
     /* How many tokens it refuses: every one issued before it was armed. */
     revokedTokens: revocation.revoked.size,
@@ -1719,17 +1717,15 @@ function publicRevocation (revocation) {
   }
 }
 
-/* Arm a revocation: `{status}`, any HTTP error status, 401 if left out. Refused while one is armed,
- * and while no token has been issued (it would refuse nothing). */
-async function handleControlArmRevocation (req, res) {
-  const body = await readJson(req)
-  const unknown = Object.keys(body).filter((key) => key !== 'status')
-  if (unknown.length > 0) {
-    return controlError(res, `a revocation takes only "status"; unknown ${unknown.map((key) => `"${key}"`).join(', ')}`)
-  }
-  const status = body.status === undefined ? 401 : body.status
-  if (!Number.isInteger(status) || status < 400 || status > 599) {
-    return controlError(res, `status must be an HTTP error status (an integer, 400-599), got ${JSON.stringify(body.status)}`)
+/* Arm a revocation. It takes no options, so the body is empty (or `{}`), and anything else is refused
+ * naming what it takes: a status, say, which the mock would otherwise ignore while the test believed
+ * it staged. Refused while one is armed, and while no token has been issued (it would refuse
+ * nothing). */
+function handleControlArmRevocation (req, res) {
+  const body = req.parsedBody
+  const empty = typeof body === 'object' && body !== null && !Array.isArray(body) && Object.keys(body).length === 0
+  if (!empty) {
+    return controlError(res, `a revocation takes no options: POST it with an empty body or {}, not ${JSON.stringify(body)}`)
   }
   if (state.revocation != null) {
     return sendJson(res, 409, {
@@ -1740,8 +1736,8 @@ async function handleControlArmRevocation (req, res) {
   if (state.tokens.size === 0) {
     return sendJson(res, 409, { error: 'no token has been issued yet, so a revocation would refuse nothing' })
   }
-  state.revocation = { status, armedAt: nowIso(), revoked: new Set(state.tokens.keys()), refused: {}, logins: 0 }
-  log(`control: revocation armed (${status}) over ${state.revocation.revoked.size} token(s)`)
+  state.revocation = { armedAt: nowIso(), revoked: new Set(state.tokens.keys()), refused: {}, logins: 0 }
+  log(`control: revocation armed over ${state.revocation.revoked.size} token(s)`)
   sendJson(res, 200, { revocation: publicRevocation(state.revocation) })
 }
 

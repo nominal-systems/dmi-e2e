@@ -403,8 +403,8 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   `POST /__control__/bearer {"accept": false}` refuses every bearer, the tokens issued already and
   any a login issues meanwhile, with a 401, and switched back on it accepts the same tokens again: a
   vendor that refuses whatever it is shown. The audit tripwire uses it, and the test after it shows
-  the polls resuming with no new login. `POST /__control__/revocation` with `{status}` (401 if left
-  out) refuses only the tokens issued before it and accepts every later one, which is what Wisdom
+  the polls resuming with no new login. `POST /__control__/revocation`, with an empty body, refuses
+  only the tokens issued before it, with a 401, and accepts every later one, which is what Wisdom
   did from 2026-11-23
   ([dmi-engine-wisdom-panel-integration#53](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/53)):
   the feeds answer with JSON:API's 401, and the voyager endpoints with the
@@ -416,10 +416,11 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   caches its token for ten days. Each call-log entry records the status it was answered with. The
   loop shows the revocation refusing both feeds and an activation and accepting a token issued after
   it, and pins, as a tripwire, that the integration never logs in again, so that neither feed is read
-  until the revocation is lifted. Another status can be staged in the same envelopes; no test here
-  does, because nothing the integration does today depends on the status (it logs in again on none,
-  and with dmi-engine-common 1.7.0 its polls see a 500 whatever the vendor answered), and which
-  statuses a fix should react to is what #53 is deciding.
+  until the revocation is lifted. The revocation always refuses with 401, and takes no options: a
+  body that names any, a `status` say, is refused with a 400 naming what it takes. No test here
+  stages another status, because nothing the integration does today depends on it (it logs in again
+  on none, and with dmi-engine-common 1.7.0 its polls see a 500 whatever the vendor answered); a
+  status option comes with the first test that needs another.
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
