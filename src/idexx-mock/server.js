@@ -66,9 +66,10 @@ const SCENARIO_KEYS = ['authValidate', 'createOrder', 'resultsLatest', 'ivlsDevi
 
 /* The keys a transport fault can be armed on, each one route: the order create, the three steps of
  * the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup, `uiOrderPut` the
- * submission), the manifest PDF, and the device list. A fault is wired on a route only together
- * with a test that uses it; adding one is a line in that route's handler and a name here. */
-const FAULT_KEYS = ['createOrder', 'uiPage', 'uiOrderGet', 'uiOrderPut', 'manifest', 'ivlsDevices']
+ * submission), the manifest PDF, the device list, and the results confirm. A fault is wired on a
+ * route only together with a test that uses it; adding one is a line in that route's handler and a
+ * name here. */
+const FAULT_KEYS = ['createOrder', 'uiPage', 'uiOrderGet', 'uiOrderPut', 'manifest', 'ivlsDevices', 'resultsConfirm']
 
 /* Outside the resettable state, like the order ids: POST /__control__/reset disarms every fault and
  * destroys the connections they hold (see src/mock-faults). */
@@ -753,6 +754,10 @@ async function handleResultsLatest (req, res) {
 }
 
 async function handleResultsConfirm (req, res, params) {
+  /* A confirm a transport fault takes never reaches the batch: it stays the batch being served, as
+   * a confirm IDEXX never received leaves it there, and the ledger records only the confirms this
+   * route answered. */
+  if (faults.intercept('resultsConfirm', req, res)) return
   await readBody(req)
   const batch = state.activeBatch
   if (batch == null || batch.batchId !== params.batchId) {

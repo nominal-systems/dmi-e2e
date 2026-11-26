@@ -420,7 +420,9 @@ create timeout, with a create held past it (`HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_
 fetch that no longer fails the create;
 [dmi-engine-idexx-integration#83](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/83)'s
 named transport errors, with a create reset or stalled and a device list cut short after its headers;
-a failed confirm step that still reports the created order; and
+a failed confirm step that still reports the created order; a failed results confirm, whose batch a
+later poll delivers again and confirms, and which the PIMS sees as one `report:updated`
+([dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409)); and
 [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s
 tripwire, an order the confirm submitted whose manifest fetch after it fails.
 
@@ -568,9 +570,10 @@ closely enough for the real integration to drive it unmodified:
   on any other key is refused.
 - **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder`, the
   three steps of the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup,
-  `uiOrderPut` the submission), `manifest` (the PDF) and `ivlsDevices`. There is none on the results
-  confirm: no test yet asserts an outcome for a failed one. `resultsLatestDelay` stays a scenario of
-  its own rather than a `hold`: it waits for
+  `uiOrderPut` the submission), `manifest` (the PDF), `ivlsDevices` and `resultsConfirm`. A confirm a
+  fault takes never reaches the batch, which stays the one being served, and the batch ledger
+  records only the confirms the route answered. `resultsLatestDelay` stays a scenario of its own
+  rather than a `hold`: it waits for
   the first answer that carries a batch, letting empty polls through, and the batch ledger counts
   the polls that reach the mock while it holds. The dmi-engine-idexx-integration#88 test reads both.
   A `hold` on a route takes its next request, whatever the answer.

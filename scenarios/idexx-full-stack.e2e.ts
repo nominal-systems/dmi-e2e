@@ -759,8 +759,9 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * README's "Transport faults in the mocks"): an answer held, a connection reset, a body stalled.
    * Each test arms one fault and disarms it in a `finally` (withFault), and asserts from the count the
    * disarm returns that the fault fired. The describe checks that nothing is armed when it starts,
-   * and after each test that the test left nothing armed. Each test places an order of its own and
-   * seeds no result, so neither the loop above nor the overlapping-polls test below sees any of it. */
+   * and after each test that the test left nothing armed. Each test places an order of its own, so
+   * the loop above sees none of it; the one test that seeds a result waits for its batch to be
+   * confirmed, so the overlapping-polls test below starts on an empty feed. */
   describe('IDEXX calls that time out, reset or stall, and the steps of a placement (dmi-engine-idexx-integration#81, #83, #93)', () => {
     /* How long dmi-api waits for the engine's answer here, and the integration's timeouts for the
      * create POST and for every other call. The two integration values are read as
@@ -1096,6 +1097,58 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
       expect((await storedOrder(response.body.id)).externalId).toBe(provider.idexxOrderId)
     }, 30_000)
+
+    /* Regression guard (dmi-api#409, fixed in dmi-api#410), through IDEXX's results confirm: a
+     * confirm that fails leaves the batch at IDEXX, the next poll fetches it again and delivers it
+     * again, and confirms it. The second delivery is identical to the first, and since dmi-api#410
+     * dmi-api leaves a report alone when a result arrives again unchanged, so the PIMS sees one
+     * `report:updated`. Before it, every delivery was another `report:updated` for a report that had
+     * not changed. The mock's ledger shows the redelivery from the provider's side: the batch served
+     * at least twice, and confirmed once, by the route, after the fault took the first confirm. This
+     * test seeds a result, and waits for its batch's confirm, so the overlapping-polls test below
+     * starts on an empty feed. */
+    it('a results confirm that fails is delivered again and confirmed by a later poll, and the PIMS sees one report:updated', async () => {
+      const { payload, requisitionId } = placement()
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place the idexx order whose results confirm will fail',
+      )
+      type LedgerBatch = { batchId: string, requisitionIds: string[], served: number, confirms: number[] }
+      const batchesFor = async (): Promise<LedgerBatch[]> =>
+        expectOk<{ batches: LedgerBatch[] }>(await mock.get('/__control__/batches'), 'read the mock results-batch ledger')
+          .batches.filter((batch) => batch.requisitionIds.includes(requisitionId))
+
+      const { result: batches, fault } = await withFault(
+        { key: 'resultsConfirm', fault: 'reset' },
+        async () => {
+          expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed the result whose confirm will fail')
+          return await pollUntil(batchesFor, (now) => now.some((batch) => batch.confirms.includes(200)), 60_000, 500)
+        },
+      )
+      console.log(`[idexx-scenario] results-batch ledger after a failed confirm -> ${JSON.stringify(batches)}; fault ${JSON.stringify(fault)}`)
+
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
+      expect(batches.map((batch) => ({ fetchedAgain: batch.served >= 2, confirms: batch.confirms })))
+        .toEqual([{ fetchedAgain: true, confirms: [200] }])
+
+      const completed = await pollUntil(async () => await storedOrder(created.id), (order) => order.status === 'COMPLETED', 30_000, 1_000)
+      expect(completed.status).toBe('COMPLETED')
+      const report = expectOk<{ id: string }>(await org.api.get(`/orders/${created.id}/report`), 'read the order report')
+      /* Polled until the first `report:updated` is in; the second delivery came before the confirm
+       * the ledger shows, so a second one would be in by then too. */
+      const types = await pollUntil(
+        async () => expectOk<{ data: Array<{ type: string, data?: { orderId?: string, reportId?: string } }> }>(
+          await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+          'list events',
+        ).data
+          .filter((event) => event.data?.orderId === created.id || event.data?.reportId === report.id)
+          .map((event) => event.type),
+        (now) => now.includes('report:updated'),
+        30_000,
+        1_000,
+      )
+      expect({ reportUpdatedEvents: types.filter((type) => type === 'report:updated').length }).toEqual({ reportUpdatedEvents: 1 })
+    }, 30_000 + 60_000 + 30_000 + 30_000 + 10_000)
 
     /* dmi-engine-idexx-integration#93's second case: the confirm succeeds, and the manifest fetch
      * after it fails. The positive twin first: with both succeeding, an auto-submitted order is
