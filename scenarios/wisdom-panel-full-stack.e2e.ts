@@ -2594,6 +2594,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         ok: false,
         status: activation.status,
         errors: [
+          'Failed to create pet',
           `Failed to POST ${env.wisdomPanel.baseUrl}/api/voyager/pet`,
           'WIS_VOY__001: You do not have permission to access these records. Must have a valid token.',
         ],
