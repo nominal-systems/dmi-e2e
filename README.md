@@ -91,7 +91,8 @@ integration it started in `afterAll`, which removes its jobs. If a run is interr
 `-p dmi-e2e-s<n>`; see "Parallel runs — slots" below). A run without `HARNESS_KEEP_UP` tears Redis
 down every time, so it is never affected. A container a killed run's scenario had paused (see
 "Service control") is unpaused before the next run starts its containers, since `compose up` refuses
-a paused one, and setup does not go on until every container of the project is running.
+a paused one, and setup does not go on until every container of the project is running. A Mongo
+failpoint a killed run left armed is turned off the same way, before dmi-api starts.
 
 ### Parallel runs — slots
 
@@ -926,6 +927,9 @@ expect(paused.containers).toEqual([`${env.composeProject}-redis-1`])
   runs `ensure-integration-status` beside a deployment.
 - **A kept-up stack.** Global setup unpauses any container a killed run left paused (`compose up`
   refuses a paused container), and does not go on until every container of the project is running.
+  On a Mongo it finds already up, it turns the `failCommand` failpoint off (`src/mongo.ts`), which a
+  run killed between arming it and clearing it leaves armed, and logs one line naming what it
+  found armed.
 
 ### Ports
 

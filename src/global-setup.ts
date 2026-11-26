@@ -1,7 +1,8 @@
 import { ChildProcess } from 'child_process'
-import { assertProjectIsOurs, composeUp, runMigrations, waitForDependencies } from './containers'
+import { assertProjectIsOurs, composeUp, projectContainers, runMigrations, waitForDependencies } from './containers'
 import { assertAppPortFree, forgetDmiApiProcesses, startDmiApi } from './dmi-api'
 import { commonUnderTest, env } from './env'
+import { closeMongo, turnOffLeftoverFailPoint } from './mongo'
 import { beginRun } from './report/report'
 import { unpauseLeftovers, waitForEveryServiceRunning } from './services'
 import { acquireSlot, releaseSlot } from './slots'
@@ -55,10 +56,21 @@ async function setUp (log: (message: string) => void): Promise<void> {
      * container"). */
     const unpaused = await unpauseLeftovers()
     if (unpaused.length > 0) log(`unpaused ${unpaused.join(', ')}, left paused by an earlier run`)
+    /* Likewise its Mongo can still hold the failCommand failpoint that run's scenario had armed
+     * (src/mongo.ts), which would fail this run's writes before any scenario armed one. */
+    const mongoWasUp = (await projectContainers('mongo')).some((container) => container.state === 'running')
     log('starting dependency containers')
     await composeUp()
     log('waiting for MySQL, Mongo and ActiveMQ')
     await waitForDependencies()
+    if (mongoWasUp) {
+      try {
+        const leftover = await turnOffLeftoverFailPoint()
+        if (leftover != null) log(`turned off the Mongo failCommand failpoint an earlier run left armed: ${JSON.stringify(leftover)}`)
+      } finally {
+        await closeMongo()
+      }
+    }
     /* Nothing stopped, paused or crash-looping: the scenarios that fault a service start by asserting
      * the stack is whole, and none of them should find it broken by an earlier run. */
     const down = await waitForEveryServiceRunning(env.timeouts.depsReadyMs)

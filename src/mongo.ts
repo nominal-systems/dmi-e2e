@@ -90,6 +90,22 @@ export async function failInserts (collection: string, times: number, errorCode 
   await failCommand(collection, 'insert', times, errorCode)
 }
 
+/* For global setup, on a stack an earlier run left up (HARNESS_KEEP_UP=1): a run killed between
+ * failCommand and clearFailPoints leaves the failpoint armed in the Mongo it kept, and the next run's
+ * writes to that collection would fail before any scenario armed anything. Reads the failpoint's
+ * state (`getParameter` on `failpoint.failCommand`, which a server with test commands on answers:
+ * `mode` 0 is off), turns it off whatever it was, and returns what was armed: its `mode` and
+ * `data`, or null when it was off. No hit count is read: the arming was another run's. */
+export async function turnOffLeftoverFailPoint (): Promise<{ mode: unknown, data: unknown } | null> {
+  const reply = await getMongo().db('admin').command({ getParameter: 1, 'failpoint.failCommand': 1 })
+  const state = reply['failpoint.failCommand'] as Document | undefined
+  if (state == null || typeof state.mode !== 'number') {
+    throw new Error(`getParameter answered without the failCommand failpoint's mode: ${JSON.stringify(reply)}`)
+  }
+  await configureFailCommand({ mode: 'off' })
+  return state.mode === 0 ? null : { mode: state.mode, data: state.data }
+}
+
 /* Disarm the failpoint, and return how many commands it failed since failCommand last armed it (0
  * if it was not armed from here): the difference between the running totals the two replies carry.
  * Only commands the failpoint matched and failed count, so after failCommand(c, cmd, n) this is the
