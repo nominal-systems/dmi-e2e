@@ -8,7 +8,10 @@ import { acquireSlot, releaseSlot } from './slots'
 import { commonCheckout } from './stacks'
 
 /* Jest runs globalSetup and globalTeardown in the same process, so the app handle can be parked
- * on globalThis for teardown to reclaim. Test files run in workers and never see it. */
+ * on globalThis for teardown to reclaim. Test files never see it: with `maxWorkers: 1` jest runs them
+ * in band, in this same process (one pid, measured), but each in a VM context and module registry of
+ * its own, whose globalThis is not this one. Hence src/dmi-api.ts's record of every dmi-api a run
+ * starts. */
 declare global {
   // eslint-disable-next-line no-var
   var __HARNESS_APP__: ChildProcess | undefined

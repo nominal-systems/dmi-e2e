@@ -71,7 +71,19 @@ export async function waitForHealth (
  * it instead, quite possibly green. Checked when setup starts and again just before the spawn. */
 export async function assertAppPortFree (): Promise<void> {
   const { hostname, port } = new URL(env.baseUrl)
-  const inUse = await new Promise<boolean>((resolve) => {
+  if (await appPortInUse()) {
+    throw new Error(
+      `something is already listening on ${hostname}:${port}, where slot ${env.slot} starts dmi-api — most likely a dmi-api ` +
+        'that a killed harness run left behind. Starting anyway would test whatever answers there instead of this ' +
+        `checkout's build. Stop it (\`ss -ltnp 'sport = :${port}'\` or \`lsof -i :${port}\` names its pid), or use another slot.`,
+    )
+  }
+}
+
+/* Whether something accepts a new connection on dmi-api's port: a TCP connect, nothing more. */
+export async function appPortInUse (): Promise<boolean> {
+  const { hostname, port } = new URL(env.baseUrl)
+  return await new Promise<boolean>((resolve) => {
     const socket = net.createConnection({ host: hostname, port: Number(port) })
     socket.setTimeout(2000)
     socket.once('connect', () => {
@@ -87,13 +99,6 @@ export async function assertAppPortFree (): Promise<void> {
       resolve(false)
     })
   })
-  if (inUse) {
-    throw new Error(
-      `something is already listening on ${hostname}:${port}, where slot ${env.slot} starts dmi-api — most likely a dmi-api ` +
-        'that a killed harness run left behind. Starting anyway would test whatever answers there instead of this ' +
-        `checkout's build. Stop it (\`ss -ltnp 'sport = :${port}'\` or \`lsof -i :${port}\` names its pid), or use another slot.`,
-    )
-  }
 }
 
 /* Builds (unless HARNESS_BUILD=0, or `build: false`) and starts dmi-api, waits for /health, and
@@ -148,6 +153,7 @@ export async function stopDmiApi (app: ChildProcess): Promise<void> {
     }, 10_000).unref()
   })
 }
+
 /* ---- which dmi-api is running ------------------------------------------------------------- */
 
 /* One dmi-api process this run started, and how it ended. */
@@ -245,18 +251,41 @@ export async function signalDmiApi (signal: NodeJS.Signals = 'SIGTERM', timeoutM
     if (exit != null) {
       return { pid: running.pid, signal, exitedAfterMs: Date.parse(exit.at) - signalledAt, code: exit.code, exitSignal: exit.signal }
     }
-    if (!isOurDmiApi(running.pid)) return { pid: running.pid, signal, exitedAfterMs: Date.now() - signalledAt, code: null, exitSignal: null }
+    if (!isOurDmiApi(running.pid)) {
+      /* Gone: its parent records the exit a moment after the process is, so give the record a second
+       * before going without it. */
+      const goneAt = Date.now()
+      while (Date.now() - goneAt < 1_000) {
+        const recorded = dmiApiProcesses().find((entry) => entry.pid === running.pid)?.exit
+        if (recorded != null) {
+          return { pid: running.pid, signal, exitedAfterMs: Date.parse(recorded.at) - signalledAt, code: recorded.code, exitSignal: recorded.signal }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return { pid: running.pid, signal, exitedAfterMs: goneAt - signalledAt, code: null, exitSignal: null }
+    }
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   process.kill(running.pid, 'SIGKILL')
   throw new Error(`dmi-api (pid ${running.pid}) had not exited ${timeoutMs} ms after ${signal}; killed`)
 }
 
+/* Waits, at most `timeoutMs`, until no dmi-api this run started is alive (or, given `pid`, that
+ * one); answers whether none is. */
+export async function dmiApiGone (timeoutMs: number, pid?: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (dmiApiProcesses().some((entry) => (pid == null || entry.pid === pid) && isOurDmiApi(entry.pid))) {
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  return true
+}
+
 /* Stops every dmi-api this run started that is still alive — the one global setup started and any a
- * scenario started again — with SIGTERM, then SIGKILL after 15 s. Global teardown's, so that no run
- * leaves a dmi-api holding its slot's port. Returns the pids it stopped. */
-export async function stopEveryDmiApi (): Promise<number[]> {
-  const alive = dmiApiProcesses().filter((entry) => isOurDmiApi(entry.pid))
+ * scenario started again — (or, given `pid`, that one) with SIGTERM, then SIGKILL after 15 s. Global
+ * teardown's, so that no run leaves a dmi-api holding its slot's port. Returns the pids it stopped. */
+export async function stopEveryDmiApi (pid?: number): Promise<number[]> {
+  const alive = dmiApiProcesses().filter((entry) => (pid == null || entry.pid === pid) && isOurDmiApi(entry.pid))
   for (const { pid } of alive) process.kill(pid, 'SIGTERM')
   const deadline = Date.now() + 15_000
   while (alive.some(({ pid }) => isOurDmiApi(pid)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 200))

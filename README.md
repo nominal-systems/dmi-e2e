@@ -437,7 +437,10 @@ of hanging on Redis, and polling resumes once Redis answers (dmi-engine-idexx-in
 Redis is flushed, dmi-api's `ensure-integration-status` brings polling back, retrying an integration
 whose engine missed its first attempt (dmi-api#346); and after a broker restart, device lookups and
 order placement get their replies again, at worst after one timeout, including two lookups in flight
-at once (dmi-api#367).
+at once (dmi-api#367). Its last test sends dmi-api a SIGTERM with a device lookup held in flight at
+the mock: the lookup gets its answer after dmi-api has stopped taking connections, and dmi-api exits
+within `SHUTDOWN_TIMEOUT_MS` and is started again
+([dmi-api#399](https://github.com/nominal-systems/dmi-api/pull/399)).
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -777,8 +780,9 @@ suite is unaffected.
 
 A scenario can take one service of its own stack away and put it back, to test what happens while
 it is gone and after it returns. `src/services.ts` stops, starts, pauses, unpauses or restarts a
-compose service of the run's project — the broker (`activemq`), `redis`, an engine container — and
-flushes Redis; `src/dmi-api.ts` sends dmi-api a signal, waits for it to exit, and starts it again.
+compose service of the run's project — the broker (`activemq`), `redis`, an engine container —
+flushes Redis, and stops dmi-api with a signal and starts it again (`src/dmi-api.ts` keeps the
+processes).
 The Mongo failpoint (`src/mongo.ts`) is the model: a fault is scoped to one target, the harness
 undoes it, and it reports what it reached, so a test asserts that it fired.
 
@@ -824,11 +828,14 @@ expect(paused.containers).toEqual([`${env.composeProject}-redis-1`])
   in a module registry of its own (in band, in jest's main process, with `maxWorkers: 1`; in a
   worker otherwise). So every dmi-api a run starts is recorded, with its exit as its parent saw it,
   in a file of the slot's beside its lock (`~/.cache/dmi-e2e/slot-locks/slot-<n>.dmi-api.json`).
-  `signalDmiApi('SIGTERM')` signals the one running and returns how long it took to exit, and how
-  (since dmi-api#399, a graceful exit is the signal itself, after `SHUTDOWN_DELAY_MS`);
-  `startDmiApi({ build: false, startedBy })` starts it again from the run's build. Global teardown
-  stops every dmi-api the file lists as alive, whoever started it, so a run that failed after a
-  restart leaves nothing holding the slot's port. `runDmiApiScript(script, args)` runs one of
+  `faults.stopDmiApi('SIGTERM')` enters dmi-api in the ledger as the signal goes out, and resolves
+  once it has exited, with how long that took and how: a code (1 is dmi-api's shutdown timeout) or
+  the signal (a shutdown that finished re-raises it). Restoring it, from the test's `finally` or
+  from `afterEach`, waits for that process to be gone (15 s at most, then kills it) and starts
+  dmi-api again from the run's build (`startDmiApi({ build: false, startedBy })`), so a test that
+  fails right after the signal still hands the next one a healthy dmi-api. Global teardown stops
+  every dmi-api the file lists as alive, whoever started it, so no run leaves one holding the slot's
+  port. `runDmiApiScript(script, args)` runs one of
   dmi-api's npm scripts from the checkout under test with the app's environment, the way an operator
   runs `ensure-integration-status` beside a deployment.
 - **A kept-up stack.** Global setup unpauses any container a killed run left paused (`compose up`
@@ -1029,7 +1036,8 @@ scenarios/
                               (dmi-engine-idexx-integration#81, #83, #93), and two results polls in
                               flight deliver a batch once (dmi-engine-idexx-integration#88); the loop
                               outlives Redis frozen (dmi-engine-idexx-integration#74) and flushed
-                              (dmi-api#346) and the broker restarted (dmi-api#367)
+                              (dmi-api#346), the broker restarted (dmi-api#367) and dmi-api stopped
+                              with a request in flight (dmi-api#399)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,

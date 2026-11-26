@@ -2,13 +2,14 @@ import { execFile, spawn } from 'child_process'
 import * as net from 'net'
 import { promisify } from 'util'
 import { compose, ComposeContainer, projectContainers, waitForHttpOk } from './containers'
+import { DmiApiExit, dmiApiGone, runningDmiApi, signalDmiApi, startDmiApi, stopEveryDmiApi } from './dmi-api'
 import { env, mockBaseUrlFor } from './env'
 import { waitForMysql } from './sql'
 import { stacks } from './stacks'
 
 /* Failure injection at the level of the stack: a scenario stops, starts, pauses or restarts one
  * compose service of THIS run's project — the broker (`activemq`), Redis, an engine container — or
- * flushes Redis, and the harness puts it back. src/mongo.ts's failpoint is the model: a fault is
+ * flushes Redis, or stops dmi-api with a signal, and the harness puts it back. src/mongo.ts's failpoint is the model: a fault is
  * scoped to one target, it is undone by the harness rather than left to the test, and it reports
  * what it reached, so the test can assert that it really fired.
  *
@@ -33,6 +34,9 @@ import { stacks } from './stacks'
  * MQTT broker" in the README). */
 export const BROKER = 'activemq'
 export const REDIS = 'redis'
+/* dmi-api is no compose service, it runs on the host (src/dmi-api.ts), but the ledger holds it like
+ * one: stopped with a signal, and restored by starting it again from the run's build. */
+export const DMI_API = 'dmi-api'
 
 export type ServiceFault = 'stopped' | 'paused'
 
@@ -42,8 +46,10 @@ export interface Disruption {
   fault: ServiceFault
   /* The replica, when one container of a replicated service was paused on its own. */
   replica?: number
-  /* The containers the fault reached, as compose named them. */
+  /* The containers the fault reached, as compose named them (for dmi-api, its process). */
   containers: string[]
+  /* dmi-api's: the process the signal was sent to. */
+  pid?: number
   since: string
   test: string
 }
@@ -80,9 +86,10 @@ export async function servicesNotRunning (): Promise<Array<Pick<ComposeContainer
 export async function assertStackWhole (): Promise<void> {
   const down = await servicesNotRunning()
   const held = disrupted()
-  if (down.length > 0 || held.length > 0) {
+  const dmiApiDown = env.manageApp && runningDmiApi() == null
+  if (down.length > 0 || held.length > 0 || dmiApiDown) {
     throw new Error(
-      `the stack is not whole before the first fault: ${JSON.stringify({ notRunning: down, faultsNotRestored: held })}`,
+      `the stack is not whole before the first fault: ${JSON.stringify({ notRunning: down, faultsNotRestored: held, dmiApiDown })}`,
     )
   }
 }
@@ -189,6 +196,27 @@ export async function restartService (service: string, stopTimeoutS = 10): Promi
   return await composeOn(['restart', '-t', String(stopTimeoutS), service])
 }
 
+/* Sends dmi-api `signal` (SIGTERM, as a pod stop does) and resolves once it has exited (see
+ * signalDmiApi). The ledger holds it stopped from the moment the signal is sent, which happens before
+ * this returns its promise, so a test can go on with a request in flight while dmi-api shuts down. */
+export async function stopDmiApi (signal: NodeJS.Signals = 'SIGTERM', test = currentTest(), timeoutMs = 30_000): Promise<DmiApiExit> {
+  const running = runningDmiApi()
+  if (running == null) throw new Error('no dmi-api of this run is running: nothing to stop (an external one, HARNESS_MANAGE_APP=0, is not the harness\'s to stop)')
+  enter({ service: DMI_API, fault: 'stopped', containers: [`dmi-api (pid ${running.pid})`], pid: running.pid }, test)
+  return await signalDmiApi(signal, timeoutMs)
+}
+
+/* dmi-api stopped by stopDmiApi, started again from the run's build, never rebuilt: once the process
+ * it signalled is gone, which a restore that comes early (a test that failed right after the signal)
+ * gives 15 s, the length of a shutdown cut by its timeout, before it kills it. Unless the test has
+ * started another one itself. */
+async function startDmiApiAgain (entry: Disruption): Promise<void> {
+  if (!(await dmiApiGone(15_000, entry.pid))) await stopEveryDmiApi(entry.pid)
+  const running = runningDmiApi()
+  if (running != null && running.pid !== entry.pid) return
+  await startDmiApi({ build: false, startedBy: `the restore after "${entry.test}"` })
+}
+
 /* Undoes one ledger entry and waits until the service answers. Two restores of one entry (a test's
  * own, racing its `finally` or afterEach's) share one undo. */
 const undoing = new Map<string, Promise<void>>()
@@ -201,6 +229,11 @@ async function undo (entry: Disruption): Promise<void> {
 }
 
 async function undoOnce (entry: Disruption): Promise<void> {
+  if (entry.service === DMI_API) {
+    await startDmiApiAgain(entry)
+    ledger.delete(ledgerKey(entry.service))
+    return
+  }
   const containers = await projectContainers(entry.service)
   const still = containers.filter((container) => entry.containers.includes(container.name) && container.state === (entry.fault === 'stopped' ? 'exited' : 'paused'))
   if (still.length > 0) {
@@ -274,6 +307,7 @@ export interface ServiceFaults {
   restart: (service: string, stopTimeoutS?: number) => Promise<string[]>
   restore: (service: string, options?: { replica?: number }) => Promise<void>
   flushRedis: () => Promise<RedisFlush>
+  stopDmiApi: (signal?: NodeJS.Signals) => Promise<DmiApiExit>
 }
 
 export function serviceFaults (): ServiceFaults {
@@ -290,6 +324,7 @@ export function serviceFaults (): ServiceFaults {
     restart: async (service, stopTimeoutS) => { open(); return await restartService(service, stopTimeoutS) },
     restore: async (service, options) => { await restoreService(service, options) },
     flushRedis: async () => { open(); return await flushRedis() },
+    stopDmiApi: async (signal) => { open(); return await stopDmiApi(signal, test) },
   }
 }
 

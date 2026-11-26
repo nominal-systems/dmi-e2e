@@ -1,6 +1,6 @@
 import { createHash } from 'crypto'
 import { ApiClient, ApiResponse, expectOk } from '../src/api-client'
-import { DmiApiScriptRun, runDmiApiScript } from '../src/dmi-api'
+import { appPortInUse, DmiApiScriptRun, runDmiApiScript, runningDmiApi } from '../src/dmi-api'
 import { appEnv, env } from '../src/env'
 import { clearFailPoints, closeMongo, failInserts } from '../src/mongo'
 import { pollUntil } from '../src/poll'
@@ -10,6 +10,7 @@ import {
   assertStackWhole,
   BROKER,
   Disruption,
+  DMI_API,
   REDIS,
   redisAnswers,
   repeatableJobsNaming,
@@ -1667,6 +1668,117 @@ describe('the loop outlives its broker, Redis and engine going away (service con
     expect({ overlappingAfter: overlappingAfter.map(({ status }) => status), held: overlappingAfter[1].ms >= holdMs && overlappingAfter[0].ms < holdMs })
       .toEqual({ overlappingAfter: [200, 200], held: true })
   }, 120_000)
+
+  /* ---- dmi-api#399 guard ----
+   *
+   * Before dmi-api#399 a SIGTERM (what every pod stop sends) ended dmi-api at once, and a request in
+   * flight lost its connection. Since, dmi-api handles SIGTERM: it goes on accepting requests for
+   * SHUTDOWN_DELAY_MS (4 s by default) while Kubernetes takes the pod out of the Service, then stops
+   * listening and waits for the requests in flight to be answered, and closes its MQTT clients and
+   * databases only after them, so a request waiting on the engine still gets the engine's reply. A
+   * shutdown still running SHUTDOWN_TIMEOUT_MS (10 s) after the signal exits with code 1. The harness
+   * sets neither variable, so dmi-api runs with both defaults (its src/config/configuration.ts).
+   *
+   * How it exits is not asserted, only by when. Today it is the timeout's exit, code 1, though the
+   * lookup is answered at about 7 s: the connection that carried the answer is a keep-alive one (the
+   * harness's client is Node's fetch), and Fastify's close goes on waiting for it after the answer, so
+   * the shutdown never reaches dmi-api's MQTT clients and databases. Closing them in order is what
+   * dmi-api#399 intended, but no open issue tracks it, so there is no tripwire for it yet.
+   *
+   * The request held in flight is a device lookup: one provider call, which the integration gives
+   * IDEXX_HTTP_TIMEOUT_MS (30 s) and dmi-api ENGINE_RESPONSE_TIMEOUT (10 s here). A placement would
+   * not do: its create is capped at IDEXX_CREATE_ORDER_TIMEOUT_MS (5 s, docker-compose.yml), and its
+   * other calls share dmi-api's 10 s with the hold. The mock holds the device list for 7 s, so the
+   * answer comes after dmi-api has stopped listening (about 4 s after the signal, which is sent once
+   * the held call is at the mock) and inside both timeouts.
+   *
+   * Last in the describe: it stops dmi-api, which the restore (in the test's `finally`, and again in
+   * afterEach) starts again before anything else runs. */
+  it('a SIGTERM lets a device lookup in flight finish with its answer, and dmi-api exits within SHUTDOWN_TIMEOUT_MS (dmi-api#399)', async () => {
+    const faults = serviceFaults()
+    const app = appEnv()
+    const engineTimeoutMs = Number(app.ENGINE_RESPONSE_TIMEOUT)
+    const shutdownDelayMs = Number(app.SHUTDOWN_DELAY_MS ?? 4_000)
+    const shutdownTimeoutMs = Number(app.SHUTDOWN_TIMEOUT_MS ?? 10_000)
+    const httpTimeoutMs = Number(process.env.HARNESS_IDEXX_HTTP_TIMEOUT_MS || 30_000)
+    const holdMs = 7_000
+    /* Refused at once, saying why, when the numbers cannot show the drain: the answer must come at
+     * least a second after dmi-api stops listening, and a second before any timeout. */
+    if (!(holdMs >= shutdownDelayMs + 2_000 && holdMs + 1_000 <= Math.min(engineTimeoutMs, shutdownTimeoutMs, httpTimeoutMs))) {
+      throw new Error(
+        `a ${holdMs} ms hold cannot show the drain with SHUTDOWN_DELAY_MS=${shutdownDelayMs}, SHUTDOWN_TIMEOUT_MS=${shutdownTimeoutMs}, ` +
+          `ENGINE_RESPONSE_TIMEOUT=${engineTimeoutMs} and IDEXX_HTTP_TIMEOUT_MS=${httpTimeoutMs}`,
+      )
+    }
+    type Hold = { hits: number, open: number, requests: Array<{ outcome: string, ms: number | null }> }
+    const dmiApiBefore = runningDmiApi()
+
+    const armed = expectOk<{ fault: { id: number } }>(
+      await mock.post('/__control__/scenarios', { key: 'ivlsDevices', fault: 'hold', delayMs: holdMs }),
+      'hold the next device list at the mock',
+    )
+    let hold: Hold | null = null
+    let answer: { status?: number, body?: unknown, error?: string, at: number } | undefined
+    let probe: { listening: boolean, answeredYet: boolean } | undefined
+    let exit: Awaited<ReturnType<typeof faults.stopDmiApi>> | undefined
+    let signalledAt = 0
+    try {
+      const inFlight = org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`).then(
+        (response) => ({ status: response.status, body: response.body, at: Date.now() }),
+        (error) => ({ error: `${String(error)}${error?.cause != null ? ` (${String(error.cause)})` : ''}`, at: Date.now() }),
+      )
+      /* In flight: the integration's call has reached the mock, which holds it. */
+      const open = await pollUntil(
+        async () => expectOk<{ faults: Record<string, Hold> }>(await mock.get('/__control__/scenarios'), 'list what is armed at the mock').faults.ivlsDevices?.open,
+        (count) => count === 1,
+        engineTimeoutMs,
+        100,
+      )
+      if (open !== 1) throw new Error('the hold at the mock never took the device lookup')
+
+      signalledAt = Date.now()
+      const exiting = faults.stopDmiApi('SIGTERM')
+      let settled = false
+      void inFlight.then(() => { settled = true })
+      /* A second after the delay, whether dmi-api still takes new connections, and whether the held
+       * lookup has been answered yet. */
+      probe = await sleep(shutdownDelayMs + 1_000).then(async () => ({ listening: await appPortInUse(), answeredYet: settled }))
+      answer = await inFlight
+      exit = await exiting
+    } finally {
+      hold = expectOk<{ fault: Hold | null }>(
+        await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`),
+        'disarm the device-list hold',
+      ).fault
+      await faults.restore(DMI_API)
+    }
+    console.log(`[idexx-scenario] SIGTERM with a lookup in flight -> answer ${JSON.stringify({ ...answer, at: (answer?.at ?? 0) - signalledAt })}, probe ${JSON.stringify(probe)}, exit ${JSON.stringify(exit)}, hold ${JSON.stringify(hold)}`)
+
+    /* THE POINT OF THIS TEST: the lookup in flight got its normal answer, the clinic's analyzer. */
+    expect({ status: answer?.status, error: answer?.error, devices: answer?.body }).toEqual({
+      status: 200,
+      error: undefined,
+      devices: [{ serialNumber: deviceSerial, status: 'ACTIVE', name: 'VetLab Station (mock)' }],
+    })
+    /* The hold fired: it took the one lookup, and its answer went out (a hold still open when the
+     * test disarms it is destroyed instead). */
+    expect({ hits: hold?.hits, outcomes: hold?.requests.map((request) => request.outcome) }).toEqual({ hits: 1, outcomes: ['answered'] })
+    /* And it was still in flight when dmi-api had stopped taking connections: the answer came during
+     * the drain, not during the delay. */
+    expect(probe).toEqual({ listening: false, answeredYet: false })
+    /* dmi-api exited after the answer, and within SHUTDOWN_TIMEOUT_MS of the signal: the second
+     * allowed past it is the timeout's own exit reaching this process (see above for how it exits). */
+    expect({
+      exited: exit != null,
+      withinShutdownTimeout: exit != null && exit.exitedAfterMs <= shutdownTimeoutMs + 1_000,
+      afterTheAnswer: exit != null && answer != null && signalledAt + exit.exitedAfterMs >= answer.at - 50,
+    }).toEqual({ exited: true, withinShutdownTimeout: true, afterTheAnswer: true })
+
+    /* Started again, and healthy, before anything else runs. */
+    const dmiApiAfter = runningDmiApi()
+    const health = await ApiClient.create().get('/health').then((response) => response.status, (error) => String(error))
+    expect({ restarted: dmiApiAfter != null && dmiApiAfter.pid !== dmiApiBefore?.pid, health }).toEqual({ restarted: true, health: 200 })
+  }, 60_000 + 30_000)
 
   afterAll(async () => {
     try {
