@@ -347,9 +347,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   ([dmi-engine-common#27](https://github.com/nominal-systems/dmi-engine-common/pull/27)): a one-shot
   503 with `Retry-After: 2` on an order form is retried about two seconds later, within the same
   poll, rather than after the default 100 ms, and the form the retry fetched is the one dmi-api
-  stores. Every test that arms one of the mock's switches disarms it in a `finally`, the describes
-  that arm them check after each test that nothing is left armed, and the run begins by asserting
-  that nothing is.
+  stores. Each test that arms the revocation or a `Retry-After` disarms it in a `finally` and
+  checks from the counts or the call log that it fired, the describes they are in check after each
+  test that nothing is left armed (as the refusals' describe does for its one-shot answers), and the
+  run begins by asserting that nothing is.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
