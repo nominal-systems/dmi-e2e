@@ -293,7 +293,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   own sibling checkouts (the engine's Dockerfile would install the published packages instead) and
   both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
-  `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
+  `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`. Its last describe
+  restarts the engine's worker with Redis stopped: the worker must exit with code 1, naming every
+  queue it could not initialize, which the engine services' `restart: on-failure` relies on, and must
+  be polling again once Redis is back ([dmi-engine#68](https://github.com/nominal-systems/dmi-engine/pull/68)).
   In November 2026 production twice saw Antech V6 return records the integration had already
   acknowledged, unchanged, on every poll and on both feeds, while answering every `AckStatus` 200,
   until it stopped by itself: the same results from `GetAllResults`, and the same orders from the
@@ -1031,7 +1034,8 @@ scenarios/
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
                               and a result or order the provider redelivers unchanged changes nothing
-                              (dmi-api#409)
+                              (dmi-api#409); an engine that cannot reach Redis at start exits, and
+                              recovers once Redis is back (dmi-engine#68)
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
                               end to end, and one order dmi-api cannot save does not cost the rest of its
                               batch (dmi-api#411)

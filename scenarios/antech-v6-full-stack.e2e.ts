@@ -4,6 +4,7 @@ import { env } from '../src/env'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, seedOrganization, SeededOrg } from '../src/seed'
+import { assertStackWhole, REDIS, restoreServices, serviceFaults, serviceLogs, waitForEveryServiceRunning, watchExits } from '../src/services'
 import { closePool, query } from '../src/sql'
 
 /* Full-system gate for Antech V6 (HARNESS_FULL_STACK=1, HARNESS_STACK=antech-v6): dmi-api under a
@@ -3042,5 +3043,88 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         `Invalid BreedId ${DEFAULT_PET_BREED}`,
       ])
     }, 60_000)
+  })
+
+  /* ---- dmi-engine#68 guard ----
+   *
+   * The engine initializes each of its Bull queues at start, against Redis. Before dmi-engine#68 a
+   * queue that could not be initialized was logged as a warning and the engine started anyway, with
+   * no queue that could ever receive its repeatable jobs: polling silently dead, the pod Ready.
+   * Since, the engine names every queue it could not initialize and exits with code 1, so the pod
+   * crash-loops where it shows; docker-compose.yml's `restart: on-failure` on the engine services
+   * relies on that exit. Here the worker (the process that polls) is restarted while Redis is
+   * stopped, so that it starts with Redis unreachable; then Redis comes back, and the restart policy
+   * must bring the worker back polling.
+   *
+   * Last in the file: it takes the engine down, and nothing after it should run on a stack that may
+   * not have recovered. The fault comes from src/services.ts, scoped to this slot's compose project,
+   * restored in the test's `finally` and again by `afterEach`. */
+  describe('an engine that cannot reach Redis when it starts exits, and recovers when Redis is back (dmi-engine#68)', () => {
+    const WORKER = 'dmi-engine-worker'
+    const QUEUES = ['antech-v6.results', 'antech-v6.orders', 'wisdom-panel.results', 'wisdom-panel.orders']
+
+    beforeAll(async () => {
+      /* A run starts with nothing stopped or paused, by this harness or anything else. */
+      await assertStackWhole()
+    })
+
+    afterEach(async () => {
+      await restoreServices()
+    }, 180_000)
+
+    it('the worker started with Redis stopped exits with code 1, naming every queue, and polls again once Redis is back', async () => {
+      const faults = serviceFaults()
+      const since = Date.now()
+      const watch = await watchExits(WORKER)
+      let exits: number[] = []
+      try {
+        await faults.stop(REDIS)
+        /* Killed a second after its SIGTERM: the engine, its container's pid 1, does not exit on
+         * one, and compose would otherwise wait out its 10 s before killing it. */
+        await faults.restart(WORKER, 1)
+        /* That kill is an exit too (137); the one that matters is the worker's own, once it has
+         * tried every queue (four, each given up on after the engine's 10 s Redis command timeout). */
+        exits = await pollUntil(async () => [...watch.codes], (codes) => codes.includes(1), 90_000, 1_000)
+      } finally {
+        watch.stop()
+        await faults.restore(REDIS)
+      }
+      const logs = await serviceLogs(WORKER, since)
+      console.log(`[antech-v6-scenario] worker exits since the restart -> ${JSON.stringify(exits)}`)
+
+      /* THE POINT OF THIS TEST: the worker exited with code 1. The engine before dmi-engine#68 logs
+       * the same line for each queue, as a warning, and then starts: only the exit tells the two
+       * apart. */
+      expect(exits).toContain(1)
+      expect(QUEUES.filter((queue) => !logs.includes(`Failed to initialize queue '${queue}'`))).toEqual([])
+
+      /* Recovered: the restart policy brings the worker back now that Redis is there, and the loop
+       * closes again. An order placed now is acknowledged by the orders poll and completed by a
+       * result seeded after that, and both polls run in the worker. */
+      expect(await waitForEveryServiceRunning(120_000)).toEqual([])
+      const payload = payloadFor([KIDNEY_PANEL_CODE])
+      const requisitionId = payload.requisitionId as string
+      const created = expectOk<{ id: string, status: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place an antech-v6 order after the worker recovered',
+      )
+      expect(created.status).toBe('SUBMITTED')
+      await waitForOrderAck(requisitionId)
+      expectOk(
+        await mock.post(`/__control__/orders/${encodeURIComponent(requisitionId)}/results`, {
+          unitCodeResults: [{ orderCode: KIDNEY_PANEL_CODE, testCodeResults: KIDNEY_PANEL }],
+          pendingTestCount: 0,
+          totalTestCount: 1,
+        }),
+        'seed a result after the worker recovered',
+      )
+      const report = await pollUntil(
+        async () => await org.api.get(`/orders/${created.id}/report`),
+        (response) => response.body?.status === 'FINAL',
+        COMPLETION_WAIT_MS,
+        1_000,
+      )
+      expect(report.body.status).toBe('FINAL')
+    }, 30_000 + 90_000 + 180_000 + ORDER_ACK_WAIT_MS + COMPLETION_WAIT_MS + 30_000)
   })
 })
