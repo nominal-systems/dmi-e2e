@@ -427,7 +427,14 @@ a failed confirm step that still reports the created order; a failed results con
 later poll delivers again and confirms, and which the PIMS sees as one `report:updated`
 ([dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409)); and
 [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s
-tripwire, an order the confirm submitted whose manifest fetch after it fails.
+tripwire, an order the confirm submitted whose manifest fetch after it fails. A describe of its own,
+after the loop's, takes the stack's services away from under an integration of its own (see
+"Service control" below), each test pinning a merged change: with Redis frozen, the integration fails a restart within its Redis command timeout instead
+of hanging on Redis, and polling resumes once Redis answers (dmi-engine-idexx-integration#74); after
+Redis is flushed, dmi-api's `ensure-integration-status` brings polling back, retrying an integration
+whose engine missed its first attempt (dmi-api#346); and after a broker restart, device lookups and
+order placement get their replies again, at worst after one timeout, including two lookups in flight
+at once (dmi-api#367).
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -1017,7 +1024,9 @@ scenarios/
                               IDEXX calls that time out, reset or stall fail named, and a failed manifest
                               or confirm step still reports the created order
                               (dmi-engine-idexx-integration#81, #83, #93), and two results polls in
-                              flight deliver a batch once (dmi-engine-idexx-integration#88)
+                              flight deliver a batch once (dmi-engine-idexx-integration#88); the loop
+                              outlives Redis frozen (dmi-engine-idexx-integration#74) and flushed
+                              (dmi-api#346) and the broker restarted (dmi-api#367)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,

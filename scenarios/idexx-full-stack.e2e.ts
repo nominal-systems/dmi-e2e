@@ -1,10 +1,22 @@
 import { createHash } from 'crypto'
 import { ApiClient, ApiResponse, expectOk } from '../src/api-client'
+import { DmiApiScriptRun, runDmiApiScript } from '../src/dmi-api'
 import { appEnv, env } from '../src/env'
 import { clearFailPoints, closeMongo, failInserts } from '../src/mongo'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
+import {
+  assertStackWhole,
+  BROKER,
+  Disruption,
+  REDIS,
+  redisAnswers,
+  repeatableJobsNaming,
+  restoreServices,
+  serviceFaults,
+  sleep,
+} from '../src/services'
 import { closePool, countOrdersForOrganization } from '../src/sql'
 
 /* Full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
@@ -1387,4 +1399,283 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       }).toEqual({ reportUpdatedEvents: 1 })
     }, 30_000 + 90_000 + (delayMs + 30_000) + 2 * pollMs + 30_000 + 10_000)
   })
+})
+
+/* ---- service control: the broker, Redis and the engine taken away under the loop ----
+ *
+ * Merged changes that make the stack survive losing one of its services, each pinned end to end:
+ * Redis frozen and resumed (dmi-engine-idexx-integration#74), Redis emptied and the operator's
+ * repair pass (dmi-api#346), the broker restarted (dmi-api#367). The faults come from src/services.ts,
+ * scoped to this slot's compose project, each restored in the test's `finally` and again by
+ * `afterEach`, so that a test that fails or times out midway still hands the next one a whole stack.
+ *
+ * Self-contained, and after the loop's own describe: an organization and an integration of its own,
+ * started here and stopped in afterAll. It must be the only idexx integration polling while it runs:
+ * the mock serves its one active results batch to whichever integration polls first (every one uses
+ * the harness's credentials), so another one polling would take this describe's results. The faults
+ * run least disruptive first: the Redis pause, then the flush, whose pass re-registers the polling
+ * jobs whatever the pause left behind, then the broker restart, which needs no polling at all. */
+describe('the loop outlives its broker, Redis and engine going away (service control)', () => {
+  /* The integration's compose service: two replicas (HARNESS_IDEXX_REPLICAS). */
+  const ENGINE = 'dmi-engine-idexx-integration'
+  /* The integration's poll interval, as docker-compose.yml reads it (see the #88 describe above). */
+  const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
+
+  const mock = ApiClient.create(env.idexx.mockBaseUrl)
+  let org: SeededOrg
+  let admin: ApiClient
+  let serviceCode: string
+  let deviceSerial: string
+
+  /* An order with this describe's integration, its in-house code and the clinic's analyzer. */
+  async function placeOrder (): Promise<{ orderId: string, requisitionId: string }> {
+    const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }], devices: [deviceSerial] })
+    const created = expectOk<{ id: string, status: string }>(
+      await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      'place an idexx order for the service-control tests',
+    )
+    expect(created.status).toBe('SUBMITTED')
+    return { orderId: created.id, requisitionId: payload.requisitionId as string }
+  }
+
+  async function orderStatus (orderId: string): Promise<string | undefined> {
+    return (await org.api.get(`/orders/${orderId}`)).body?.status
+  }
+
+  beforeAll(async () => {
+    /* A run starts with nothing stopped or paused, by this harness or anything else. */
+    await assertStackWhole()
+    /* As in the loop's own beforeAll: only load-bearing for warm reruns (HARNESS_KEEP_UP). */
+    await mock.post('/__control__/reset').catch(() => undefined)
+
+    const catalogue = expectOk<{ list: Array<{ code: string, inHouse: boolean }> }>(
+      await mock.get('/api/v1/ref/tests'),
+      'read the mock orderable-test catalogue',
+    )
+    const inHouse = catalogue.list.find((service) => service.inHouse)
+    if (inHouse == null) throw new Error('the mock catalogue advertises no in-house test code')
+    serviceCode = inHouse.code
+    deviceSerial = expectOk<{ ivlsDeviceList: Array<{ deviceSerialNumber: string }> }>(
+      await mock.get('/api/v1/ivls/devices'),
+      'read the mock IVLS device list',
+    ).ivlsDeviceList[0].deviceSerialNumber
+
+    const root = ApiClient.create()
+    org = await seedOrganization(root, 'idexx-services', {
+      providerId: 'idexx',
+      configuration: {
+        orderingBaseUrl: env.idexx.orderingBaseUrl,
+        resultBaseUrl: env.idexx.resultBaseUrl,
+        'X-Pims-Id': env.idexx.pimsId,
+        'X-Pims-Version': env.idexx.pimsVersion,
+      },
+      integrationOptions: { username: env.idexx.username, password: env.idexx.password, locale: env.idexx.locale },
+    })
+    admin = await adminLogin(root)
+    expectOk(await admin.post(`/admin/integrations/${org.integrationId}/start`), 'start the service-control integration')
+  }, 120_000)
+
+  /* The backstop: whatever a test left stopped or paused, even one jest abandoned on its timeout, is
+   * restored before the next test starts, and the stack is checked whole. */
+  afterEach(async () => {
+    await restoreServices()
+  }, 180_000)
+
+  /* ---- dmi-engine-idexx-integration#74 guard ----
+   *
+   * The integration's Bull clients carry a command timeout (REDIS_COMMAND_TIMEOUT_MS, 10 s by
+   * default, which docker-compose.yml leaves alone), so that a Redis that stops answering fails their
+   * commands instead of hanging them for good. Without it, an integration restart sent while Redis
+   * does not answer hangs in the engine's stop handler, and the caller learns nothing until its own
+   * engine timeout: in production 90 s, after which the restart that should have repaired polling
+   * had failed without a word from the engine. Redis is paused, which freezes it with every
+   * connection left open, as a Redis that stops answering does. The restart is asked for by the
+   * operator's pass (`ensure-integration-status`, one attempt, this integration only), run with an
+   * engine timeout of its own well above the integration's command timeout: the loop's dmi-api waits
+   * 10 s, which would race it. Then Redis resumes, and the next restart must bring polling back.
+   *
+   * Pausing Redis alone, and resuming it, proves nothing here: commands that hang come back when
+   * Redis does, with or without the timeout, and polling resumes either way (that staging passed with
+   * the integration's timeout removed). The restart's answer time is what the timeout changes. */
+  it('with Redis frozen, a restart fails within the integration\'s Redis command timeout instead of hanging, and polling resumes once Redis answers (dmi-engine-idexx-integration#74)', async () => {
+    const faults = serviceFaults()
+    const { orderId, requisitionId } = await placeOrder()
+
+    const passEngineTimeoutMs = 30_000
+    let paused: Disruption
+    let answeredWhilePaused: boolean
+    let frozenPass: DmiApiScriptRun
+    let askedAt: number | undefined
+    let failedAt: number | undefined
+    try {
+      paused = await faults.pause(REDIS)
+      answeredWhilePaused = await redisAnswers(2_000)
+      frozenPass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`, '--attempts=1'], {
+        timeoutMs: passEngineTimeoutMs + 60_000,
+        environment: { ENGINE_RESPONSE_TIMEOUT: String(passEngineTimeoutMs) },
+        onLine: (line) => {
+          /* The pass logs what it found just before it sends the first engine request. */
+          if (askedAt == null && /Found .*integration/.test(line)) askedAt = Date.now()
+          if (failedAt == null && line.includes(org.integrationId) && /fail|error/i.test(line)) failedAt = Date.now()
+        },
+      })
+    } finally {
+      await faults.restore(REDIS)
+    }
+    console.log(`[idexx-scenario] restart while Redis was frozen -> exit ${frozenPass.code}, failed ${failedAt == null || askedAt == null ? '(never)' : `${failedAt - askedAt} ms`} after the request:\n${frozenPass.output.filter((line) => /IntegrationsService|ensuring/.test(line)).join('\n')}`)
+    /* The fault fired: the project's one Redis was paused, and it did not answer while it was. */
+    expect({ containers: paused.containers, answeredWhilePaused }).toEqual({
+      containers: [`${env.composeProject}-redis-1`],
+      answeredWhilePaused: false,
+    })
+    /* THE POINT OF THIS TEST: the engine answered the restart, with its failure, inside its command
+     * timeout plus slack, and not the pass's own timeout at 30 s. */
+    expect({
+      exitCode: frozenPass.code,
+      restartFailed: failedAt != null,
+      answeredWithin20s: failedAt != null && askedAt != null && failedAt - askedAt < 20_000,
+    }).toEqual({ exitCode: 1, restartFailed: true, answeredWithin20s: true })
+
+    /* Redis answers again: the next restart succeeds, and polling resumes — a result seeded now is
+     * delivered. */
+    expect(await redisAnswers(2_000)).toBe(true)
+    const pass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`], { timeoutMs: 120_000 })
+    expect({ exitCode: pass.code, pollingJobs: (await repeatableJobsNaming(org.integrationId)).length }).toEqual({ exitCode: 0, pollingJobs: 2 })
+    expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed a result after Redis resumed')
+    const completed = await pollUntil(async () => await orderStatus(orderId), (status) => status === 'COMPLETED', 60_000, 1_000)
+    expect(completed).toBe('COMPLETED')
+  }, 30_000 + 90_000 + 120_000 + 60_000 + 30_000)
+
+  /* ---- dmi-api#346 guard ----
+   *
+   * An integration's polling jobs live only in Redis: after a cutover to an empty Redis (or a flush,
+   * or an eviction) the integration stays RUNNING in dmi-api with nothing polling, and nothing
+   * re-creates the jobs. `npm run ensure-integration-status` is the operator's repair: it restarts
+   * each integration, so the engine registers its jobs again. dmi-api#346 made it usable for that:
+   * an integration whose restart fails is retried with a backoff, and the pass carries on and reports
+   * it, where before the first failure was the last word. Here the engine misses the pass's first
+   * attempt: both replicas are paused until the pass reports that attempt failed, as an engine that
+   * stops answering for a while (a pod restarted for the cutover) would. The pass must still bring
+   * polling back. Against the pass before dmi-api#346 the attempt that failed is the last one, the
+   * pass exits 0, and nothing polls. */
+  it('after Redis is flushed, ensure-integration-status brings polling back, though the engine misses its first attempt (dmi-api#346)', async () => {
+    const faults = serviceFaults()
+
+    /* The integration's two polling jobs (results and orders), as Bull registers them. */
+    const registered = await repeatableJobsNaming(org.integrationId)
+    const flushed = await faults.flushRedis()
+    const registeredAfter = await repeatableJobsNaming(org.integrationId)
+    expect({ registered: registered.length, keysAfter: flushed.keysAfter, registeredAfter }).toEqual({
+      registered: 2,
+      keysAfter: 0,
+      registeredAfter: [],
+    })
+
+    /* Polling is dead: a result seeded now is not delivered over four poll intervals. */
+    const { orderId, requisitionId } = await placeOrder()
+    expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed a result after the flush')
+    await sleep(4 * pollMs)
+    expect(await orderStatus(orderId)).toBe('SUBMITTED')
+
+    /* The pass, for this integration only, with the engine unable to answer until the pass reports
+     * a failed attempt for it. */
+    let unpausing: Promise<void> | undefined
+    let pass: DmiApiScriptRun
+    try {
+      await faults.pause(ENGINE)
+      pass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`], {
+        timeoutMs: 120_000,
+        onLine: (line) => {
+          if (unpausing == null && line.includes(org.integrationId) && /fail|error/i.test(line)) unpausing = faults.restore(ENGINE)
+        },
+      })
+    } finally {
+      await unpausing
+      await faults.restore(ENGINE)
+    }
+    const sawFailedAttempt = unpausing != null
+    console.log(`[idexx-scenario] ensure-integration-status -> exit ${pass.code}:\n${pass.output.join('\n')}`)
+    expect({ exitCode: pass.code, sawFailedAttempt }).toEqual({ exitCode: 0, sawFailedAttempt: true })
+    expect({ pollingJobsAfterThePass: (await repeatableJobsNaming(org.integrationId)).length }).toEqual({ pollingJobsAfterThePass: 2 })
+
+    const completed = await pollUntil(async () => await orderStatus(orderId), (status) => status === 'COMPLETED', 60_000, 1_000)
+    expect(completed).toBe('COMPLETED')
+  }, 30_000 + 4 * 3_000 + 120_000 + 60_000 + 30_000)
+
+  /* ---- dmi-api#367 guard ----
+   *
+   * dmi-api's MQTT client subscribes to a pattern's reply channel (`<pattern>/reply`) on demand and
+   * counts the requests in flight on it. Before dmi-api#367 it unsubscribed the channel whenever that
+   * count fell to zero, and subscribed again only when a request found it at zero. A broker outage
+   * breaks the count: a request made while the broker is down never gets its subscription (mqtt.js
+   * fails it with the connection), yet its timeout still counts it out, so from then on the count
+   * runs one below the requests in flight. When the first of two overlapping requests completes,
+   * the channel is unsubscribed under the other, whose reply is lost: dmi-api answers it 504 after
+   * its 10 s. Since dmi-api#367 the client never unsubscribes a reply channel, and subscribes it
+   * again after a timeout.
+   *
+   * So the test sends two device lookups at once, one of them held for 3 s, before the restart: both
+   * are answered, which shows the probe itself works. A lookup made while the broker is stopped is
+   * the one timeout the outage costs. Afterwards a lookup may time out once more, if it is published
+   * before the engine's replicas are back on the broker, and then the overlapping pair is sent again
+   * and both must be answered. Last, an order is placed (placeOrder asserts SUBMITTED, which is the
+   * engine's reply). Against dmi-api before #367 the pair after the restart loses the held lookup. */
+  it('a broker restart leaves the device and order round trips answering, at worst after one timeout (dmi-api#367)', async () => {
+    const faults = serviceFaults()
+    const lookup = async (): Promise<{ status: number, ms: number }> => {
+      const started = Date.now()
+      const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+      return { status: response.status, ms: Date.now() - started }
+    }
+    /* Two lookups in flight at once, one held: replica 1 of the integration is paused for holdMs, and
+     * the broker hands a shared subscription's messages to its subscribers in turn, so one lookup
+     * waits on the paused replica while the other is answered. */
+    const holdMs = 3_000
+    const overlapping = async (): Promise<Array<{ status: number, ms: number }>> => {
+      let answers: Promise<Array<{ status: number, ms: number }>>
+      try {
+        await faults.pause(ENGINE, { replica: 1 })
+        answers = Promise.all([lookup(), lookup()])
+        await sleep(holdMs)
+      } finally {
+        await faults.restore(ENGINE, { replica: 1 })
+      }
+      return (await answers).sort((a, b) => a.ms - b.ms)
+    }
+
+    const before = await overlapping()
+    console.log(`[idexx-scenario] overlapping lookups before the broker restart -> ${JSON.stringify(before)}`)
+
+    let duringOutage: { status: number, ms: number }
+    try {
+      await faults.stop(BROKER)
+      duringOutage = await lookup()
+    } finally {
+      await faults.restore(BROKER)
+    }
+    /* Afterwards, at worst one more timeout: a request published before the engine's replicas are
+     * back on the broker reaches nobody (they reconnect shortly after dmi-api does). */
+    const after = [await lookup()]
+    if (after[0].status !== 200) after.push(await lookup())
+    const overlappingAfter = await overlapping()
+    console.log(`[idexx-scenario] broker restart -> during ${JSON.stringify(duringOutage)}, after ${JSON.stringify(after)}, overlapping after ${JSON.stringify(overlappingAfter)}`)
+    await placeOrder()
+
+    expect({ before: before.map(({ status }) => status), held: before[1].ms >= holdMs && before[0].ms < holdMs }).toEqual({ before: [200, 200], held: true })
+    expect(duringOutage.status).toBe(504)
+    expect(after.map(({ status }) => status)).toEqual(after.length === 1 ? [200] : [504, 200])
+    expect({ overlappingAfter: overlappingAfter.map(({ status }) => status), held: overlappingAfter[1].ms >= holdMs && overlappingAfter[0].ms < holdMs })
+      .toEqual({ overlappingAfter: [200, 200], held: true })
+  }, 120_000)
+
+  afterAll(async () => {
+    try {
+      await restoreServices()
+    } finally {
+      if (admin != null && org?.integrationId != null) {
+        await admin.post(`/admin/integrations/${org.integrationId}/stop`).catch(() => undefined)
+      }
+      await closePool()
+    }
+  }, 180_000)
 })
