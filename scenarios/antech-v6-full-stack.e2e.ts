@@ -3403,8 +3403,10 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
           await disarmRevocation()
         }
 
-        expect(placed?.ok).toBe(false)
-        expect(placed?.body?.errors).toEqual([failedPost('/LabOrders/v6/Order'), 'Access token is invalid.'])
+        expect({ ok: placed?.ok, errors: placed?.body?.errors }).toEqual({
+          ok: false,
+          errors: [failedPost('/LabOrders/v6/Order'), 'Access token is invalid.'],
+        })
         expect({
           status: revocation?.status,
           placementRefused: revocation?.refused.orderPlacement,

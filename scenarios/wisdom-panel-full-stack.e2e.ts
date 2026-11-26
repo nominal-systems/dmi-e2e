@@ -2661,7 +2661,7 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
           ORDER_WAIT_MS,
           1_000,
         )
-        expect(resumed.length).toBeGreaterThan(0)
+        expect({ kitsPollsAnswered200AfterTheDisarm: resumed.length > 0 }).toEqual({ kitsPollsAnswered200AfterTheDisarm: true })
       }, NEGATIVE_WAIT_MS + ORDER_WAIT_MS + 60_000)
 
       it.failing('the integration logs in again when the provider revokes its token, and both polls resume', async () => {
