@@ -1042,7 +1042,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
           message: 'The provider idexx failed to list devices with status 502: A request to idexx failed without a response (ECONNRESET: socket hang up): GET /api/v1/ivls/devices.',
         })
       } finally {
-        await mock.delete('/__control__/scenarios/ivlsDevices')
+        /* By its id, like every other cleanup here: a late one must not disarm a later test's fault. */
+        await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`)
       }
     }, engineTimeoutMs + 10_000)
 
