@@ -995,6 +995,44 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(fired(fault)).toEqual({ hits: 1, outcomes: ['capped'] })
     }, engineTimeoutMs + 10_000)
 
+    /* What every test here leans on when it fails midway: disarming a key ends what its fault still
+     * holds, there and then, and a disarm by any other arming's id leaves the fault alone. A device
+     * list is held for far longer than dmi-api waits, and disarmed once the mock holds it: the
+     * integration's call fails at once, its connection closed, instead of being answered late. */
+    it('disarming a held call ends it at once, and a disarm by another id leaves the fault armed', async () => {
+      const armed = expectOk<{ fault: Fault }>(
+        await mock.post('/__control__/scenarios', { key: 'ivlsDevices', fault: 'hold', delayMs: 120_000 }),
+        'hold the device list at the mock',
+      )
+      try {
+        const pending = org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+        await pollUntil(armedAtMock, (now) => now.faults.ivlsDevices?.open === 1, engineTimeoutMs, 200)
+
+        const byAnotherId = expectOk<{ fault: Fault | null }>(
+          await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id + 1}`),
+          'disarm the hold by an id it does not have',
+        )
+        const stillArmed = (await armedAtMock()).faults.ivlsDevices
+        const cleared = expectOk<{ fault: Fault }>(
+          await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`),
+          'disarm the hold',
+        )
+        const response = await pending
+        console.log(`[idexx-scenario] disarmed held device list -> HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+
+        expect({ byAnotherId: byAnotherId.fault, stillArmed: stillArmed?.id }).toEqual({ byAnotherId: null, stillArmed: armed.fault.id })
+        expect(fired(cleared.fault)).toEqual({ hits: 1, outcomes: ['destroyed'] })
+        /* Closed by the mock's disarm, with a FIN, long before dmi-api's own timeout: a hold left to
+         * run would have been dmi-api's 504 instead. */
+        expect({ status: response.status, message: response.body?.message }).toEqual({
+          status: 502,
+          message: 'The provider idexx failed to list devices with status 502: A request to idexx failed without a response (ECONNRESET: socket hang up): GET /api/v1/ivls/devices.',
+        })
+      } finally {
+        await mock.delete('/__control__/scenarios/ivlsDevices')
+      }
+    }, engineTimeoutMs + 10_000)
+
     /* The positive twin of the manifest test below: an order placed without autoSubmitOrder is
      * created, waiting for input, and dmi-api stores the PDF its create answer points at — the
      * bytes the mock served, fetched once, before any confirm. */
