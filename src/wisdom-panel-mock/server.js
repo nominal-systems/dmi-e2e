@@ -8,8 +8,9 @@
  * channels, and kit ACTIVATION (which is what an "order" is for this provider). A separate control
  * plane (`/__control__/*`) lets tests provision provider-side kits (one at a time, or several in
  * one orders batch), seed result sets (with their kit's report ready, or still pending until the
- * test finishes it), fail the PDF generator, revoke bearers and inspect what the mock received, so
- * the order -> result -> report loop is deterministic and CI-safe.
+ * test finishes it), fail the PDF generator, refuse bearers (all of them, or the tokens issued so
+ * far) and inspect what the mock received, so the order -> result -> report loop is deterministic
+ * and CI-safe.
  *
  * It NEVER talks to a live Wisdom Panel host and never authenticates for real. Every kit code,
  * hospital, veterinarian, pet, owner and genetic finding here is SYNTHETIC — invented values shaped
@@ -74,12 +75,31 @@
  *
  * 5. THE TOKEN IS CACHED FOR TEN DAYS AND NEVER REFRESHED ON A 401. OBSERVED: `expires_in` is
  *    3456000 s (40 days) and the integration caches the token for `expires_in x 0.25`. It never
- *    re-authenticates on a 401. So (a) this mock honours every token it has ever issued for the
- *    life of the process — an expiring mock token would break the loop for a reason the vendor
- *    would not produce; and (b) "revoking" a credential is a control-plane switch
- *    (`POST /__control__/bearer {"accept": false}`) that makes the mock reject bearers it still
- *    knows, and switching it back ON must make the SAME tokens valid again, because the engine will
- *    never come back for new ones.
+ *    re-authenticates on a 401. So this mock honours every token it has ever issued for the life of
+ *    the process — an expiring mock token would break the loop for a reason the vendor would not
+ *    produce — and it has two ways to stop honouring them, both control-plane switches, both
+ *    answering a refused call with the dialect's own refusal of a bad token (detail 3):
+ *      - `POST /__control__/bearer {"accept": false}` refuses EVERY bearer, the tokens issued so far
+ *        and any a login issues while it is off, with a 401. Switching it back on makes the SAME
+ *        tokens valid again, because the engine will never come back for new ones. It stages a
+ *        vendor that refuses whatever it is shown, so a new login would not help either: the audit
+ *        tripwire and the test that the polls resume use it.
+ *      - `POST /__control__/revocation {"status": <n>}` (401 if left out) refuses the tokens issued
+ *        BEFORE it, and accepts every token a login issues after it. That is what Wisdom did on
+ *        2026-11-23 after a maintenance, OBSERVED IN PRODUCTION
+ *        (nominal-systems/dmi-engine-wisdom-panel-integration#53): the tokens the engine held were
+ *        refused for more than a day while `/oauth/token` kept working, and the activations dmi-api
+ *        logged were answered 401 with the voyager sentence `requireVoyagerAuth` sends. The polls'
+ *        status was never logged; the read endpoints answer a made-up bearer with the JSON:API 401
+ *        below (OBSERVED, 2026-11-25). The status is a parameter so that another can be staged, in
+ *        the same envelope (any status but 401 INVENTED). It counts what it refused, per endpoint
+ *        (keyed as the call log's `counters`), and the logins it saw, and it is listed with those
+ *        counts (`GET /__control__/revocation`, and on the call log) until
+ *        `DELETE /__control__/revocation` disarms it, answering with the final counts. Only one can
+ *        be armed at a time. Disarming makes the revoked tokens good again — a harness rule, not a
+ *        provider one: the integration keeps its token for ten days, and a test that ended with an
+ *        engine process still holding a refused token would leave every later test's polls failing.
+ *    A token both switches refuse is answered, and counted, as the revocation's.
  *
  * 6. ACKNOWLEDGE IS A FILTER, NOT A DELETE, AND THE TWO CHANNELS ARE INDEPENDENT. OBSERVED: an
  *    acknowledged kit still answers an unfiltered query; acking a result set does not acknowledge
@@ -306,9 +326,12 @@ function freshState () {
     pets: new Map(),
     /* result set id -> result set record, including the simplified body the scenario seeded. */
     resultSets: new Map(),
-    /* The control-plane revocation switch (load-bearing detail 5). When false every bearer is
+    /* The control-plane acceptance switch (load-bearing detail 5). When false every bearer is
      * refused, in each dialect's own shape, and the tokens stay valid for when it is switched back. */
     acceptBearers: true,
+    /* The armed token revocation, or null (load-bearing detail 5): { status, armedAt, revoked (the
+     * tokens issued before it), refused (per endpoint), logins }. */
+    revocation: null,
     /* One entry per provider-endpoint call, so a scenario asserts on what the integration DID. */
     calls: [],
     nextCallSeq: 0,
@@ -441,13 +464,15 @@ function externalBase (req) {
  * `Failed to POST <url>`. Each builder is used only where its shape was observed. */
 
 /* OBSERVED VERBATIM on `/api/v1/*` for a missing or unknown bearer. Note the asymmetry that a
- * tidier mock would have ironed out: `code` is a NUMBER here and `status` a STRING. */
-function sendJsonApiUnauthorized (res, why) {
+ * tidier mock would have ironed out: `code` is a NUMBER here and `status` a STRING. A revocation
+ * armed with another status sends it in both members (load-bearing detail 5; INVENTED: JSON:API
+ * defines `status` as the HTTP status, and the observed `code` carries it too). */
+function sendJsonApiUnauthorized (res, why, status = 401) {
   state.counters.unauthorized += 1
-  log(`401 on /api/v1: ${why}`)
-  sendJsonApi(res, 401, {
+  log(`${status} on /api/v1: ${why}`)
+  sendJsonApi(res, status, {
     errors: [
-      { title: 'Permission Denied', detail: 'The access token is invalid', code: 401, status: '401' },
+      { title: 'Permission Denied', detail: 'The access token is invalid', code: status, status: String(status) },
     ],
   })
 }
@@ -485,8 +510,8 @@ function sendNotAcceptable (res, accept) {
 }
 
 /* The voyager dialect: a plain `{message}`. OBSERVED for the 422s of `GET /api/voyager/pet`
- * (`WIS_VOY__105: Failed: Kit <code> could not be found.`); the status/shape of a voyager call made
- * with a bad bearer was NOT observed, so that use below is INVENTED and says so at its call site.
+ * (`WIS_VOY__105: Failed: Kit <code> could not be found.`), and in production for the 401 that
+ * `POST /api/voyager/pet` answered a revoked bearer with (see `requireVoyagerAuth`).
  * `WisdomApiException` reads `options.message`, so everything sent through here reaches an operator
  * verbatim through POST /orders — which is the point of using the vendor's own `WIS_VOY__nnn:
  * Failed: ...` house style rather than a message of the mock's own devising. */
@@ -559,33 +584,58 @@ function bearerOf (req) {
   return match === null ? null : match[1]
 }
 
-/* A bearer is good when the mock issued it AND the revocation switch is on. The switch never
- * forgets a token: see load-bearing detail 5. */
-function bearerIsValid (req) {
-  const token = bearerOf(req)
-  return token !== null && state.acceptBearers && state.tokens.has(token)
+/* Whether an armed revocation refuses this token: it was issued before the revocation was. */
+function isRevoked (token) {
+  return state.revocation != null && state.revocation.revoked.has(token)
 }
 
-function requireJsonApiAuth (req, res) {
+/* Why the mock refuses a request's bearer, or null when it takes it. A bearer is good when the mock
+ * issued it, no revocation refuses it, and the acceptance switch is on. Neither switch ever forgets
+ * a token: see load-bearing detail 5. */
+function bearerRefusal (req) {
+  const token = bearerOf(req)
+  if (token === null) return 'no bearer'
+  if (!state.tokens.has(token)) return 'unknown bearer'
+  if (isRevoked(token)) return 'revoked bearer'
+  if (!state.acceptBearers) return 'bearer acceptance switched off'
+  return null
+}
+
+/* The status a refused bearer is answered with: the revocation's for a token it refuses (and that
+ * refusal counted against `operation`), 401 for every other. */
+function refusalStatus (refusal, operation) {
+  if (refusal !== 'revoked bearer') return 401
+  const refused = state.revocation.refused
+  refused[operation] = (refused[operation] ?? 0) + 1
+  return state.revocation.status
+}
+
+/* `operation` names the endpoint for a revocation's refusal count, as `counters` names it. */
+function requireJsonApiAuth (req, res, operation) {
   if (!acceptableToJsonApi(req)) {
     sendNotAcceptable(res, req.headers.accept)
     return false
   }
-  if (!bearerIsValid(req)) {
-    sendJsonApiUnauthorized(res, bearerOf(req) === null ? 'no bearer' : 'unknown or revoked bearer')
+  const refusal = bearerRefusal(req)
+  if (refusal !== null) {
+    sendJsonApiUnauthorized(res, refusal, refusalStatus(refusal, operation))
     return false
   }
   return true
 }
 
-/* The voyager and pdf-generator endpoints' answer to a bad bearer was NOT observed. 401 with the
- * voyager dialect's `{message}` is INVENTED — chosen because every other voyager refusal observed
- * (the 422s) is shaped that way, which is a smaller invention than importing the JSON:API envelope
- * across a dialect boundary. */
-function requireVoyagerAuth (req, res) {
-  if (bearerIsValid(req)) return true
+/* The voyager endpoints' answer to a bad bearer. OBSERVED IN PRODUCTION on `POST /api/voyager/pet`
+ * for the tokens Wisdom revoked on 2026-11-23: a 401 carrying this sentence, logged by dmi-api for
+ * every activation in that window (nominal-systems/dmi-engine-wisdom-panel-integration#53). The
+ * same answer on the other voyager endpoints, and on the pdf generator, which shares this check, is
+ * INFERRED: nobody has seen them refuse a bearer. */
+const VOYAGER_INVALID_TOKEN = 'WIS_VOY__001: You do not have permission to access these records. Must have a valid token.'
+
+function requireVoyagerAuth (req, res, operation) {
+  const refusal = bearerRefusal(req)
+  if (refusal === null) return true
   state.counters.unauthorized += 1
-  sendVoyagerError(res, 401, 'Unauthorized: the access token is invalid.', 'bad bearer on a voyager endpoint')
+  sendVoyagerError(res, refusalStatus(refusal, operation), VOYAGER_INVALID_TOKEN, `${refusal} on a voyager endpoint`)
   return false
 }
 
@@ -794,6 +844,9 @@ async function handleTokenGrant (req, res) {
   const token = `wp-mock-${randomUUID()}`
   state.tokens.set(token, { username: body.username, issuedAt: nowIso() })
   state.counters.login += 1
+  /* A login while a revocation is armed is the recovery the revocation stages; it is counted, and
+   * its token is not among the revoked ones. */
+  if (state.revocation != null) state.revocation.logins += 1
   log(`issued token #${state.tokens.size} to '${body.username}'`)
 
   sendJson(res, 200, {
@@ -813,7 +866,7 @@ async function handleTokenGrant (req, res) {
  * mock that ignored it would let an integration that stopped sending `hospital_number` read every
  * clinic's kits while the gate stayed green. */
 function handleKits (req, res, params, query) {
-  if (!requireJsonApiAuth(req, res)) return
+  if (!requireJsonApiAuth(req, res, 'kits')) return
   const filters = parseFilters(res, query, KIT_FILTERS)
   if (filters === null) return
   state.counters.kits += 1
@@ -848,7 +901,7 @@ function handleKits (req, res, params, query) {
  * non-empty page kills the results poll inside the logging interceptor, one layer earlier than the
  * orders side. A result set's hospital is its kit's. */
 function handleResultSets (req, res, params, query) {
-  if (!requireJsonApiAuth(req, res)) return
+  if (!requireJsonApiAuth(req, res, 'resultSets')) return
   const filters = parseFilters(res, query, RESULT_SET_FILTERS)
   if (filters === null) return
   state.counters.resultSets += 1
@@ -886,7 +939,7 @@ function handleResultSets (req, res, params, query) {
  * KEY ORDER IS LOAD-BEARING: the mapper walks `Object.keys(...)` and uses the index as the test
  * result's `seq`, so the order below is what decides which panel is seq 0, 1 and 2. */
 function handleSimplifiedResults (req, res, params) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'simplified')) return
   state.counters.simplified += 1
   const kitId = params.kitId
   state.fetches.simplified[kitId] = (state.fetches.simplified[kitId] || 0) + 1
@@ -939,7 +992,7 @@ function handleSimplifiedResults (req, res, params) {
  * delivered. Its HTTP layer retries a 5xx once inside the same request and never a 4xx, so a poll
  * makes two requests here for a 500 and one for a 404. */
 function handleVetReport (req, res, params) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'pdf')) return
   state.counters.pdf += 1
   const kitId = params.kitId
   state.fetches.pdf[kitId] = (state.fetches.pdf[kitId] || 0) + 1
@@ -979,7 +1032,7 @@ function handleVetReport (req, res, params) {
  * the zoetis one would) would be fiction. Acknowledging is a FILTER, not a delete: the kit or set
  * stays queryable, it just leaves the `unacknowledged` view. */
 async function handleAcknowledgeKits (req, res) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'ackKits')) return
   const body = await readJson(req)
   state.counters.ackKits += 1
 
@@ -1011,7 +1064,7 @@ async function handleAcknowledgeKits (req, res) {
 }
 
 async function handleAcknowledgeResultSets (req, res) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'ackResultSets')) return
   const body = await readJson(req)
   state.counters.ackResultSets += 1
 
@@ -1049,7 +1102,7 @@ async function handleAcknowledgeResultSets (req, res) {
  * `client_phone`, the birth fields, and a BREED — `getBreeds` is `[]` for this provider and the
  * mapper never sends one, so requiring one would be the mock inventing a contract. */
 async function handleCreatePet (req, res) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'createPet')) return
   const body = await readJson(req)
   state.counters.createPet += 1
   const data = body?.data
@@ -1164,7 +1217,7 @@ async function handleCreatePet (req, res) {
  * it; it is served because the endpoint exists and its 422 is the one voyager refusal OBSERVED
  * verbatim. The 200 form is INFERRED (the §E envelope again). */
 function handleGetPet (req, res, params, query) {
-  if (!requireVoyagerAuth(req, res)) return
+  if (!requireVoyagerAuth(req, res, 'getPet')) return
   state.counters.getPet += 1
   const kitCode = query.get('kit_code')
   const voyagerPetId = query.get('voyager_pet_id')
@@ -1650,6 +1703,59 @@ function handleControlReportReady (req, res, params) {
   sendJson(res, 200, { ...publicKit(kit), seq })
 }
 
+/* ---- token revocation (load-bearing detail 5) ---- */
+
+function publicRevocation (revocation) {
+  if (revocation == null) return null
+  return {
+    status: revocation.status,
+    armedAt: revocation.armedAt,
+    /* How many tokens it refuses: every one issued before it was armed. */
+    revokedTokens: revocation.revoked.size,
+    /* Calls refused, per endpoint. */
+    refused: { ...revocation.refused },
+    /* Logins while armed, each issuing a token it accepts. */
+    logins: revocation.logins,
+  }
+}
+
+/* Arm a revocation: `{status}`, any HTTP error status, 401 if left out. Refused while one is armed,
+ * and while no token has been issued (it would refuse nothing). */
+async function handleControlArmRevocation (req, res) {
+  const body = await readJson(req)
+  const unknown = Object.keys(body).filter((key) => key !== 'status')
+  if (unknown.length > 0) {
+    return controlError(res, `a revocation takes only "status"; unknown ${unknown.map((key) => `"${key}"`).join(', ')}`)
+  }
+  const status = body.status === undefined ? 401 : body.status
+  if (!Number.isInteger(status) || status < 400 || status > 599) {
+    return controlError(res, `status must be an HTTP error status (an integer, 400-599), got ${JSON.stringify(body.status)}`)
+  }
+  if (state.revocation != null) {
+    return sendJson(res, 409, {
+      error: `a revocation is already armed (since ${state.revocation.armedAt}); DELETE /__control__/revocation first`,
+      revocation: publicRevocation(state.revocation),
+    })
+  }
+  if (state.tokens.size === 0) {
+    return sendJson(res, 409, { error: 'no token has been issued yet, so a revocation would refuse nothing' })
+  }
+  state.revocation = { status, armedAt: nowIso(), revoked: new Set(state.tokens.keys()), refused: {}, logins: 0 }
+  log(`control: revocation armed (${status}) over ${state.revocation.revoked.size} token(s)`)
+  sendJson(res, 200, { revocation: publicRevocation(state.revocation) })
+}
+
+/* Disarm it, and answer with what it did. 200 either way; `cleared` says whether one was armed. The
+ * tokens it refused are good again. */
+function handleControlClearRevocation (req, res) {
+  const revocation = publicRevocation(state.revocation)
+  state.revocation = null
+  if (revocation != null) {
+    log(`control: revocation cleared (refused ${JSON.stringify(revocation.refused)}, ${revocation.logins} login(s) while armed)`)
+  }
+  sendJson(res, 200, { cleared: revocation != null, revocation })
+}
+
 async function handleControlBearer (req, res) {
   const body = await readJson(req)
   if (typeof body.accept !== 'boolean') return controlError(res, 'accept must be a boolean')
@@ -1670,7 +1776,7 @@ function handleControlReset (req, res) {
 
 /* ---- request recording ---- */
 
-function recordCall (req, url, body) {
+function recordCall (req, res, url, body) {
   state.nextCallSeq += 1
   const call = {
     seq: state.nextCallSeq,
@@ -1682,9 +1788,15 @@ function recordCall (req, url, body) {
     authorization: req.headers.authorization ?? null,
     contentType: req.headers['content-type'] ?? null,
     body,
+    /* The status it was answered with, filled in once the response is done; null until then, and
+     * for a call whose head was never written. */
+    status: null,
   }
   state.calls.push(call)
   if (state.calls.length > MAX_CALL_LOG) state.calls.splice(0, state.calls.length - MAX_CALL_LOG)
+  res.on('close', () => {
+    call.status = res.headersSent ? res.statusCode : null
+  })
   return call
 }
 
@@ -1785,12 +1897,16 @@ const routes = [
         fetches: state.fetches,
         tokens: [...state.tokens.keys()],
         acceptBearers: state.acceptBearers,
+        revocation: publicRevocation(state.revocation),
         lastSeq: state.nextCallSeq,
         calls,
       })
     },
   ],
   ['POST', /^\/__control__\/bearer$/, handleControlBearer],
+  ['POST', /^\/__control__\/revocation$/, handleControlArmRevocation],
+  ['GET', /^\/__control__\/revocation$/, (req, res) => sendJson(res, 200, { revocation: publicRevocation(state.revocation) })],
+  ['DELETE', /^\/__control__\/revocation$/, handleControlClearRevocation],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
 
@@ -1829,7 +1945,7 @@ const server = http.createServer(async (req, res) => {
       req.parsedBody = body
     }
     /* Parked on the request so a handler can add what it answered (the kits feed does). */
-    if (isProviderCall) req.callRecord = recordCall(req, url, body)
+    if (isProviderCall) req.callRecord = recordCall(req, res, url, body)
 
     try {
       await handler(req, res, params, url.searchParams)

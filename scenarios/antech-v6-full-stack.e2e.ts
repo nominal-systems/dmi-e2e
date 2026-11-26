@@ -288,6 +288,32 @@ interface RedeliveryWindow {
   acked: number
 }
 
+/* The mock's token revocation, as its control plane lists it (the mock's header, load-bearing
+ * detail 10): the status it refuses with, how many tokens it refuses, the calls it refused per
+ * operation, and the logins made while it was armed. */
+interface Revocation {
+  status: number
+  armedAt: string
+  revokedTokens: number
+  refused: Record<string, number>
+  logins: number
+}
+
+/* One provider call in the mock's call log, as it arrived, with the answer it got. */
+interface LoggedCall {
+  seq: number
+  at: string
+  method: string
+  path: string
+  operation: string
+  clinicAccessionId: string | null
+  /* The labOrder status polls the mock had answered when the call arrived: two calls carrying the
+   * same number were made within one orders poll. */
+  labOrderPolls: number
+  status: number | null
+  retryAfter: string | null
+}
+
 describe('antech-v6 full-stack (Antech V6 mock)', () => {
   let root: ApiClient
   let org: SeededOrg
@@ -447,6 +473,95 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       status: 'REGISTERED',
       panels: [],
     })
+  }
+
+  /* What is armed at the mock: the error scenarios, per key, and the token revocation, null when
+   * none is. */
+  async function armedAtMock (): Promise<{ scenarios: Record<string, unknown>, revocation: Revocation | null }> {
+    return expectOk<{ scenarios: Record<string, unknown>, revocation: Revocation | null }>(
+      await mock.get('/__control__/scenarios'),
+      'list what is armed at the mock',
+    )
+  }
+
+  /* Whatever is still armed at the mock is cleared, and then named as a failure. Run after each test
+   * that arms something: a test that failed or timed out before its own cleanup ran would otherwise
+   * leave the next test a refused token or a one-shot answer, and the red would land in the wrong
+   * test. Jest reports a failing `afterEach` on the test it followed, which is the one that left it
+   * armed; clearing first means the tests after it start clean whatever happens here. */
+  async function expectNothingLeftArmed (): Promise<void> {
+    const { scenarios, revocation } = await armedAtMock()
+    const leftoverScenarios = Object.keys(scenarios)
+    for (const key of leftoverScenarios) {
+      expectOk(
+        await mock.delete(`/__control__/scenarios/${encodeURIComponent(key)}`),
+        `clear the leftover '${key}' scenario at the mock`,
+      )
+    }
+    if (revocation != null) await disarmRevocation()
+    expect({ leftoverScenarios, leftoverRevocation: revocation }).toEqual({ leftoverScenarios: [], leftoverRevocation: null })
+  }
+
+  /* Revoke every token the mock has issued so far, refused with `status` (401 when left out); the
+   * tokens later logins issue are accepted. */
+  async function armRevocation (status?: number): Promise<Revocation> {
+    return expectOk<{ revocation: Revocation }>(
+      await mock.post('/__control__/revocation', status === undefined ? {} : { status }),
+      `revoke the tokens the mock has issued${status === undefined ? '' : `, refusing them with ${status}`}`,
+    ).revocation
+  }
+
+  async function revocationNow (): Promise<Revocation | null> {
+    return expectOk<{ revocation: Revocation | null }>(
+      await mock.get('/__control__/revocation'),
+      'read the revocation at the mock',
+    ).revocation
+  }
+
+  /* Disarm the revocation and return what it did, null if none was armed. The tokens it refused are
+   * good again. Safe to call twice: each test disarms as soon as it is done with it, and again in
+   * its `finally`. */
+  async function disarmRevocation (): Promise<Revocation | null> {
+    return expectOk<{ revocation: Revocation | null }>(
+      await mock.delete('/__control__/revocation'),
+      'disarm the revocation at the mock',
+    ).revocation
+  }
+
+  /* A token from the mock's own login, as the integration gets one. */
+  async function mintToken (): Promise<string> {
+    return expectOk<{ Token: string }>(
+      await mock.post('/Users/v6/Login', {
+        UserName: env.antechV6.username,
+        Password: env.antechV6.password,
+        ClinicID: env.antechV6.clinicId,
+      }),
+      'log in to the mock directly',
+    ).Token
+  }
+
+  /* The labOrder status feed, asked for directly with `token`. The harness's ApiClient speaks
+   * dmi-api's auth schemes, not Antech's `accessToken` header, so provider-side probes go out over
+   * plain fetch. */
+  async function labOrderFeedWith (token: string): Promise<{ status: number, body: any }> {
+    const response = await fetch(
+      `${env.antechV6.mockBaseUrl}/LabResults/v6/GetStatus?serviceType=labOrder` +
+        `&ClinicID=${encodeURIComponent(env.antechV6.clinicId)}&overrideAck=true&ClinicAccessionID=none`,
+      { headers: { accessToken: token } },
+    )
+    return { status: response.status, body: await response.json() }
+  }
+
+  /* The provider calls the mock logged after `since`, of one operation. */
+  async function loggedCalls (operation: string, since: number): Promise<LoggedCall[]> {
+    return expectOk<{ calls: LoggedCall[] }>(
+      await mock.get('/__control__/calls/log', { operation, since }),
+      `read the mock's log of ${operation} calls`,
+    ).calls
+  }
+
+  async function lastLoggedSeq (): Promise<number> {
+    return expectOk<{ lastSeq: number }>(await mock.get('/__control__/calls/log', { since: Number.MAX_SAFE_INTEGER }), "read the mock's call log").lastSeq
   }
 
   /* The generic line the integration puts first in the error list of a failed placement: the URL
@@ -675,6 +790,13 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       expect(org.organizationId).toBeTruthy()
       expect(org.providerConfigurationId).toBeTruthy()
       expect(org.integrationId).toBeTruthy()
+    })
+
+    it('the mock starts the run with nothing armed: no error scenario, no token revocation', async () => {
+      /* Every switch a test arms is listed until it is disarmed, so a run that inherited one from a
+       * warm rerun, or a mock that came up armed, is named here before any test can be confused by
+       * it. */
+      expect(await armedAtMock()).toEqual({ scenarios: {}, revocation: null })
     })
 
     it('the mock is provisioned for the clinic and lab the integration was configured with', async () => {
@@ -1567,20 +1689,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
      * mock is cleared and then named as a failure. Jest reports a failing `afterEach` on the test it
      * followed, which is the one that armed the answer and never used it; clearing first means the
      * tests after it start clean whatever happens here. */
-    afterEach(async () => {
-      const armed = expectOk<{ scenarios: Record<string, unknown> }>(
-        await mock.get('/__control__/scenarios'),
-        'list the scenarios still armed at the mock',
-      ).scenarios
-      const leftoverScenarios = Object.keys(armed)
-      for (const key of leftoverScenarios) {
-        expectOk(
-          await mock.delete(`/__control__/scenarios/${encodeURIComponent(key)}`),
-          `clear the leftover '${key}' scenario at the mock`,
-        )
-      }
-      expect({ leftoverScenarios }).toEqual({ leftoverScenarios: [] })
-    })
+    afterEach(expectNothingLeftArmed)
 
     /* Arms `answer` once on `key` (`placeOrder` is `/LabOrders/v6/Order`, `placePreOrder` is
      * `/LabOrders/v6/PreOrderPlacement`): a status and body spelled out here, or one of the mock's
@@ -2896,6 +3005,100 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     }, REDELIVERY_WAIT_MS * 2 + 30_000)
   })
 
+  describe('a Retry-After from Antech is honoured (nominal-systems/dmi-engine-common#27)', () => {
+    /* dmi-engine-common's `BaseApiService.get` retries a GET once when it fails with a 5xx, a 429 or
+     * no response: after 100 ms by default, or after the response's `Retry-After` when it carries
+     * one (capped at 60 s). That is #27, released in dmi-engine-common 1.7.0, the version dmi-engine's
+     * lockfile resolves. Whether Antech ever sends the header is not known; the mock sends it when a
+     * scenario asks (its header).
+     *
+     * WHICH ENDPOINT. The retry decides its delay from the error it is handed, and on 1.7.0 the
+     * logging interceptor runs the integration's accession-id extractor on the error body first. On
+     * GetStatus and GetAllResults that extractor dereferences success-only keys, throws, and the
+     * TypeError replaces the provider's error: it has no response, so no header, and the retry runs
+     * after 100 ms whatever the provider said (the status-poll audit tripwire below is the same
+     * throw). The TRF's extractor reads the URL alone, so its error reaches the retry whole. And the
+     * TRF is fetched inside the orders poll, once per reference-lab order, which gives a call this
+     * test can single out: a promoted draft's. */
+    afterEach(expectNothingLeftArmed)
+
+    const RETRY_AFTER_SECONDS = 2
+    /* A 100 ms retry cannot reach the lower bound and a 2 s one cannot miss it: the integration's
+     * timer starts only once the 503 has reached it, so the retry arrives at least 2 s after the
+     * 503 did, by the mock's own clock. The upper bound leaves three seconds for a slow CI machine. */
+    const MIN_GAP_MS = RETRY_AFTER_SECONDS * 1000 - 100
+    const MAX_GAP_MS = RETRY_AFTER_SECONDS * 1000 + 3_000
+
+    it('a 503 with `Retry-After: 2` on an order form is retried about two seconds later, in the same poll, and the retried form is the one stored', async () => {
+      const payload = payloadFor([referenceLabCode], {
+        requisitionId: `hrn-v6-retry-after-${randomUUID().slice(0, 8)}`,
+      })
+      const requisitionId = payload.requisitionId as string
+      const created = expectOk<{ id: string, status: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place the reference-lab order whose form will be refused once',
+      )
+      expect(created.status).toBe('WAITING_FOR_INPUT')
+
+      const since = await lastLoggedSeq()
+      let trfCalls: LoggedCall[] = []
+      try {
+        /* The next TRF fetch, whichever order it is for, is answered 503 with the header. Nothing
+         * else in this file is on the labOrder feed by now, so it is this order's: the call log
+         * below shows that it was. The body is the TRF endpoint's own `{StatusCode, ErrorMessage}`
+         * shape, with a wording of the mock's (an Antech 503 was never captured). */
+        expectOk(
+          await mock.post('/__control__/scenarios', {
+            key: 'trf',
+            status: 503,
+            body: { StatusCode: 503, ErrorMessage: 'Service Unavailable' },
+            retryAfter: RETRY_AFTER_SECONDS,
+            once: true,
+          }),
+          `arm a one-shot 503 with Retry-After: ${RETRY_AFTER_SECONDS} on the next TRF fetch`,
+        )
+        expectOk(
+          await mock.post(`/__control__/orders/${encodeURIComponent(requisitionId)}/promote`, {}),
+          'promote the draft to a placed order at the mock',
+        )
+        /* The orders poll fetches the form, emits the order, then acknowledges it: once the ack has
+         * landed, every fetch of this poll has happened. */
+        await waitForOrderAck(requisitionId)
+        trfCalls = (await loggedCalls('trf', since)).filter((call) => call.clinicAccessionId === requisitionId)
+      } finally {
+        /* Consumed by the 503 when all went well; disarmed here when it did not. */
+        await mock.delete('/__control__/scenarios/trf').catch(() => undefined)
+      }
+
+      /* The 503 reached this order's form, carrying the header, and one retry followed it. */
+      expect(trfCalls.map((call) => ({ status: call.status, retryAfter: call.retryAfter }))).toEqual([
+        { status: 503, retryAfter: String(RETRY_AFTER_SECONDS) },
+        { status: 200, retryAfter: null },
+      ])
+      const [refused, retried] = trfCalls
+      const gapMs = Date.parse(retried.at) - Date.parse(refused.at)
+      console.log(`[antech-v6-scenario] TRF retried ${gapMs} ms after the 503 with Retry-After: ${RETRY_AFTER_SECONDS}`)
+      expect({ gapMs, atLeast: gapMs >= MIN_GAP_MS, atMost: gapMs <= MAX_GAP_MS }).toEqual({ gapMs, atLeast: true, atMost: true })
+      /* The HTTP layer's retry, not the next poll fetching the form again: no orders poll began
+       * between the two. */
+      expect(retried.labOrderPolls).toBe(refused.labOrderPolls)
+
+      /* And the retry's answer is what reached dmi-api: the order form it stored is the one document
+       * the mock served. Read once dmi-api has applied the order the poll delivered. */
+      const submitted = await pollUntil(
+        async () => await org.api.get(`/orders/${created.id}`),
+        (response) => response.body?.status === 'SUBMITTED',
+        STATUS_APPLIED_WAIT_MS,
+        1_000,
+      )
+      expect(submitted.body?.status).toBe('SUBMITTED')
+      const order = await mockOrder(requisitionId)
+      expect(order.trfDigests).toHaveLength(1)
+      const stored = expectOk<{ data: string }>(await org.api.get(`/orders/${created.id}/manifest`), 'read the stored order form')
+      expect(createHash('sha256').update(Buffer.from(stored.data, 'base64')).digest('hex')).toBe(order.trfDigests[0])
+    }, ORDER_ACK_WAIT_MS + STATUS_APPLIED_WAIT_MS + 30_000)
+  })
+
   /* ---- tripwires ----
    *
    * Each asserts the CORRECT behaviour and is marked `failing` while the integration does not have
@@ -3043,6 +3246,232 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         `Invalid BreedId ${DEFAULT_PET_BREED}`,
       ])
     }, 60_000)
+
+    describe('a token Antech stops accepting (nominal-systems/dmi-engine-antech-v6-integration#95)', () => {
+      /* The integration caches its token per user and clinic for 12 hours, in each engine process,
+       * and `withAuthentication` is its recovery: a call refused with 401 logs in again, refreshes
+       * the cache and is retried once. The mock's revocation (its header, load-bearing detail 10)
+       * stages a vendor that stops accepting the tokens it has issued while its login keeps working,
+       * as Wisdom Panel did on 2026-11-23. The first two tests prove the revocation reaches the
+       * integration's calls and that the recovery runs where a 401 reaches it, and does not where
+       * the refusal is a 5xx; the tripwire after them is the polls, where the 401 does not reach it.
+       *
+       * Each test arms the revocation for as long as it needs it and disarms it in a `finally`, and
+       * this describe checks after each that nothing is left armed. Disarming makes the revoked
+       * tokens good again, so the polls recover whatever the integration did; the tests that follow
+       * would otherwise find an engine holding a dead token for 12 hours. */
+      afterEach(expectNothingLeftArmed)
+
+      it('a revocation refuses the tokens issued before it and accepts those issued after: both polls are refused, a placement logs in again and goes through, and disarmed the polls resume', async () => {
+        /* A token of this test's own, issued before the revocation. */
+        const oldToken = await mintToken()
+        const payload = payloadFor([KIDNEY_PANEL_CODE], {
+          requisitionId: `hrn-v6-revoked-placement-${randomUUID().slice(0, 8)}`,
+        })
+        const requisitionId = payload.requisitionId as string
+
+        let revocation: Revocation | null = null
+        let polls: Revocation | null = null
+        let oldAnswer: { status: number, body: any } = { status: 0, body: null }
+        let newAnswer: { status: number, body: any } = { status: 0, body: null }
+        let placed: ApiResponse | undefined
+        try {
+          const armed = await armRevocation()
+          /* At least the worker's, the api process's and this test's. */
+          expect(armed.revokedTokens).toBeGreaterThanOrEqual(3)
+
+          /* The worker's next ticks meet it on both feeds the polls read. */
+          polls = await pollUntil(
+            revocationNow,
+            (now) => (now?.refused.getStatusLabOrder ?? 0) >= 1 && (now?.refused.getAllResults ?? 0) >= 1,
+            NEGATIVE_WAIT_MS,
+            500,
+          )
+
+          /* The old token is refused, in the envelope the mock answers a token it does not take
+           * with; a token from a login made now is accepted. */
+          oldAnswer = await labOrderFeedWith(oldToken)
+          newAnswer = await labOrderFeedWith(await mintToken())
+
+          /* A placement: the api process's cached token is refused with a 401 that reaches the
+           * integration whole (the placement's accession-id extractor reads the request, not the
+           * error body), so `withAuthentication` logs in again and the order goes through. */
+          placed = await org.api.post('/orders', payload, { autoSubmitOrder: true })
+          revocation = await disarmRevocation()
+        } finally {
+          await disarmRevocation()
+        }
+
+        expect({
+          labOrderFeedRefused: (polls?.refused.getStatusLabOrder ?? 0) >= 1,
+          resultsFeedRefused: (polls?.refused.getAllResults ?? 0) >= 1,
+          refused: polls?.refused,
+        }).toEqual({ labOrderFeedRefused: true, resultsFeedRefused: true, refused: polls?.refused })
+        expect(oldAnswer).toEqual({
+          status: 401,
+          body: {
+            type: 'https://www.rfc-editor.org/rfc/rfc9110.html#status.401',
+            message: 'Access token is invalid.',
+            status: 401,
+            errorDetails: {},
+            isSuccess: false,
+            requestId: expect.any(String),
+          },
+        })
+        expect({ status: newAnswer.status, keys: Object.keys(newAnswer.body ?? {}).sort() }).toEqual({
+          status: 200,
+          keys: ['LabOrders', 'LabResults'],
+        })
+
+        expect({ httpStatus: placed?.status, status: placed?.body?.status, errors: placed?.body?.errors }).toEqual({
+          httpStatus: 201,
+          status: 'SUBMITTED',
+          errors: undefined,
+        })
+        /* Refused once, then placed: the only way past the refusal is a token issued after it. And
+         * at least two logins in the window, this test's own and the api process's. */
+        expect({ placementRefused: revocation?.refused.orderPlacement, loggedIn: (revocation?.logins ?? 0) >= 2 }).toEqual({
+          placementRefused: 1,
+          loggedIn: true,
+        })
+        expect((await mockOrder(requisitionId)).kind).toBe('order')
+
+        /* Disarmed, the polls run again: the order placed in the window is acknowledged. */
+        await waitForOrderAck(requisitionId)
+      }, NEGATIVE_WAIT_MS + ORDER_ACK_WAIT_MS + 30_000)
+
+      it('a revocation answered 500 is not taken for a stale token: nothing logs in again, and the placement fails with the provider\'s wording', async () => {
+        /* The status is the revocation's parameter. `withAuthentication` logs in again on a 401 only,
+         * which is what keeps a provider outage answered 5xx from doubling into a login per call
+         * (the same guard nominal-systems/dmi-engine-wisdom-panel-integration#53 asks for). On the
+         * polls a 5xx is retried once, 100 ms later, and the poll fails; at placement, which is not
+         * retried, the provider's wording reaches the operator. */
+        const payload = payloadFor([KIDNEY_PANEL_CODE], {
+          requisitionId: `hrn-v6-revoked-500-${randomUUID().slice(0, 8)}`,
+        })
+        const requisitionId = payload.requisitionId as string
+
+        let revocation: Revocation | null = null
+        let placed: ApiResponse | undefined
+        try {
+          await armRevocation(500)
+          placed = await org.api.post('/orders', payload, { autoSubmitOrder: true })
+          console.log(
+            `[antech-v6-scenario] placement under a 500 revocation -> HTTP ${placed.status}: ${placed.text.slice(0, 300)}`,
+          )
+          /* And the polls meet it too, so that "no login" covers them as well. */
+          await pollUntil(
+            revocationNow,
+            (now) => (now?.refused.getStatusLabOrder ?? 0) >= 1 && (now?.refused.getAllResults ?? 0) >= 1,
+            NEGATIVE_WAIT_MS,
+            500,
+          )
+          revocation = await disarmRevocation()
+        } finally {
+          await disarmRevocation()
+        }
+
+        expect(placed?.ok).toBe(false)
+        expect(placed?.body?.errors).toEqual([failedPost('/LabOrders/v6/Order'), 'Access token is invalid.'])
+        expect({
+          status: revocation?.status,
+          placementRefused: revocation?.refused.orderPlacement,
+          labOrderFeedRefused: (revocation?.refused.getStatusLabOrder ?? 0) >= 1,
+          resultsFeedRefused: (revocation?.refused.getAllResults ?? 0) >= 1,
+          logins: revocation?.logins,
+        }).toEqual({ status: 500, placementRefused: 1, labOrderFeedRefused: true, resultsFeedRefused: true, logins: 0 })
+        /* The provider never took the order. */
+        expect((await mock.get(`/__control__/orders/${encodeURIComponent(requisitionId)}`)).status).toBe(404)
+      }, NEGATIVE_WAIT_MS + 30_000)
+
+      it.failing('the integration logs in again when Antech stops accepting its token, and both polls deliver again', async () => {
+        /* EXPECTED: when Antech refuses the cached token with a 401, the next orders poll and the
+         * next results poll recover as a placement does: one login, and the records waiting on each
+         * feed are delivered — a draft the clinic completed reaches dmi-api as SUBMITTED, and a
+         * result as a FINAL report. ACTUAL: no poll logs in again, and nothing is delivered for as
+         * long as the token stays refused (up to the cache's 12 hours).
+         *
+         * WHY: on the polls the 401 never reaches `withAuthentication`. With the dmi-engine-common
+         * that dmi-engine resolves (1.7.0), the logging interceptor hands the error body to the
+         * integration's `extractAccessionIds`, which dereferences `body.LabOrders` /
+         * `body.LabResults` on GetStatus and calls `body.map` on GetAllResults; on an error body
+         * that throws a TypeError, which has no response, so `BaseApiService` retries it as a
+         * network failure and then throws a 500, and `isUnauthorized` sees 500. The first test above
+         * is the positive twin: the same revocation, a 401 that reaches the recovery at placement,
+         * and a login. Filed as nominal-systems/dmi-engine-antech-v6-integration#95; its fix is
+         * expected from a dmi-engine-common release carrying nominal-systems/dmi-engine-common#33,
+         * which passes the provider's error through, so this should flip with the dmi-engine
+         * lockfile bump to it.
+         *
+         * Two records wait for the recovery, one per feed, so a recovery of one poll alone is not
+         * enough: a draft placed before the revocation and completed after it (the orders channel,
+         * which is the only one that can move it to SUBMITTED), and an order acknowledged before it
+         * whose result is seeded after it (the results channel, the only one that writes a report
+         * FINAL). */
+        const resultOrder = await placeAcknowledgedOrder('revoked token result')
+        const draftPayload = payloadFor([referenceLabCode], {
+          requisitionId: `hrn-v6-revoked-token-draft-${randomUUID().slice(0, 8)}`,
+        })
+        const draftRequisitionId = draftPayload.requisitionId as string
+        const draft = expectOk<{ id: string, status: string }>(
+          await org.api.post('/orders', draftPayload, { autoSubmitOrder: true }),
+          'place the reference-lab draft for the orders feed',
+        )
+        expect(draft.status).toBe('WAITING_FOR_INPUT')
+
+        let revocation: Revocation | null = null
+        let draftStatus: unknown
+        let reportStatus: unknown
+        try {
+          await armRevocation()
+          expectOk(
+            await mock.post(`/__control__/orders/${encodeURIComponent(draftRequisitionId)}/promote`, {}),
+            'complete the draft at the provider',
+          )
+          expectOk(
+            await mock.post(`/__control__/orders/${encodeURIComponent(resultOrder.requisitionId)}/results`, {
+              unitCodeResults: [{ orderCode: KIDNEY_PANEL_CODE, testCodeResults: KIDNEY_PANEL }],
+              pendingTestCount: 0,
+              totalTestCount: 1,
+            }),
+            'seed the result for the results feed',
+          )
+
+          const relogin = await pollUntil(revocationNow, (now) => (now?.logins ?? 0) >= 1, NEGATIVE_WAIT_MS, 1_000)
+          expect({ loggedInAgain: (relogin?.logins ?? 0) >= 1, refused: relogin?.refused }).toEqual({
+            loggedInAgain: true,
+            refused: relogin?.refused,
+          })
+
+          draftStatus = (
+            await pollUntil(
+              async () => await org.api.get(`/orders/${draft.id}`),
+              (response) => response.body?.status === 'SUBMITTED',
+              COMPLETION_WAIT_MS,
+              1_000,
+            )
+          ).body?.status
+          reportStatus = (
+            await pollUntil(
+              async () => await org.api.get(`/orders/${resultOrder.orderId}/report`),
+              (response) => response.body?.status === 'FINAL',
+              COMPLETION_WAIT_MS,
+              1_000,
+            )
+          ).body?.status
+          revocation = await disarmRevocation()
+        } finally {
+          await disarmRevocation()
+        }
+
+        expect({ draft: draftStatus, report: reportStatus }).toEqual({ draft: 'SUBMITTED', report: 'FINAL' })
+        expect({
+          labOrderFeedRefused: (revocation?.refused.getStatusLabOrder ?? 0) >= 1,
+          resultsFeedRefused: (revocation?.refused.getAllResults ?? 0) >= 1,
+          logins: revocation?.logins,
+        }).toEqual({ labOrderFeedRefused: true, resultsFeedRefused: true, logins: 1 })
+      }, ORDER_ACK_WAIT_MS + NEGATIVE_WAIT_MS + COMPLETION_WAIT_MS * 2 + 30_000)
+    })
   })
 
   /* ---- dmi-engine#68 guard ----
