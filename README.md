@@ -343,6 +343,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   through, and that a refusal answered 500 makes nothing log in; and it pins, as a tripwire, that
   the two polls do not recover
   ([dmi-engine-antech-v6-integration#95](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/95)).
+  Arming an error scenario answers with its `id`, from the same counter (`scenario.id`), and
+  `DELETE /__control__/scenarios/<key>?id=<id>` disarms whichever of the key's scenario and
+  transport fault is that arming, and nothing else: `cleared` says whether it was the scenario,
+  `fault` whether it was the fault. Without an id it disarms both, as the sweeps after each test do.
   An error scenario answering 429 or 503 can carry a `Retry-After` header (`retryAfter` on
   `POST /__control__/scenarios`: whole seconds, or a string sent as it is, such as an HTTP date);
   whether Antech ever sends one is not known. `GET /__control__/calls/log` lists each provider call
@@ -352,8 +356,8 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   ([dmi-engine-common#27](https://github.com/nominal-systems/dmi-engine-common/pull/27)): a one-shot
   503 with `Retry-After: 2` on an order form is retried about two seconds later, within the same
   poll, rather than after the default 100 ms, and the form the retry fetched is the one dmi-api
-  stores. Each test that arms the revocation or a `Retry-After` disarms it in a `finally` and
-  checks from the counts or the call log that it fired, the describes they are in check after each
+  stores. Each test that arms the revocation or a `Retry-After` disarms it in a `finally`, by its
+  id, and checks from the counts or the call log that it fired, the describes they are in check after each
   test that nothing is left armed (as the refusals' describe does for its one-shot answers), and the
   run begins by asserting that nothing is.
   The mock also takes transport faults (see "Transport faults in the mocks") on two keys:
@@ -829,7 +833,8 @@ its start that nothing is armed, and after each test, that the test left nothing
 - `if (faults.intercept('<key>', req, res)) return` as the first line of each route's handler;
 - the control routes above calling `faults.arm`, `faults.list`, `faults.disarm` and `faults.reset`;
   and `faults.nextArmingId()` for any switch of the mock's own that is disarmed by id the same way
-  (the antech-v6 mock's token revocation), so that no two armings in a mock share an id.
+  (the antech-v6 mock's status scenarios and its token revocation), so that no two armings in a mock
+  share an id.
 
 `intercept` answers true only for a reset, which has taken the request. For a hold or a stall the
 handler answers as it always does, and the module sends that answer late or in part. A key is wired

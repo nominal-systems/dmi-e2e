@@ -17,11 +17,12 @@
  * `trfUnavailable`, `unknownPath`), sent by the same builder the mock uses where that envelope was
  * observed, so a test that arms it cannot keep an old copy after a new capture. A 429 or 503 the
  * test spells out can also carry a `Retry-After` header (`retryAfter`: whole seconds, or a string
- * sent as it is, such as an HTTP date). `GET /__control__/scenarios` lists what is still armed (per
- * key: `status`, `once`, `envelope`, `retryAfter`; and beside them the token revocation, if one is
- * armed) and `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot
- * answer and never reached it can be named and cleaned up instead of leaving that answer for the
- * next call.
+ * sent as it is, such as an HTTP date). Arming one answers with its `id`, from the counter the
+ * transport faults' ids come from (src/mock-faults' nextArmingId). `GET /__control__/scenarios`
+ * lists what is still armed (per key: `id`, `status`, `once`, `envelope`, `retryAfter`; and beside
+ * them the token revocation, if one is armed) and `DELETE /__control__/scenarios/:key` disarms one,
+ * so a test that armed a one-shot answer and never reached it can be named and cleaned up instead
+ * of leaving that answer for the next call.
  *
  * `GET /__control__/calls/log` is the mock's record of each provider call as it arrived: when, the
  * operation, the accession it named, the labOrder status polls answered before it, and the status
@@ -32,7 +33,8 @@
  * mocks share, `src/mock-faults`, armed over the same `POST /__control__/scenarios` with a `fault`
  * field, on the keys in FAULT_KEYS, and listed beside the scenarios as `faults`.
  * `DELETE /__control__/scenarios/:key[?id=]` disarms a key's scenario and its fault; with `id`, only
- * the fault, and only while it is that arming.
+ * whichever of the two is that arming, so a test whose cleanup runs late cannot disarm a later
+ * test's scenario or fault on the same key.
  *
  * A result is seeded (`POST /__control__/orders/:id/results`) only for an order the orders poll has
  * already acknowledged; a seed for any other is answered 409. Seeding moves the order's
@@ -2104,7 +2106,9 @@ const RETRY_AFTER_STATUSES = [429, 503]
 /* Arm a scenario: `{key, status, body, once}`, or `{key, envelope, once}` with `envelope` naming
  * one of `ENVELOPES`, whose builder then sends its own status and body. The first takes
  * `retryAfter` with a 429 or a 503: whole seconds, sent as the header's delta-seconds, or a string
- * sent as it is (an HTTP date, say). Arming a key that is already armed replaces it. */
+ * sent as it is (an HTTP date, say). Arming a key that is already armed replaces it. Answers with
+ * the scenario as it is listed, `id` included: the arming's, from the mock's one arming counter
+ * (src/mock-faults' nextArmingId), for a disarm that names it. */
 async function handleControlScenario (req, res) {
   const body = await readJson(req)
   if (typeof body.key !== 'string') {
@@ -2165,8 +2169,14 @@ async function handleControlScenario (req, res) {
     }
     scenario.retryAfter = String(value)
   }
+  scenario.id = faults.nextArmingId()
   state.scenarios[body.key] = scenario
-  sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
+  sendJson(res, 200, { ok: true, key: body.key, scenario: publicScenario(scenario), scenarios: Object.keys(state.scenarios) })
+}
+
+/* A status scenario as the control plane lists it. */
+function publicScenario (scenario) {
+  return { id: scenario.id, status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null, retryAfter: scenario.retryAfter }
 }
 
 /* Everything armed in the mock: the status scenarios per key, the transport faults per key
@@ -2176,12 +2186,7 @@ async function handleControlScenario (req, res) {
  * test that armed it has finished was never consumed: the call it was armed for did not happen. */
 function handleControlListScenarios (req, res) {
   sendJson(res, 200, {
-    scenarios: Object.fromEntries(
-      Object.entries(state.scenarios).map(([key, scenario]) => [
-        key,
-        { status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null, retryAfter: scenario.retryAfter },
-      ]),
-    ),
+    scenarios: Object.fromEntries(Object.entries(state.scenarios).map(([key, scenario]) => [key, publicScenario(scenario)])),
     faults: faults.list(),
     revocation: publicRevocation(state.revocation),
   })
@@ -2275,15 +2280,20 @@ function handleControlCallLog (req, res, params, query) {
 }
 
 /* Disarm a key: its status scenario and its transport fault, with every connection the fault still
- * holds or stalls. `?id=<n>` disarms the fault only while it is that arming (src/mock-faults), and
- * leaves the scenario alone, so a late cleanup cannot disarm a later test's fault. 200 either way:
- * `cleared` says whether a scenario was armed, `fault` is the fault with its final count, or null. */
+ * holds or stalls. `?id=<n>` disarms only whichever of the two is that arming, while it is (the ids
+ * come from one counter, so it is at most one of them), so a late cleanup cannot disarm a later
+ * test's scenario or fault on the key. An id that is not a number names no arming, as for a fault
+ * (src/mock-faults). 200 either way: `cleared` says whether the scenario was disarmed, `fault` is the
+ * fault disarmed, with its final count, or null. */
 function handleControlClearScenario (req, res, params, query) {
-  const id = query.get('id')
-  const cleared = id == null && Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
+  const raw = query.get('id')
+  const id = raw == null ? undefined : Number(raw)
+  const scenario = Object.prototype.hasOwnProperty.call(state.scenarios, params.key) ? state.scenarios[params.key] : null
+  const cleared = scenario != null && (id === undefined || scenario.id === id)
   if (cleared) delete state.scenarios[params.key]
-  const fault = faults.disarm(params.key, id == null ? undefined : Number(id))
-  if (cleared) log(`control: scenario '${params.key}' cleared`)
+  const fault = faults.disarm(params.key, id)
+  if (cleared) log(`control: scenario '${params.key}' (id ${scenario.id}) cleared`)
+  else if (scenario != null) log(`control: scenario '${params.key}' (id ${scenario.id}) left armed by a disarm naming id ${raw}`)
   sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios), fault })
 }
 

@@ -489,10 +489,19 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     })
   }
 
+  /* An error scenario as the mock lists it: the arming's id, and what it answers. */
+  interface ArmedScenario {
+    id: number
+    status: number
+    once: boolean
+    envelope: string | null
+    retryAfter: string | null
+  }
+
   /* What is armed at the mock: the error scenarios and the transport faults, per key, and the token
    * revocation, null when none is. */
   interface Armed {
-    scenarios: Record<string, unknown>
+    scenarios: Record<string, ArmedScenario>
     faults: Record<string, Fault>
     revocation: Revocation | null
   }
@@ -3106,21 +3115,33 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
 
       const since = await lastLoggedSeq()
       let trfCalls: LoggedCall[] = []
+      /* The next TRF fetch, whichever order it is for, is answered 503 with the header. Nothing else
+       * in this file is on the labOrder feed by now, so it is this order's: the call log below shows
+       * that it was. The body is the TRF endpoint's own `{StatusCode, ErrorMessage}` shape, with a
+       * wording of the mock's (an Antech 503 was never captured). */
+      const armed = expectOk<{ scenario: ArmedScenario }>(
+        await mock.post('/__control__/scenarios', {
+          key: 'trf',
+          status: 503,
+          body: { StatusCode: 503, ErrorMessage: 'Service Unavailable' },
+          retryAfter: RETRY_AFTER_SECONDS,
+          once: true,
+        }),
+        `arm a one-shot 503 with Retry-After: ${RETRY_AFTER_SECONDS} on the next TRF fetch`,
+      ).scenario
       try {
-        /* The next TRF fetch, whichever order it is for, is answered 503 with the header. Nothing
-         * else in this file is on the labOrder feed by now, so it is this order's: the call log
-         * below shows that it was. The body is the TRF endpoint's own `{StatusCode, ErrorMessage}`
-         * shape, with a wording of the mock's (an Antech 503 was never captured). */
-        expectOk(
-          await mock.post('/__control__/scenarios', {
-            key: 'trf',
-            status: 503,
-            body: { StatusCode: 503, ErrorMessage: 'Service Unavailable' },
-            retryAfter: RETRY_AFTER_SECONDS,
-            once: true,
-          }),
-          `arm a one-shot 503 with Retry-After: ${RETRY_AFTER_SECONDS} on the next TRF fetch`,
+        /* A disarm naming another arming's id leaves the scenario armed: what keeps a cleanup that
+         * runs late from disarming a later test's answer on the same key. */
+        const byAnotherId = expectOk<{ cleared: boolean, fault: Fault | null }>(
+          await mock.delete(`/__control__/scenarios/trf?id=${armed.id + 1}`),
+          'disarm the TRF scenario by an id it does not have',
         )
+        const stillListed = (await armedAtMock()).scenarios.trf
+        expect({ cleared: byAnotherId.cleared, fault: byAnotherId.fault, stillListed: stillListed?.id }).toEqual({
+          cleared: false,
+          fault: null,
+          stillListed: armed.id,
+        })
         expectOk(
           await mock.post(`/__control__/orders/${encodeURIComponent(requisitionId)}/promote`, {}),
           'promote the draft to a placed order at the mock',
@@ -3130,8 +3151,8 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
         await waitForOrderAck(requisitionId)
         trfCalls = (await loggedCalls('trf', since)).filter((call) => call.clinicAccessionId === requisitionId)
       } finally {
-        /* Consumed by the 503 when all went well; disarmed here when it did not. */
-        await mock.delete('/__control__/scenarios/trf').catch(() => undefined)
+        /* Consumed by the 503 when all went well; disarmed here, by its id, when it did not. */
+        await mock.delete(`/__control__/scenarios/trf?id=${armed.id}`).catch(() => undefined)
       }
 
       /* The 503 reached this order's form, carrying the header, and one retry followed it. */
