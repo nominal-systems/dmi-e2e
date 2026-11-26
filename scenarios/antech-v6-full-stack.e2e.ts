@@ -3262,7 +3262,22 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * would otherwise find an engine holding a dead token for 12 hours. */
       afterEach(expectNothingLeftArmed)
 
+      /* A placement before the revocation, so that the api process holds a token the revocation
+       * will refuse and has the test guide's point-of-care codes cached (for an hour), as it does
+       * after any auto-submitted order. Without it, a test run on its own would log in afresh at
+       * placement, past the revocation, or read the test guide with the refused token, whose 404
+       * the integration takes for a missing guide: the order would then go to the pre-order
+       * endpoint instead. */
+      async function warmPlacementPath (before: string): Promise<void> {
+        const warm = expectOk<{ status: string }>(
+          await org.api.post('/orders', payloadFor([KIDNEY_PANEL_CODE]), { autoSubmitOrder: true }),
+          `place an order before ${before}`,
+        )
+        expect(warm.status).toBe('SUBMITTED')
+      }
+
       it('a revocation refuses the tokens issued before it and accepts those issued after: both polls are refused, a placement logs in again and goes through, and disarmed the polls resume', async () => {
+        await warmPlacementPath('the revocation')
         /* A token of this test's own, issued before the revocation. */
         const oldToken = await mintToken()
         const payload = payloadFor([KIDNEY_PANEL_CODE], {
@@ -3346,6 +3361,7 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
          * (the same guard nominal-systems/dmi-engine-wisdom-panel-integration#53 asks for). On the
          * polls a 5xx is retried once, 100 ms later, and the poll fails; at placement, which is not
          * retried, the provider's wording reaches the operator. */
+        await warmPlacementPath('the 500 revocation')
         const payload = payloadFor([KIDNEY_PANEL_CODE], {
           requisitionId: `hrn-v6-revoked-500-${randomUUID().slice(0, 8)}`,
         })
