@@ -1,8 +1,9 @@
 import { ChildProcess } from 'child_process'
 import { assertProjectIsOurs, composeUp, runMigrations, waitForDependencies } from './containers'
-import { assertAppPortFree, startDmiApi } from './dmi-api'
+import { assertAppPortFree, forgetDmiApiProcesses, startDmiApi } from './dmi-api'
 import { commonUnderTest, env } from './env'
 import { beginRun } from './report/report'
+import { unpauseLeftovers, waitForEveryServiceRunning } from './services'
 import { acquireSlot, releaseSlot } from './slots'
 import { commonCheckout } from './stacks'
 
@@ -46,10 +47,19 @@ async function setUp (log: (message: string) => void): Promise<void> {
 
   if (env.manageContainers) {
     await assertProjectIsOurs()
+    /* A stack an earlier run left up (HARNESS_KEEP_UP=1) can hold a container that run's scenario
+     * had paused when it was killed, and `compose up` refuses one ("cannot start a paused
+     * container"). */
+    const unpaused = await unpauseLeftovers()
+    if (unpaused.length > 0) log(`unpaused ${unpaused.join(', ')}, left paused by an earlier run`)
     log('starting dependency containers')
     await composeUp()
     log('waiting for MySQL, Mongo and ActiveMQ')
     await waitForDependencies()
+    /* Nothing stopped, paused or crash-looping: the scenarios that fault a service start by asserting
+     * the stack is whole, and none of them should find it broken by an earlier run. */
+    const down = await waitForEveryServiceRunning(env.timeouts.depsReadyMs)
+    if (down.length > 0) throw new Error(`containers of ${env.composeProject} are not running: ${JSON.stringify(down)}`)
     log(`running dmi-api migrations from ${env.dmiApiDir}`)
     await runMigrations()
   } else {
@@ -58,6 +68,9 @@ async function setUp (log: (message: string) => void): Promise<void> {
 
   if (env.manageApp) {
     log(`building and starting dmi-api on ${env.baseUrl}`)
+    /* A new run, a new record of the dmi-api processes it starts (src/dmi-api.ts). Nothing an earlier
+     * run recorded is still listening: assertAppPortFree said so above. */
+    forgetDmiApiProcesses()
     globalThis.__HARNESS_APP__ = await startDmiApi()
     log('dmi-api is healthy')
   } else {

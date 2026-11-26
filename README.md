@@ -65,7 +65,8 @@ That does the whole thing from a clean state:
    dependency reports up.
 5. Run the scenarios, one file at a time (`maxWorkers: 1`): they share one database, one event
    stream and one `seq` counter, and must not race.
-6. Stop dmi-api and `docker compose down -v`.
+6. Stop dmi-api (and any dmi-api a scenario started again; see "Service control") and
+   `docker compose down -v`.
 
 Faster iteration:
 
@@ -88,7 +89,9 @@ job from an earlier run could race a later run for its results. Each loop's scen
 integration it started in `afterAll`, which removes its jobs. If a run is interrupted before that,
 `docker compose --profile <loop> down -v` clears Redis (outside a slot tree, in slot n add
 `-p dmi-e2e-s<n>`; see "Parallel runs — slots" below). A run without `HARNESS_KEEP_UP` tears Redis
-down every time, so it is never affected.
+down every time, so it is never affected. A container a killed run's scenario had paused (see
+"Service control") is unpaused before the next run starts its containers, since `compose up` refuses
+a paused one, and setup does not go on until every container of the project is running.
 
 ### Parallel runs — slots
 
@@ -760,6 +763,67 @@ compose service is still named `activemq` so all `ACTIVEMQ_*` / `MQTT_HOST` conf
 unchanged, and dmi-api's `activemq: up` health check (a generic MQTT ping) still passes, so the fast
 suite is unaffected.
 
+### Service control: the broker, Redis, an engine or dmi-api taken away mid-run
+
+A scenario can take one service of its own stack away and put it back, to test what happens while
+it is gone and after it returns. `src/services.ts` stops, starts, pauses, unpauses or restarts a
+compose service of the run's project — the broker (`activemq`), `redis`, an engine container — and
+flushes Redis; `src/dmi-api.ts` sends dmi-api a signal, waits for it to exit, and starts it again.
+The Mongo failpoint (`src/mongo.ts`) is the model: a fault is scoped to one target, the harness
+undoes it, and it reports what it reached, so a test asserts that it fired.
+
+```ts
+const faults = serviceFaults()                    // this test's controls
+let paused: Disruption
+try {
+  paused = await faults.pause(REDIS)              // or stop(), restart(), flushRedis()
+  /* … the test, with Redis frozen … */
+} finally {
+  await faults.restore(REDIS)
+}
+expect(paused.containers).toEqual([`${env.composeProject}-redis-1`])
+```
+
+- **Only this run's containers.** Every operation goes through the harness's own compose invocation
+  (`compose()` in `src/containers.ts`: the files, profile and project `composeUp` uses, the project
+  named with `-p` as well as through `COMPOSE_PROJECT_NAME`, so that it does not depend on the
+  environment of the process that calls it), and is first run in compose's `--dry-run` mode:
+  compose names the containers the command would touch, and the command is refused unless each one
+  is a container compose lists for the slot's project. Pausing one replica of a replicated service
+  (`pause(service, { replica: n })`) has no compose command; the container is the one compose lists
+  for that replica, and `docker pause` gets its id.
+- **Nothing stays down.** Each fault is entered in a ledger as it is made (`disrupted()` lists it:
+  service, fault, containers, since when, by which test). `restoreServices()` undoes every entry,
+  waits until compose reports every container of the project running, and checks each restored
+  service answers (Redis a `PING`, the broker an MQTT publish, MySQL a query, the mock `/status`);
+  it throws naming whatever is still down. A describe that injects faults calls it from
+  `afterEach`, so a test that fails or times out midway still hands the next test a whole stack,
+  and asserts at its start, with `assertStackWhole()`, that every container is running and nothing
+  is in the ledger. A test's controls (`serviceFaults()`) stop working once `restoreServices()` has
+  run after it: jest keeps running a test body it abandoned on a timeout, and that body must not
+  fault the stack under the next test.
+- **Redis.** `flushRedis()` empties it (`FLUSHALL`, through `redis-cli` in the container: no client
+  library) and reports the key count before and after; `repeatableJobsNaming(id)` lists the Bull
+  repeat registrations that name an integration; `redisAnswers(ms)` says whether Redis answers a
+  `PING` on its published port. A paused Redis accepts the connection and never answers.
+- **What an engine did.** `watchExits(service)` collects the exit code of each of the service's
+  containers as it exits, from Docker's event stream: a container under a restart policy is up
+  again before its state could be read, and the daemon keeps too few past events, for every
+  container on the machine, to be asked afterwards. `serviceLogs(service, since)` reads its log.
+- **dmi-api.** Global setup starts dmi-api, and a scenario cannot see that process's handle: it runs
+  in a module registry of its own (in band, in jest's main process, with `maxWorkers: 1`; in a
+  worker otherwise). So every dmi-api a run starts is recorded, with its exit as its parent saw it,
+  in a file of the slot's beside its lock (`~/.cache/dmi-e2e/slot-locks/slot-<n>.dmi-api.json`).
+  `signalDmiApi('SIGTERM')` signals the one running and returns how long it took to exit, and how
+  (since dmi-api#399, a graceful exit is the signal itself, after `SHUTDOWN_DELAY_MS`);
+  `startDmiApi({ build: false, startedBy })` starts it again from the run's build. Global teardown
+  stops every dmi-api the file lists as alive, whoever started it, so a run that failed after a
+  restart leaves nothing holding the slot's port. `runDmiApiScript(script, args)` runs one of
+  dmi-api's npm scripts from the checkout under test with the app's environment, the way an operator
+  runs `ensure-integration-status` beside a deployment.
+- **A kept-up stack.** Global setup unpauses any container a killed run left paused (`compose up`
+  refuses a paused container), and does not go on until every container of the project is running.
+
 ### Ports
 
 Shifted off dmi-api's defaults so a developer's dev stack can keep running alongside the harness.
@@ -907,8 +971,13 @@ src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
   stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
-  containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
-  dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
+  containers.ts               compose up/down (profile-aware), the harness's one compose invocation, the
+                              project's containers as compose lists them, readiness polling, dmi-api migrations
+  dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill; the record of every dmi-api
+                              a run starts (signal it, start it again, stop them all at teardown); dmi-api's
+                              own npm scripts, run beside it
+  services.ts                 failure injection on the stack: stop, start, pause, restart a compose service
+                              of the run's project, flush Redis; the ledger of what is down, and its restore
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
   mongo.ts                    mongodb client for failure injection: arms the `failCommand` failpoint so

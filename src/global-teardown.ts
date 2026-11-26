@@ -1,7 +1,7 @@
 import { ChildProcess } from 'child_process'
 import * as path from 'path'
 import { composeDown } from './containers'
-import { stopDmiApi } from './dmi-api'
+import { stopDmiApi, stopEveryDmiApi } from './dmi-api'
 import { env } from './env'
 import { buildIndex, publish } from './report/report'
 import { releaseSlot } from './slots'
@@ -35,6 +35,12 @@ async function teardown (): Promise<void> {
     log('stopping dmi-api')
     await stopDmiApi(app)
     globalThis.__HARNESS_APP__ = undefined
+  }
+  /* And any dmi-api a scenario started again after stopping that one, which this process holds no
+   * handle to: a run must not leave one holding the slot's port, whether its test passed or not. */
+  if (env.manageApp) {
+    const stopped = await stopEveryDmiApi()
+    if (stopped.length > 0) log(`stopped dmi-api (pid ${stopped.join(', ')}), started again by a scenario`)
   }
 
   /* The reporters have already written reports/<suite>/ (jest runs onRunComplete before
