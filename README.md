@@ -540,6 +540,16 @@ closely enough for the real integration to drive it unmodified:
   The `resultsLatestDelay` scenario (`{ delayMs, once }`) holds the next poll answer that carries a
   batch for `delayMs`, its content fixed on arrival, and the ledger counts the polls that reached
   the mock meanwhile: it is how the loop puts two polls of one integration in flight at once.
+  `GET /__control__/scenarios` lists everything armed — the status scenarios (with `hits`; a `once`
+  scenario leaves the list when it is used) and the transport faults — and
+  `DELETE /__control__/scenarios/<key>` disarms one key. A status scenario on a key the mock does not
+  have (`authValidate`, `createOrder`, `resultsLatest`, `ivlsDevices`, `resultsLatestDelay`) is
+  refused.
+- **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder` and
+  `ivlsDevices`. `resultsLatestDelay` stays a scenario of its own rather than a `hold`: it waits for
+  the first answer that carries a batch, letting empty polls through, and the batch ledger counts
+  the polls that reach the mock while it holds. The dmi-engine-idexx-integration#88 test reads both.
+  A `hold` on a route takes its next request, whatever the answer.
 
 All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
 captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
@@ -651,6 +661,65 @@ integrators, not clinic or patient data — and every name, value, unit and rang
 invented. It never authenticates for real, and it builds the `link href`s it advertises from the
 request's own `Host` header, so even the URLs the integration POSTs back to resolve to the mock rather
 than anywhere real.
+
+### Transport faults in the mocks
+
+A status scenario answers a call with the wrong thing. Some failures are not an answer at all: the
+answer comes late, the connection closes with no answer, or the headers arrive and the body never
+finishes. `src/mock-faults/index.js` stages those three, and every mock that wires it stages them
+the same way. It is zero-dependency CommonJS like the mocks. Each mock image copies it beside its
+server through a second named build context (`additional_contexts: mock-faults` in
+docker-compose.yml), so the server requires it as `../mock-faults` in the repo and in the image alike.
+
+A fault is armed on one of the mock's **route keys** over the control route its status scenarios
+use, for the next `times` requests to that route (default 1). After those the route answers as
+usual again. The model is the Mongo failpoint in `src/mongo.ts`: one target, a number of attempts,
+and a count of what it hit, read back to prove the fault fired.
+
+| `fault` | Options | What the mock does | What a Node client sees (Node 20, axios on `http`) |
+|---|---|---|---|
+| `hold` | `delayMs` (required, ≤ 10 min) | Runs the route's handler on arrival, so its answer and whatever else it does (an order created, a scenario used up) are fixed then, and sends the answer `delayMs` later. | The answer, late. A client whose timeout is shorter gives up first and gets nothing. |
+| `reset` | `close`: `rst` (default) or `fin` | Never runs the route. Once the request has arrived whole, closes the connection with no response: a TCP RST (`socket.resetAndDestroy()`), or a plain FIN (`socket.destroy()`). | `rst`: `ECONNRESET`, "read ECONNRESET". `fin`: `ECONNRESET`, "socket hang up". The same for GET and POST, with keep-alive or without. |
+| `stall` | `bytes` (default 0), `capMs` (default 120 s, ≤ 10 min) | Runs the route's handler on arrival, sends its status line and headers and the first `bytes` bytes of its body (never all of it: the headers still announce its full length), then nothing. After `capMs` the connection is closed. | A response whose body never completes. Its own timeout fires, or, at `capMs`, the body is cut short. |
+
+```
+POST   /__control__/scenarios           {"key": "createOrder", "fault": "hold", "delayMs": 15000}
+                                         -> {"ok": true, "key": "createOrder", "fault": {"id": 7, ...}}
+GET    /__control__/scenarios           -> {"scenarios": {...}, "faults": {"createOrder": {...}}}
+DELETE /__control__/scenarios/<key>?id=<id>   -> {"scenario": null, "fault": {... its final count ...}}
+POST   /__control__/reset
+```
+
+A fault reads back as `{id, fault, <its options>, times, hits, remaining, open, requests}`. `requests`
+lists, in arrival order, each request it took: its `outcome` and the milliseconds from arrival to
+it (`ms`, null while open). The outcomes are `held` and `stalled` (still open), `answered` (a hold
+sent its answer), `client-closed` (the client closed the connection first, e.g. on its own
+timeout), `capped` (a stall reached `capMs`), `destroyed` (disarmed or reset while open), and
+`reset`. A fault stays listed once it is used up, with that record, until it is disarmed. Options
+a fault does not take, and keys the mock does not have, are refused with a 400 naming the allowed
+ones.
+
+**Nothing leaks into the next test.**
+
+- Disarming a key (`DELETE`) and `POST /__control__/reset` destroy every connection its fault still
+  holds or stalls. The client sees the request fail; it never gets a late answer.
+- Every open connection also has its own end: a hold's `delayMs`, a stall's `capMs`.
+- `DELETE …?id=<id>` disarms the fault only while it is that arming, so a cleanup that runs late
+  (after a jest timeout) cannot disarm the next test's fault on the same key.
+
+A scenario that arms a fault disarms it in a `finally` with its id. It then asserts the count the
+`DELETE` returns: a fault that never fired fails the test. A `describe` that arms faults asserts at
+its start that nothing is armed, and after each test, that the test left nothing armed.
+
+**Wiring it into a mock** is three things:
+
+- `const faults = createFaults({ keys, log })`;
+- `if (faults.intercept('<key>', req, res)) return` as the first line of each route's handler;
+- the control routes above calling `faults.arm`, `faults.list`, `faults.disarm` and `faults.reset`.
+
+`intercept` answers true only for a reset, which has taken the request. For a hold or a stall the
+handler answers as it always does, and the module sends that answer late or in part. A key is wired
+only together with a test that arms a fault on it. Which keys each mock has is in its own section.
 
 ### The MQTT broker
 
@@ -816,6 +885,8 @@ src/
   sql.ts                      mysql2 pool for setup and assertions
   mongo.ts                    mongodb client for failure injection: arms the `failCommand` failpoint so
                               one command on one of dmi-api's collections fails, and reads back how often
+  mock-faults/index.js        transport faults the mocks share (hold, reset, stall), armed per route key
+                              with a count of what each took; built into each mock image that wires it
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   refs.ts                     canonical dmi ref codes looked up by name over GET /refs/*, for the ref-mapping value assertions
   idexx-mock/server.js        the VetConnect Plus mock provider (zero-dependency Node HTTP server)

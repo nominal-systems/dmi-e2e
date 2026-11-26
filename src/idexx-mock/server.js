@@ -15,8 +15,12 @@
  * requisition ids of the results it carried, how many results/latest responses carried it, how
  * each confirm of it was answered, and — for an answer held by the `resultsLatestDelay` scenario —
  * how many results/latest requests arrived while it was held), `POST /__control__/scenarios`
- * injects a canned answer or holds one results answer (see handleControlScenario), and
- * `POST /__control__/reset` clears all of it.
+ * injects a canned answer, holds one results answer, or arms a transport fault (see
+ * handleControlScenario), `GET /__control__/scenarios` lists everything armed,
+ * `DELETE /__control__/scenarios/:key` disarms a key, and `POST /__control__/reset` clears all of it.
+ *
+ * Transport faults (hold, reset, stall) come from the module the mocks share, `src/mock-faults`, and
+ * are armed on the keys in FAULT_KEYS.
  *
  * Data: every patient, client, veterinarian and clinic identifier here is INVENTED — no captured
  * clinic or patient data, ever. Provider vocabulary (analyte numbers, analyzer and test codes,
@@ -28,6 +32,7 @@
 
 const http = require('http')
 const crypto = require('crypto')
+const { createFaults } = require('../mock-faults')
 
 const PORT = Number(process.env.PORT || 3000)
 /* Origin baked into the uiURL and pdf/result links the mock hands back. The integration fetches
@@ -53,6 +58,19 @@ function log (message) {
   /* One-line, greppable, prefixed like the harness's other services. */
   console.log(`[idexx-mock] ${message}`)
 }
+
+/* The keys a status scenario can be armed on (handleControlScenario). Anything else is refused: a
+ * scenario on a key no route takes would never fire. */
+const SCENARIO_KEYS = ['authValidate', 'createOrder', 'resultsLatest', 'ivlsDevices', 'resultsLatestDelay']
+
+/* The keys a transport fault can be armed on, each one route: the order create and the device
+ * list. A fault is wired on a route only together with a test that uses it; adding one is a line in
+ * that route's handler and a name here. */
+const FAULT_KEYS = ['createOrder', 'ivlsDevices']
+
+/* Outside the resettable state, like the order ids: POST /__control__/reset disarms every fault and
+ * destroys the connections they hold (see src/mock-faults). */
+const faults = createFaults({ keys: FAULT_KEYS, log })
 
 function uuid () {
   return crypto.randomUUID()
@@ -87,9 +105,10 @@ function freshState () {
     /* The holds whose answer is still being held (see handleResultsLatest); every results/latest
      * request that arrives meanwhile is counted on each of them. */
     held: new Set(),
-    /* Error/edge injection: { [key]: { status, body } }. Keys are logical operation names, e.g.
-     * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices' — plus 'resultsLatestDelay',
-     * { delayMs }, which holds an answer instead of replacing it. */
+    /* Error/edge injection: { [key]: { status, body, once, hits } }. Keys are logical operation
+     * names (SCENARIO_KEYS) — among them 'resultsLatestDelay', { delayMs, once, hits }, which holds
+     * an answer instead of replacing it. `hits` counts the calls a scenario answered; a `once`
+     * scenario leaves this map with its one call. Transport faults are kept apart, by `faults`. */
     scenarios: {},
   }
 }
@@ -144,10 +163,12 @@ function originFor (req) {
 }
 
 /* An injected scenario for `key` short-circuits the handler with a canned status/body. Cleared once
- * consumed when `once` is set, so a test can inject a single transient failure. */
+ * consumed when `once` is set, so a test can inject a single transient failure; one without it
+ * answers every call, counted in `hits`, until it is replaced or disarmed. */
 function takeScenario (key) {
   const scenario = state.scenarios[key]
   if (scenario == null) return null
+  scenario.hits += 1
   if (scenario.once) delete state.scenarios[key]
   return scenario
 }
@@ -477,6 +498,7 @@ async function handleAuthValidate (req, res) {
 }
 
 async function handleCreateOrder (req, res) {
+  if (faults.intercept('createOrder', req, res)) return
   const scenario = takeScenario('createOrder')
   if (scenario != null) {
     sendJson(res, scenario.status, scenario.body ?? { message: 'create order failed' })
@@ -696,6 +718,7 @@ async function handleResultsSearch (req, res, query) {
  * the `ErrorResponse` IDEXX's spec gives this endpoint's 500, under UNKNOWN_ERROR — a code from the
  * spec's list, and the envelope the integration's providerErrorMapper reads. */
 function handleIvlsDevices (req, res) {
+  if (faults.intercept('ivlsDevices', req, res)) return
   const scenario = takeScenario('ivlsDevices')
   if (scenario != null) {
     sendJson(res, scenario.status, scenario.body ?? { errors: [{ errorCode: 'UNKNOWN_ERROR', message: 'device list failed' }] })
@@ -787,10 +810,32 @@ async function handleControlScenario (req, res) {
    *
    * `resultsLatestDelay` is the one key that holds an answer instead of replacing it:
    * { "key": "resultsLatestDelay", "delayMs": 9000, "once": true } holds the next results/latest
-   * answer that carries a batch for `delayMs` (see handleResultsLatest). */
+   * answer that carries a batch for `delayMs` (see handleResultsLatest). It is not the shared
+   * `hold` below: it waits for the first answer that carries a batch, letting empty polls through,
+   * and the batch ledger counts the polls that reach the mock while it holds, which is what the
+   * dmi-engine-idexx-integration#88 test reads. A `hold` takes the next request, whatever it answers.
+   *
+   * A body with `fault` arms a transport fault instead, on a key in FAULT_KEYS:
+   * { "key": "createOrder", "fault": "hold" | "reset" | "stall", "times": 1, ... } (the options are
+   * src/mock-faults'). It sits beside any status scenario on the same key: a held createOrder
+   * answers late with whatever the route, or its scenario, answers. Arming a key again replaces
+   * what was armed on it. */
   const body = await readBody(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
+    return
+  }
+  if (body.fault !== undefined) {
+    const armed = faults.arm(body)
+    if (armed.error != null) {
+      sendJson(res, 400, { message: armed.error })
+      return
+    }
+    sendJson(res, 200, { ok: true, key: body.key, fault: armed.fault })
+    return
+  }
+  if (!SCENARIO_KEYS.includes(body.key)) {
+    sendJson(res, 400, { message: `unknown scenario key '${body.key}': this mock's scenario keys are ${SCENARIO_KEYS.join(', ')}` })
     return
   }
   if (body.key === 'resultsLatestDelay') {
@@ -798,14 +843,44 @@ async function handleControlScenario (req, res) {
       sendJson(res, 400, { message: 'the resultsLatestDelay scenario requires a positive number "delayMs"' })
       return
     }
-    state.scenarios[body.key] = { delayMs: body.delayMs, once: body.once === true }
+    state.scenarios[body.key] = { delayMs: body.delayMs, once: body.once === true, hits: 0 }
   } else {
-    state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+    state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true, hits: 0 }
   }
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
 }
 
+/* Everything armed in the mock, per key: the status scenarios (`status` or `delayMs`, `once`, `hits`;
+ * a `once` scenario listed here has not been reached yet) and the transport faults (src/mock-faults:
+ * `id`, `fault`, its options, `times`, `hits`, `remaining`, `open`, and what became of each request
+ * it took). A fault stays listed once spent, with what it took, until it is disarmed. */
+function handleControlListScenarios (req, res) {
+  sendJson(res, 200, {
+    scenarios: Object.fromEntries(
+      Object.entries(state.scenarios).map(([key, { body, ...scenario }]) => [key, scenario]),
+    ),
+    faults: faults.list(),
+  })
+}
+
+/* Disarm a key: its status scenario and its transport fault, with every connection the fault still
+ * holds or stalls. `?id=<n>` disarms the fault only while it is that arming (src/mock-faults), so a
+ * late cleanup cannot disarm a later test's fault. 200 either way; the answer carries what was
+ * disarmed, the fault with its final hits, or null for each. */
+function handleControlClearScenario (req, res, params, query) {
+  const id = query.get('id')
+  const scenario = id == null ? state.scenarios[params.key] ?? null : null
+  if (scenario != null) delete state.scenarios[params.key]
+  const fault = faults.disarm(params.key, id == null ? undefined : Number(id))
+  if (scenario != null) log(`control: scenario '${params.key}' cleared`)
+  sendJson(res, 200, {
+    scenario: scenario == null ? null : (({ body, ...rest }) => rest)(scenario),
+    fault,
+  })
+}
+
 function handleControlReset (req, res) {
+  faults.reset()
   state = freshState()
   log('state reset')
   sendJson(res, 200, { ok: true })
@@ -847,6 +922,8 @@ const routes = [
   ['GET', /^\/__control__\/orders\/(?<requisitionId>[^/]+)$/, handleControlGetOrder],
   ['GET', /^\/__control__\/batches$/, handleControlListBatches],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
+  ['GET', /^\/__control__\/scenarios$/, handleControlListScenarios],
+  ['DELETE', /^\/__control__\/scenarios\/(?<key>[^/]+)$/, handleControlClearScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
 
