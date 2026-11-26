@@ -3262,18 +3262,34 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
        * would otherwise find an engine holding a dead token for 12 hours. */
       afterEach(expectNothingLeftArmed)
 
-      /* A placement before the revocation, so that the api process holds a token the revocation
-       * will refuse and has the test guide's point-of-care codes cached (for an hour), as it does
-       * after any auto-submitted order. Without it, a test run on its own would log in afresh at
-       * placement, past the revocation, or read the test guide with the refused token, whose 404
-       * the integration takes for a missing guide: the order would then go to the pre-order
-       * endpoint instead. */
+      /* Before a revocation, both engine processes must hold a token it will refuse, as they do
+       * after any earlier test: the worker once it has answered a poll of each feed, the api
+       * process after a placement, which also caches the test guide's point-of-care codes (for an
+       * hour). Done here so that the tests do not depend on the ones before them. Run on its own, a
+       * test would otherwise arm the revocation before the worker's first login, which then falls
+       * after it and is accepted; or place its order with a fresh login, past the revocation; or
+       * read the test guide with the refused token, whose 404 the integration takes for a missing
+       * guide, so that the order goes to the pre-order endpoint instead. */
       async function warmPlacementPath (before: string): Promise<void> {
         const warm = expectOk<{ status: string }>(
           await org.api.post('/orders', payloadFor([KIDNEY_PANEL_CODE]), { autoSubmitOrder: true }),
           `place an order before ${before}`,
         )
         expect(warm.status).toBe('SUBMITTED')
+        const polled = await pollUntil(
+          async () =>
+            expectOk<{ getStatusLabOrder: number, getAllResults: number }>(
+              await mock.get('/__control__/calls'),
+              'read the mock call counters',
+            ),
+          (calls) => calls.getStatusLabOrder >= 1 && calls.getAllResults >= 1,
+          ORDER_ACK_WAIT_MS,
+          500,
+        )
+        expect({ ordersPolled: polled.getStatusLabOrder >= 1, resultsPolled: polled.getAllResults >= 1 }).toEqual({
+          ordersPolled: true,
+          resultsPolled: true,
+        })
       }
 
       it('a revocation refuses the tokens issued before it and accepts those issued after: both polls are refused, a placement logs in again and goes through, and disarmed the polls resume', async () => {
