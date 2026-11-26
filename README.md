@@ -887,6 +887,11 @@ expect(paused.containers).toEqual([`${env.composeProject}-redis-1`])
   is a container compose lists for the slot's project. Pausing one replica of a replicated service
   (`pause(service, { replica: n })`) has no compose command; the container is the one compose lists
   for that replica, and `docker pause` gets its id.
+- **Only a stack the harness started.** With `HARNESS_MANAGE_CONTAINERS=0` the containers are
+  whoever's started them, so `stop`, `pause`, `restart` and `flushRedis` refuse before they touch
+  anything: `refusing to pause redis: with HARNESS_MANAGE_CONTAINERS=0 the stack is not the harness's
+  to stop (it did not start it)`. `stopDmiApi` refuses the same way with `HARNESS_MANAGE_APP=0`. A
+  test that faults a service therefore fails at its first control, naming the variable.
 - **Nothing stays down.** Each fault is entered in a ledger as it is made (`disrupted()` lists it:
   service, fault, containers, since when, by which test). `restoreServices()` undoes every entry,
   waits until compose reports every container of the project running, and checks each restored

@@ -28,7 +28,11 @@ import { stacks } from './stacks'
  * with it. A test takes its controls with `serviceFaults()`, and they stop working when that test
  * ends: a test body jest has abandoned on a timeout cannot fault the stack under the next test.
  * `disrupted()` lists what the ledger holds, and `servicesNotRunning()` what compose reports down,
- * whoever brought it down. */
+ * whoever brought it down.
+ *
+ * Only a stack the harness started. With HARNESS_MANAGE_CONTAINERS=0 the containers are whoever's
+ * started them, so stop, pause, restart and flushRedis refuse before they touch anything, naming the
+ * variable; with HARNESS_MANAGE_APP=0 stopDmiApi refuses the same way. */
 
 /* The compose services the scenarios fault. The broker keeps ActiveMQ's name in compose (see "The
  * MQTT broker" in the README). */
@@ -148,6 +152,13 @@ async function waitForStates (service: string, names: string[], state: string, t
   throw new Error(`${names.join(', ')} did not reach '${state}' within ${timeoutMs} ms: ${JSON.stringify(last.map(({ name, state }) => ({ name, state })))}`)
 }
 
+/* Refuses `what` up front unless the harness started the stack's containers (see the header). */
+function requireManagedContainers (what: string): void {
+  if (!env.manageContainers) {
+    throw new Error(`refusing to ${what}: with HARNESS_MANAGE_CONTAINERS=0 the stack is not the harness's to stop (it did not start it)`)
+  }
+}
+
 function enter (disruption: Omit<Disruption, 'since' | 'test'>, test: string): Disruption {
   const key = ledgerKey(disruption.service, disruption.replica)
   if (ledger.has(key)) throw new Error(`${key} is already ${ledger.get(key)?.fault}; restore it first`)
@@ -159,6 +170,7 @@ function enter (disruption: Omit<Disruption, 'since' | 'test'>, test: string): D
 /* `docker compose stop <service>`: every container of the service, which stays stopped until
  * restored. */
 export async function stopService (service: string, test = currentTest()): Promise<Disruption> {
+  requireManagedContainers(`stop ${service}`)
   await knownService(service)
   const containers = await composeOn(['stop', service])
   if (containers.length === 0) throw new Error(`compose stopped nothing for ${service}: was it running?`)
@@ -172,6 +184,7 @@ export async function stopService (service: string, test = currentTest()): Promi
  * form, so the container's id is the one compose lists for that replica. */
 export async function pauseService (service: string, options: { replica?: number } = {}, test = currentTest()): Promise<Disruption> {
   const { replica } = options
+  requireManagedContainers(`pause ${replica == null ? service : `${service} replica ${replica}`}`)
   let containers: string[]
   if (replica == null) {
     await knownService(service)
@@ -192,6 +205,7 @@ export async function pauseService (service: string, options: { replica?: number
  * ledger: a container that does not come back (an engine that refuses to start) is what
  * restoreServices() waits for. */
 export async function restartService (service: string, stopTimeoutS = 10): Promise<string[]> {
+  requireManagedContainers(`restart ${service}`)
   await knownService(service)
   return await composeOn(['restart', '-t', String(stopTimeoutS), service])
 }
@@ -200,8 +214,11 @@ export async function restartService (service: string, stopTimeoutS = 10): Promi
  * signalDmiApi). The ledger holds it stopped from the moment the signal is sent, which happens before
  * this returns its promise, so a test can go on with a request in flight while dmi-api shuts down. */
 export async function stopDmiApi (signal: NodeJS.Signals = 'SIGTERM', test = currentTest(), timeoutMs = 30_000): Promise<DmiApiExit> {
+  if (!env.manageApp) {
+    throw new Error('refusing to stop dmi-api: with HARNESS_MANAGE_APP=0 dmi-api is not the harness\'s to stop (it did not start it)')
+  }
   const running = runningDmiApi()
-  if (running == null) throw new Error('no dmi-api of this run is running: nothing to stop (an external one, HARNESS_MANAGE_APP=0, is not the harness\'s to stop)')
+  if (running == null) throw new Error('refusing to stop dmi-api: no dmi-api this run started is running')
   enter({ service: DMI_API, fault: 'stopped', containers: [`dmi-api (pid ${running.pid})`], pid: running.pid }, test)
   return await signalDmiApi(signal, timeoutMs)
 }
@@ -347,6 +364,7 @@ export interface RedisFlush {
  * gone, as after a cutover to an empty instance. Reports the key counts on either side, so a test can
  * assert that there was something to lose. */
 export async function flushRedis (): Promise<RedisFlush> {
+  requireManagedContainers('flush Redis')
   const keysBefore = Number(await redisCli('DBSIZE'))
   const reply = await redisCli('FLUSHALL')
   if (reply !== 'OK') throw new Error(`FLUSHALL answered '${reply}'`)
