@@ -65,7 +65,7 @@ function log (message) {
 const SCENARIO_KEYS = ['authValidate', 'createOrder', 'resultsLatest', 'ivlsDevices', 'resultsLatestDelay']
 
 /* The keys a transport fault can be armed on, each one route: the order create, the three steps of
- * the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup, `uiOrderPut` the
+ * the confirm handshake (`uiPage` the UI page, `uiOrderGet` the order setup, `uiOrderPut` the
  * submission), the manifest PDF, the device list, and the results confirm. A fault is wired on a
  * route only together with a test that uses it; adding one is a line in that route's handler and a
  * name here. */
@@ -652,9 +652,8 @@ async function handleUiOrderGet (req, res, params) {
 
 async function handleUiOrderPut (req, res, params) {
   /* Step 3: the integration PUTs the transformed order to submit it. We record the submission and
-   * answer with the order's `pdfURL`, which the integration reads from this answer
-   * (`IdexxConfirmOrderResponse`) and fetches again once the order is submitted. That the live
-   * confirm answers with one is the integration's reading of it, unprobed here. */
+   * answer with the order's `pdfURL`, which the integration fetches again once the order is
+   * submitted. Whether the live confirm answers with one has not been probed here. */
   if (faults.intercept('uiOrderPut', req, res)) return
   await readBody(req)
   const order = state.orders.get(params.orderId)

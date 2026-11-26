@@ -491,9 +491,10 @@ later poll delivers again and confirms, and which the PIMS sees as one `report:u
 [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s
 tripwire, an order the confirm submitted whose manifest fetch after it fails. A describe of its own,
 after the loop's, takes the stack's services away from under an integration of its own (see
-"Service control" below), each test pinning a merged change: with Redis frozen, the integration fails a restart within its Redis command timeout instead
-of hanging on Redis, and polling resumes once Redis answers (dmi-engine-idexx-integration#74); after
-Redis is flushed, dmi-api's `ensure-integration-status` brings polling back, retrying an integration
+"Service control" below), each test pinning a merged change: with Redis frozen, the integration
+answers a restart with its failure within seconds instead of not at all, and polling resumes once
+Redis answers (dmi-engine-idexx-integration#74); after Redis is flushed, dmi-api's
+`ensure-integration-status` brings polling back, retrying an integration
 whose engine missed its first attempt (dmi-api#346); and after a broker restart, device lookups and
 order placement get their replies again, at worst after one timeout, including two lookups in flight
 at once (dmi-api#367). Its last test sends dmi-api a SIGTERM with a device lookup held in flight at
@@ -611,9 +612,8 @@ closely enough for the real integration to drive it unmodified:
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
   integration issues to submit the order. The `PUT` answers with the order's `pdfURL`, which the
-  integration reads from that answer and fetches once more after the submission. That the live
-  confirm answers with one is the integration's reading of it (`IdexxConfirmOrderResponse`), not
-  something probed here.
+  integration fetches once more after the submission. Whether the live confirm answers with one has
+  not been probed here.
 - **Manifest**: the create answer carries a `pdfURL` in IDEXX's shape, `/api/v1/pdf/<order id>?token=
   <token>&orderId=<order id>`, pointing back at the mock, and the mock serves the order's form there
   as a real PDF (synthetic text naming the order). Like every ordering call it needs HTTP Basic, and
@@ -644,7 +644,7 @@ closely enough for the real integration to drive it unmodified:
   `authValidate`, `createOrder`, `resultsLatest`, `ivlsDevices` and `resultsLatestDelay`; a scenario
   on any other key is refused.
 - **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder`, the
-  three steps of the confirmOrder handshake (`uiPage` the UI page, `uiOrderGet` the order setup,
+  three steps of the handshake above (`uiPage` the UI page, `uiOrderGet` the order setup,
   `uiOrderPut` the submission), `manifest` (the PDF), `ivlsDevices` and `resultsConfirm`. A confirm a
   fault takes never reaches the batch, which stays the one being served, and the batch ledger
   records only the confirms the route answered. `resultsLatestDelay` stays a scenario of its own
@@ -782,7 +782,7 @@ and a count of what it hit, read back to prove the fault fired.
 |---|---|---|---|
 | `hold` | `delayMs` (required, ≤ 10 min) | Runs the route's handler on arrival, so its answer and whatever else it does (an order created, a scenario used up) are fixed then, and sends the answer `delayMs` later. | The answer, late. A client whose timeout is shorter gives up first and gets nothing. |
 | `reset` | `close`: `rst` (default) or `fin` | Never runs the route. Once the request has arrived whole, closes the connection with no response: a TCP RST (`socket.resetAndDestroy()`), or a plain FIN (`socket.destroy()`). | `rst`: `ECONNRESET`, "read ECONNRESET". `fin`: `ECONNRESET`, "socket hang up". The same for GET and POST, with keep-alive or without. |
-| `stall` | `bytes` (default 0), `capMs` (default 120 s, ≤ 10 min) | Runs the route's handler on arrival, sends its status line and headers and the first `bytes` bytes of its body (never all of it: the headers still announce its full length), then nothing. After `capMs` the connection is closed. | A response whose body never completes. Its own timeout fires, or, at `capMs`, the body is cut short. axios (1.17, as the idexx integration has it) reports both alike, with the response attached: `ERR_BAD_RESPONSE`, "stream has been aborted", not a timeout. |
+| `stall` | `bytes` (default 0), `capMs` (default 120 s, ≤ 10 min) | Runs the route's handler on arrival, sends its status line and headers and the first `bytes` bytes of its body (never all of it: the headers still announce its full length), then nothing. After `capMs` the connection is closed. | A response whose body never completes. Its own timeout fires, or, at `capMs`, the body is cut short. axios 1.17 reports both alike, with the response attached: `ERR_BAD_RESPONSE`, "stream has been aborted", not a timeout. |
 
 ```
 POST   /__control__/scenarios           {"key": "createOrder", "fault": "hold", "delayMs": 15000}
@@ -1139,7 +1139,7 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 |---|---|---|---|
 | fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
 | fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
-| idexx | `the order is reported SUBMITTED` (under `a confirm that succeeds and a manifest fetch after it that fails`) | An order the confirm submitted is reported `SUBMITTED`, whatever becomes of the manifest fetch after it. Today `WAITING_FOR_INPUT`: the integration sets `SUBMITTED` only after that fetch, in a `try` whose `catch` only logs, so a failed fetch skips it while the order sits submitted at IDEXX | [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93) |
+| idexx | `the order is reported SUBMITTED` (under `a confirm that succeeds and a manifest fetch after it that fails`) | An order the confirm submitted is reported `SUBMITTED`, whatever becomes of the manifest fetch after it. Today, when that fetch fails, `WAITING_FOR_INPUT`, the status from before the confirm, while the order sits submitted at IDEXX | [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93) |
 | zoetis | `the dmi order's local test list shrinks to the remaining code` | Cancelling one test removes it from the dmi order's test list. Today the provider-side cancel happens, but dmi-api appends the cancelled test to the order's list instead of removing it | not yet filed |
 | antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |

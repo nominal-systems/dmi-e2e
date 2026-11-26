@@ -767,7 +767,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    *
    * Past the test catalogue (cached), a placement is up to six IDEXX calls in a row: the create
    * POST, the manifest PDF its answer points at, and with autoSubmitOrder the three steps of the
-   * confirmOrder handshake (the UI page, the order setup, the submission) and the manifest once
+   * confirm handshake (the UI page, the order setup, the submission) and the manifest once
    * more. The tests here fail one of those calls at a time, by its route key at the mock, with a transport fault (src/mock-faults; the
    * README's "Transport faults in the mocks"): an answer held, a connection reset, a body stalled.
    * Each test arms one fault and disarms it in a `finally` (withFault), and asserts from the count the
@@ -901,12 +901,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
     /* Regression guard (dmi-engine-idexx-integration#81): the create POST has a timeout of its own,
      * IDEXX_CREATE_ORDER_TIMEOUT_MS, and a create held past it fails at the integration, which tells
-     * the caller it timed out and that IDEXX may still have the order. Before #81 the create had no
-     * timeout at all, and dmi-api gave up on the RPC with its own 504, naming nobody. The answer is
-     * held past dmi-api's timeout too, so a create that waited for anything longer than its own
-     * timeout shows as that 504. The hold runs the create at the mock on arrival, as IDEXX would:
-     * the order exists at the provider, never confirmed, which is what "may still have processed it"
-     * warns of. */
+     * the caller it timed out and that IDEXX may still have the order. Before #81 the integration
+     * waited on a held create for as long as it was held, and dmi-api gave up on the RPC with its own
+     * 504, naming nobody. The answer is held past dmi-api's timeout too, so a create that waited for
+     * anything longer than its own timeout shows as that 504. The hold runs the create at the mock
+     * on arrival, as IDEXX would: the order exists at the provider, never confirmed, which is what
+     * "may still have processed it" warns of. */
     it('a create held past IDEXX_CREATE_ORDER_TIMEOUT_MS fails naming that timeout, and the order is at IDEXX unconfirmed', async () => {
       /* Refused at once, saying why, when the stack cannot show it: only a create timeout that dmi-api
        * outwaits reaches the caller as the integration's error, and only one that differs from the
@@ -938,15 +938,14 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
     /* Regression guard (dmi-engine-idexx-integration#83, merged into #81's branch): a connection reset
      * on an IDEXX call reaches dmi-api as a ProviderError naming the cause, ECONNRESET, and the call.
-     * Before #83 the interceptor dmi-engine-common provides, and the integration's error mapper, both
-     * read `error.response.data` on an error that has none, and the TypeError that threw replaced the
-     * real failure: dmi-api answered 500 "Internal server error". Both ways a connection can close
-     * with no answer, a TCP RST and a FIN, since a Node client words them differently. The reset
-     * comes before the route runs, so the mock never has the order. */
+     * Before #83 the cause was lost on the way: dmi-api answered 500 with a TypeError's message
+     * ("Cannot read properties of undefined …") and no errors, naming neither the reset nor the call.
+     * Both ways a connection can close with no answer, a TCP RST and a FIN, since a Node client words
+     * them differently. The reset comes before the route runs, so the mock never has the order. */
     it.each([
       ['rst', 'read ECONNRESET'],
       ['fin', 'socket hang up'],
-    ])('a create whose connection is reset (%s) fails naming ECONNRESET, not as a TypeError', async (close, cause) => {
+    ])('a create whose connection is reset (%s) fails naming ECONNRESET, not as an internal server error', async (close, cause) => {
       const { payload, requisitionId } = placement()
 
       const { result: response, fault } = await withFault(
@@ -966,13 +965,13 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
 
     /* Regression guard (dmi-engine-idexx-integration#83): the headers of the create's answer arrive,
      * then part of its body, then nothing, until the create timeout ends the wait. That reaches
-     * dmi-api as a ProviderError saying IDEXX answered but its body did not arrive. Before #83 the
-     * interceptor's raw_data record read `body.idexxOrderId` on the missing body and threw a
-     * TypeError in place of the error. The cause it names is axios's, as it reports a timeout that
-     * fires once the response has begun: the body's stream aborted, the same words as a body cut
-     * short (the device-list test below), not the timeout. The stall runs the route, so the order
-     * exists at IDEXX. */
-    it('a create whose answer stalls after its headers fails naming the body that did not arrive, not as a TypeError', async () => {
+     * dmi-api as a ProviderError saying IDEXX answered but its body did not arrive. Before #83 it
+     * reached the caller as the same 500 with a TypeError's message as the reset above did. The cause
+     * it names is in the HTTP client's words, as the client reports a timeout that fires once the
+     * response has begun: the body's stream aborted, the same words as a body cut short (the
+     * device-list test below), not the timeout. The stall runs the route, so the order exists at
+     * IDEXX. */
+    it('a create whose answer stalls after its headers fails naming the body that did not arrive, not as an internal server error', async () => {
       const { payload, requisitionId } = placement()
 
       const { result: response, fault } = await withFault(
@@ -1087,7 +1086,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect({ externalId: stored.externalId, manifest: manifestOf(stored) }).toEqual({ externalId: provider.idexxOrderId, manifest: null })
     }, 30_000)
 
-    /* A failed step of the confirmOrder handshake does not fail the create: the order exists at IDEXX
+    /* A failed step of the confirm handshake does not fail the create: the order exists at IDEXX
      * by then, and failing would lose its id. dmi-engine-idexx-integration#93 calls that much right
      * and leaves the rest open — what status the caller gets, and how the failure is made visible —
      * so this asserts only the settled part: 201, with IDEXX's id stored. Each of the three steps in
@@ -1207,11 +1206,12 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       }, 30_000)
 
       /* TRIPWIRE (dmi-engine-idexx-integration#93). Expected: an order the confirm submitted is
-       * reported SUBMITTED, whatever becomes of the manifest fetch after it. Today it is reported
-       * WAITING_FOR_INPUT: the integration sets SUBMITTED only after that fetch, inside the try whose
-       * catch only logs "Error confirming order", so the failed fetch skips it. The order sits at IDEXX
-       * submitted while dmi-api, and the PIMS, wait for input that is not needed. The positive twin is
-       * the test above this describe; the plain test just above reaches the state this reads. */
+       * reported SUBMITTED, whatever becomes of the manifest fetch after it. Today the loop sees it
+       * reported WAITING_FOR_INPUT, the status it had before the confirm, while the mock has it
+       * submitted: a failed fetch after the confirm leaves the order as if the confirm had not run.
+       * The order sits at IDEXX submitted while dmi-api, and the PIMS, wait for input that is not
+       * needed. The positive twin is the test above this describe; the plain test just above reaches
+       * the state this reads. */
       it.failing('the order is reported SUBMITTED', async () => {
         expect((await storedOrder(submittedOrderId)).status).toBe('SUBMITTED')
       })
@@ -1484,21 +1484,21 @@ describe('the loop outlives its broker, Redis and engine going away (service con
 
   /* ---- dmi-engine-idexx-integration#74 guard ----
    *
-   * The integration's Bull clients carry a command timeout (REDIS_COMMAND_TIMEOUT_MS, 10 s by
-   * default, which docker-compose.yml leaves alone), so that a Redis that stops answering fails their
-   * commands instead of hanging them for good. Without it, an integration restart sent while Redis
-   * does not answer hangs in the engine's stop handler, and the caller learns nothing until its own
-   * engine timeout: in production 90 s, after which the restart that should have repaired polling
-   * had failed without a word from the engine. Redis is paused, which freezes it with every
-   * connection left open, as a Redis that stops answering does. The restart is asked for by the
-   * operator's pass (`ensure-integration-status`, one attempt, this integration only), run with an
-   * engine timeout of its own well above the integration's command timeout: the loop's dmi-api waits
-   * 10 s, which would race it. Then Redis resumes, and the next restart must bring polling back.
+   * Since dmi-engine-idexx-integration#74, an integration restart sent while Redis does not answer is
+   * answered, with its failure, within a bound of the integration's own (10 s unless configured
+   * otherwise; the harness leaves it there). Before #74 such a restart got no answer from the
+   * integration at all, and the caller learned nothing until its own engine timeout: in production
+   * 90 s, after which the restart that should have repaired polling had failed without a word from
+   * the engine. Redis is paused, which freezes it with every connection left open, as a Redis that
+   * stops answering does. The restart is asked for by the operator's pass
+   * (`ensure-integration-status`, one attempt, this integration only), run with an engine timeout of
+   * its own well above the integration's bound: the loop's dmi-api waits 10 s, which would race it.
+   * Then Redis resumes, and the next restart must bring polling back.
    *
-   * Pausing Redis alone, and resuming it, proves nothing here: commands that hang come back when
-   * Redis does, with or without the timeout, and polling resumes either way (that staging passed with
-   * the integration's timeout removed). The restart's answer time is what the timeout changes. */
-  it('with Redis frozen, a restart fails within the integration\'s Redis command timeout instead of hanging, and polling resumes once Redis answers (dmi-engine-idexx-integration#74)', async () => {
+   * Pausing Redis alone, and resuming it, proves nothing here: polling resumes once Redis answers
+   * again, with #74 or without it (that staging passed against the integration with #74's change
+   * taken out). How soon the restart is answered is what #74 changes. */
+  it('with Redis frozen, a restart fails within 20 s instead of hanging, and polling resumes once Redis answers (dmi-engine-idexx-integration#74)', async () => {
     const faults = serviceFaults()
     const { orderId, requisitionId } = await placeOrder()
 
@@ -1529,8 +1529,8 @@ describe('the loop outlives its broker, Redis and engine going away (service con
       containers: [`${env.composeProject}-redis-1`],
       answeredWhilePaused: false,
     })
-    /* THE POINT OF THIS TEST: the engine answered the restart, with its failure, inside its command
-     * timeout plus slack, and not the pass's own timeout at 30 s. */
+    /* THE POINT OF THIS TEST: the engine answered the restart, with its failure, inside its 10 s
+     * bound plus slack, and not at the pass's own timeout at 30 s. */
     expect({
       exitCode: frozenPass.code,
       restartFailed: failedAt != null,
@@ -1679,11 +1679,9 @@ describe('the loop outlives its broker, Redis and engine going away (service con
    * shutdown still running SHUTDOWN_TIMEOUT_MS (10 s) after the signal exits with code 1. The harness
    * sets neither variable, so dmi-api runs with both defaults (its src/config/configuration.ts).
    *
-   * How it exits is not asserted, only by when. Today it is the timeout's exit, code 1, though the
-   * lookup is answered at about 7 s: the connection that carried the answer is a keep-alive one (the
-   * harness's client is Node's fetch), and Fastify's close goes on waiting for it after the answer, so
-   * the shutdown never reaches dmi-api's MQTT clients and databases. Closing them in order is what
-   * dmi-api#399 intended, but no open issue tracks it, so there is no tripwire for it yet.
+   * What this asserts is that the answer arrives during the drain, and that dmi-api exits within the
+   * bound dmi-api#399 promises, SHUTDOWN_TIMEOUT_MS after the signal; not whether it exits by the
+   * signal or by the deadline.
    *
    * The request held in flight is a device lookup: one provider call, which the integration gives
    * IDEXX_HTTP_TIMEOUT_MS (30 s) and dmi-api ENGINE_RESPONSE_TIMEOUT (10 s here). A placement would
@@ -1767,7 +1765,8 @@ describe('the loop outlives its broker, Redis and engine going away (service con
      * the drain, not during the delay. */
     expect(probe).toEqual({ listening: false, answeredYet: false })
     /* dmi-api exited after the answer, and within SHUTDOWN_TIMEOUT_MS of the signal: the second
-     * allowed past it is the timeout's own exit reaching this process (see above for how it exits). */
+     * allowed past it is for an exit at the deadline to reach this process (which way it exits is
+     * not asserted; see above). */
     expect({
       exited: exit != null,
       withinShutdownTimeout: exit != null && exit.exitedAfterMs <= shutdownTimeoutMs + 1_000,
