@@ -233,12 +233,16 @@ services:
     profiles: ['antech-v6']
     build:
       context: ./src/antech-v6-mock
+      # The transport faults the mocks share, beside the server, as for idexx-mock above.
+      additional_contexts:
+        mock-faults: ./src/mock-faults
       dockerfile_inline: |
         FROM node:20-alpine
         WORKDIR /app
-        COPY server.js ./
+        COPY server.js ./antech-v6-mock/
+        COPY --from=mock-faults index.js ./mock-faults/
         EXPOSE 3000
-        CMD ["node", "server.js"]
+        CMD ["node", "antech-v6-mock/server.js"]
     environment:
       PORT: '3000'
     ports:

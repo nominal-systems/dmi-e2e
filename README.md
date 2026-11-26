@@ -351,6 +351,17 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   checks from the counts or the call log that it fired, the describes they are in check after each
   test that nothing is left armed (as the refusals' describe does for its one-shot answers), and the
   run begins by asserting that nothing is.
+  The mock also takes transport faults (see "Transport faults in the mocks") on two keys:
+  `getStatus`, the status feed, whose labOrder call is the orders poll's first, and `placeOrder`,
+  the order endpoint; they are listed as `faults` beside the scenarios and the revocation on
+  `GET /__control__/scenarios`. A status poll held past the integration's 60 s HTTP timeout
+  ([dmi-engine-antech-v6-integration#70](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/pull/70))
+  is given up on at 60 s and asked again within a second (dmi-engine-common's one retry), and an
+  order placed meanwhile is delivered; without the timeout the held answer would simply come late.
+  That test holds the poll 62 s, and is most of what it costs the loop. A placement held past the
+  10 s dmi-api waits for the engine, which the provider then completes, is a tripwire for
+  [dmi-api#365](https://github.com/nominal-systems/dmi-api/issues/365), beside a placement held
+  3 s that is placed as usual.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
@@ -1091,9 +1102,10 @@ scenarios/
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
                               a result or order the provider redelivers unchanged changes nothing
                               (dmi-api#409), a 503's Retry-After is honoured (dmi-engine-common#27),
-                              a token the provider revokes is replaced at placement; an engine that
-                              cannot reach Redis at start exits, and recovers once Redis is back
-                              (dmi-engine#68)
+                              a token the provider revokes is replaced at placement, a status poll
+                              held past 60 s is given up on and asked again
+                              (dmi-engine-antech-v6-integration#70); an engine that cannot reach
+                              Redis at start exits, and recovers once Redis is back (dmi-engine#68)
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
                               end to end, and one order dmi-api cannot save does not cost the rest of its
                               batch (dmi-api#411)
@@ -1132,6 +1144,7 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 | antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
 | antech-v6 | `the integration logs in again when Antech stops accepting its token, and both polls deliver again` | A new login on each refused poll, one or two since the two polls share a tick, and no more over two further orders polls; a draft completed at the provider delivered as SUBMITTED and a result as a FINAL report. Today no poll logs in again: on the polls the 401 reaches the integration as a 500, because the logging interceptor throws on the error body, so its re-login on a 401 never runs and nothing is delivered while the token stays refused (it is cached for 12 hours) | [dmi-engine-antech-v6-integration#95](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/95) |
+| antech-v6 | `an order the provider created after dmi-api stopped waiting ends with the provider's id and SUBMITTED, never a bare ERROR` | One dmi order, SUBMITTED, carrying the provider's id, for a placement held past `ENGINE_RESPONSE_TIMEOUT` that the provider then completes. Today dmi-api answers 504 and records the order ERROR with no external id, discards the engine's late answer, and the orders poll, unable to match the provider's order to an order with no id, records it as an order of its own | [dmi-api#365](https://github.com/nominal-systems/dmi-api/issues/365) |
 | antech-v6 | `an order for a patient with no species OR breed mapping is still placeable` | The order is placed. Today the provider refuses it: the integration's default species and default breed are not a valid pair | [dmi-engine-antech-v6-integration#88](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/88) |
 | wisdom-panel | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | As in the antech-v6 loop: dmi-api's defect, not the provider's | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | wisdom-panel | `a result whose ideal-weight section is empty yields no ideal-weight items` | No ideal-weight panel. Today three DONE items with no value | [dmi-engine-wisdom-panel-integration#46](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/46) |

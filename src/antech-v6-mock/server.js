@@ -28,6 +28,12 @@
  * and `Retry-After` it was answered with. A test reads the gap between a refused call and its retry
  * there.
  *
+ * Transport faults (a held answer, a reset connection, a stalled body) come from the module the
+ * mocks share, `src/mock-faults`, armed over the same `POST /__control__/scenarios` with a `fault`
+ * field, on the keys in FAULT_KEYS, and listed beside the scenarios as `faults`.
+ * `DELETE /__control__/scenarios/:key[?id=]` disarms a key's scenario and its fault; with `id`, only
+ * the fault, and only while it is that arming.
+ *
  * A result is seeded (`POST /__control__/orders/:id/results`) only for an order the orders poll has
  * already acknowledged; a seed for any other is answered 409. Seeding moves the order's
  * `OrderStatus` to `Partial` or `Final`, and a record still on the unacknowledged feed carries that
@@ -207,6 +213,7 @@
 
 const http = require('http')
 const { createHash, randomInt, randomUUID } = require('crypto')
+const { createFaults } = require('../mock-faults')
 
 const PORT = Number(process.env.PORT || 3000)
 
@@ -240,6 +247,15 @@ let nextVendorId = 900000000 + (Date.now() % 1000000)
 function log (message) {
   console.log(`[antech-v6-mock] ${message}`)
 }
+
+/* The keys a transport fault can be armed on (src/mock-faults), each one route and named as the
+ * route's status scenario is: the status feed (`getStatus`, both service types, which is the orders
+ * poll's first call) and the order endpoint (`placeOrder`, an auto-submitted point-of-care order).
+ * A key is wired only together with a test that arms a fault on it; adding one is a line at the top
+ * of its route's handler and a name here. Outside the resettable state: POST /__control__/reset
+ * disarms every fault and destroys the connections they hold. */
+const FAULT_KEYS = ['getStatus', 'placeOrder']
+const faults = createFaults({ keys: FAULT_KEYS, log })
 
 /* A W3C `traceparent`-shaped id, as the validation-error envelope carries. Synthetic and random. */
 function traceId () {
@@ -951,6 +967,7 @@ function getStatusOperation (query) {
 }
 
 function handleGetStatus (req, res, params, query) {
+  if (faults.intercept('getStatus', req, res)) return
   if (requireHeaderToken(req, res, getStatusOperation(query)) == null) return
 
   const serviceType = query.get('serviceType')
@@ -1576,6 +1593,9 @@ async function handlePreOrderPlacement (req, res) {
  * because nothing reads it — `createOrder` throws the placement response away and maps the REQUEST
  * instead. Reproduced as the wire sends it rather than as the interface declares it. */
 async function handleOrderPlacement (req, res) {
+  /* A held placement is recorded on arrival, as the provider would have it: the order exists at
+   * Antech whatever becomes of the answer. */
+  if (faults.intercept('placeOrder', req, res)) return
   if (requireHeaderToken(req, res, 'orderPlacement') == null) return
   state.calls.orderPlacement += 1
 
@@ -2087,6 +2107,19 @@ async function handleControlScenario (req, res) {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
     return
   }
+  /* A body with `fault` arms a transport fault instead, on a key in FAULT_KEYS, with
+   * src/mock-faults' options: { "key": "getStatus", "fault": "hold" | "reset" | "stall", "times": 1,
+   * ... }. It sits beside any status scenario on the same key: a held route answers late with
+   * whatever it, or its scenario, answers. */
+  if (body.fault !== undefined) {
+    const armed = faults.arm(body)
+    if (armed.error != null) {
+      sendJson(res, 400, { message: armed.error })
+      return
+    }
+    sendJson(res, 200, { ok: true, key: body.key, fault: armed.fault })
+    return
+  }
   let scenario
   if (body.envelope !== undefined) {
     const envelope = ENVELOPES.get(body.envelope)
@@ -2132,9 +2165,11 @@ async function handleControlScenario (req, res) {
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
 }
 
-/* What is still armed, per key, and the token revocation beside the scenarios (null when none is
- * armed). A one-shot that is listed here after the test that armed it has finished was never
- * consumed: the call it was armed for did not happen. */
+/* Everything armed in the mock: the status scenarios per key, the transport faults per key
+ * (src/mock-faults: `id`, `fault`, its options, `times`, `hits`, `remaining`, `open`, and what
+ * became of each request it took; a fault stays listed once spent, until it is disarmed), and the
+ * token revocation (null when none is armed). A one-shot scenario that is listed here after the
+ * test that armed it has finished was never consumed: the call it was armed for did not happen. */
 function handleControlListScenarios (req, res) {
   sendJson(res, 200, {
     scenarios: Object.fromEntries(
@@ -2143,6 +2178,7 @@ function handleControlListScenarios (req, res) {
         { status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null, retryAfter: scenario.retryAfter },
       ]),
     ),
+    faults: faults.list(),
     revocation: publicRevocation(state.revocation),
   })
 }
@@ -2221,15 +2257,21 @@ function handleControlCallLog (req, res, params, query) {
   })
 }
 
-/* Disarm one scenario. 200 either way; `cleared` says whether one was armed. */
-function handleControlClearScenario (req, res, params) {
-  const cleared = Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
-  delete state.scenarios[params.key]
+/* Disarm a key: its status scenario and its transport fault, with every connection the fault still
+ * holds or stalls. `?id=<n>` disarms the fault only while it is that arming (src/mock-faults), and
+ * leaves the scenario alone, so a late cleanup cannot disarm a later test's fault. 200 either way:
+ * `cleared` says whether a scenario was armed, `fault` is the fault with its final count, or null. */
+function handleControlClearScenario (req, res, params, query) {
+  const id = query.get('id')
+  const cleared = id == null && Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
+  if (cleared) delete state.scenarios[params.key]
+  const fault = faults.disarm(params.key, id == null ? undefined : Number(id))
   if (cleared) log(`control: scenario '${params.key}' cleared`)
-  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios) })
+  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios), fault })
 }
 
 function handleControlReset (req, res) {
+  faults.reset()
   state = freshState()
   log('state reset')
   sendJson(res, 200, { ok: true })
