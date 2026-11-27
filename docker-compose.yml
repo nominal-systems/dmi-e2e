@@ -332,7 +332,7 @@ services:
                  done \
               && npx tsc -p tsconfig.json \
               && rm -f .npmrc \
-              && npm pack --pack-destination /packs; \
+              && npm pack --pack-destination /packs || exit 1; \
             done
         # Stage 2: the engine's checkout, with the packed modules (and common, when packed) installed
         # over its published deps.
