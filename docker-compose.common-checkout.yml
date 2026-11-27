@@ -23,7 +23,7 @@
 # compose's own `<project>-<service>` name).
 
 x-common-checkout-build: &common-checkout-build
-  context: ${DMI_ENGINE_COMMON_DIR:?the harness reads this file only with DMI_ENGINE_COMMON_DIR set}
+  context: ${DMI_ENGINE_COMMON_DIR:?the harness adds this file only with DMI_ENGINE_COMMON_DIR set. A --common slot tree's .env adds it through COMPOSE_FILE, so set COMPOSE_FILE=docker-compose.yml as well to build there without the checkout}
   dockerfile_inline: |
     # The checkout, built and packed (as stage 0 of the engine image). (Doubled dollars: compose
     # substitutes its own variables in this inline file before Docker sees it.)

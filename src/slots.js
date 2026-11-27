@@ -309,8 +309,8 @@ function releaseSlot (slot, environment = process.env) {
 function verifySlots () {
   const root = path.resolve(__dirname, '..')
   /* With the override the harness adds for a dmi-engine-common checkout (src/stacks.js): whatever it
-   * publishes or names must follow the slot too. It declares no project name, so the `name:` check
-   * below still reads docker-compose.yml's. */
+   * publishes or names must follow the slot too. Only docker-compose.yml may name the project: compose
+   * takes the last file's `name:`, so one in the override would rename the project whenever it is added. */
   const compose = ['docker-compose.yml', commonCheckout.composeFile]
     .map((file) => path.join(root, file))
     .filter((file) => fs.existsSync(file))
@@ -387,8 +387,10 @@ function verifySlots () {
       problems.push(`top-level ${section[1]} entry named ${fixed[1]} is the same in every slot — drop \`name:\` and let compose prefix it with the project`)
     }
   }
-  const name = /^name:\s*['"]?([^'"\s]+)/m.exec(compose)?.[1]
-  if (name !== BASE_PROJECT) problems.push(`docker-compose.yml's project name is '${name}', not '${BASE_PROJECT}' — slot 0 would not be the project a bare \`docker compose\` uses`)
+  const names = [...compose.matchAll(/^name:\s*['"]?([^'"\s]+)/gm)].map((match) => match[1])
+  if (names.length !== 1 || names[0] !== BASE_PROJECT) {
+    problems.push(`the compose files name the project ${names.length === 0 ? 'nowhere' : names.map((name) => `'${name}'`).join(', then ')}, not once as '${BASE_PROJECT}' in docker-compose.yml — slot 0 would not be the project a bare \`docker compose\` uses`)
+  }
 
   if (problems.length > 0) {
     throw new Error(`harness slots (src/slots.js) are inconsistent with docker-compose.yml:\n  - ${problems.join('\n  - ')}`)
