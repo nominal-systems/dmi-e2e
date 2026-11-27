@@ -850,7 +850,8 @@ scenarios/
                               throttled on every event write is still sent to the provider (dmi-api#371),
                               and two results polls in flight deliver a batch once
                               (dmi-engine-idexx-integration#88); an organization starts and stops its own
-                              integration with its API key, read from the provider's side (dmi-api#424)
+                              integration with its API key, read from the provider's side (dmi-api#424); and
+                              the integration's log names who started, stopped and deleted it (dmi-api#306)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,

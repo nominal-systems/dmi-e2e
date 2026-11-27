@@ -1088,7 +1088,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
    * organization's key, then stopped and started again from the Admin API: newest first, the log must name the admin
    * (`Admin`, the jwt strategy's subject) twice and then the organization. The sequence does not read the same both
    * ways, so a log served oldest first fails on its entries, not only on their times. A start that finds the
-   * integration running asks nothing of the engine and must add nothing.
+   * integration running asks nothing of the engine and must add nothing, and a delete with the organization's
+   * provider configuration is recorded too.
    *
    * Last in the file, for the reason the block above is: its integration polls the mock while it runs. */
   describe('an integration\'s log names who started and stopped it, newest first (dmi-api#306)', () => {
@@ -1169,6 +1170,28 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         body: { ok: 'Integration is already running' },
       })
       expect((await readLog()).total).toBe(3)
+    })
+
+    /* Deleting a provider configuration soft-deletes its integrations without going through the integration's own
+     * delete, so it records them on its own. The integration is stopped first: that delete does not stop it. */
+    it("deleting the organization's provider configuration records the integration's delete, and the log outlives it", async () => {
+      const stopped = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
+      expect({ status: stopped.status, body: stopped.body }).toEqual({ status: 201, body: { ok: 'Integration stopped' } })
+      const deleted = await owner.api.delete(`/providers/idexx/configurations/${owner.providerConfigurationId}`)
+      expect(deleted.status).toBe(204)
+      expect((await owner.api.get(`/integrations/${owner.integrationId}`)).status).toBe(404)
+
+      const log = await readLog()
+      expect({
+        total: log.total,
+        newest: log.data.slice(0, 2).map(({ action, actorType, actor, error }) => ({ action, actorType, actor, error })),
+      }).toEqual({
+        total: 5,
+        newest: [
+          { action: 'delete', actorType: 'organization', actor: organizationName, error: null },
+          { action: 'stop', actorType: 'organization', actor: organizationName, error: null },
+        ],
+      })
     })
   })
 })
