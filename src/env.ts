@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'fs'
 import * as path from 'path'
 import { applySlot } from './slots'
-import { commonCheckout, composeCommonCheckout, resolveStack, stacks, suiteName } from './stacks'
+import { commonCheckout, composeBuildsWithoutCommon, composeCommonCheckout, resolveStack, stacks, suiteName } from './stacks'
 
 /* Harness configuration, resolved once from process.env against defaults that match
  * docker-compose.yml. This repo has no dependency on dmi-api's source: it locates a dmi-api
@@ -301,6 +301,15 @@ function resolveCommon (): CommonUnderTest {
       `${dirVariable} (${fromEnvironment ? 'in the environment' : `in ${path.join(harnessRoot, '.env')}`}) resolves, for compose, to ` +
         `${dir}, which holds no checkout of @nominal-systems/dmi-engine-common. Point it at one, or unset it to build ` +
         'against the published package.',
+    )
+  }
+  /* Every image this loop builds must take the checkout, or the report would record one it ran without. */
+  const without = composeBuildsWithoutCommon(harnessRoot, stacks[env.stack].composeProfile, dir, process.env)
+  if (without.length > 0) {
+    throw new Error(
+      `${dirVariable} names a dmi-engine-common checkout, but the ${env.stack} loop would build ${without.join(', ')} ` +
+        `without it: give ${without.length === 1 ? 'that service' : 'each'} a block in ${commonCheckout.composeFile}, as the ` +
+        `other standalone integrations have, or unset ${dirVariable} to run this loop against the published package.`,
     )
   }
   return { checkout: { dir, fromVariable: fromEnvironment ? dirVariable : `${dirVariable}, from .env` } }

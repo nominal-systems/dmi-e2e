@@ -174,25 +174,57 @@ const commonCheckout = {
  * @param {string} harnessRoot @param {NodeJS.ProcessEnv} [environment]
  * @returns {string | undefined} */
 function composeCommonCheckout (harnessRoot, environment = process.env) {
-  /* eslint-disable-next-line @typescript-eslint/no-var-requires */
-  const { execFileSync } = require('child_process')
   const { service, context, setArg, dirVariable } = commonCheckout
-  let rendered
-  try {
-    rendered = execFileSync('docker', ['compose', '-f', path.join(harnessRoot, 'docker-compose.yml'), 'config', '--format', 'json', service], {
-      cwd: harnessRoot,
-      env: environment,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-  } catch (error) {
-    throw new Error(`could not ask compose how it resolves ${dirVariable} (docker compose config ${service}): ${String(error.stderr ?? error.message).trim()}`)
-  }
-  const build = JSON.parse(rendered).services?.[service]?.build
+  const build = composeConfig(harnessRoot, ['config', '--format', 'json', service], environment, `how it resolves ${dirVariable}`)
+    .services?.[service]?.build
   if (typeof build?.additional_contexts?.[context] !== 'string') {
     throw new Error(`docker compose config renders no '${context}' build context on ${service}: the compose file predates ${dirVariable}`)
   }
   return build.args?.[setArg] === '1' ? build.additional_contexts[context] : undefined
+}
+
+/* The services a loop would build without the checkout `dir`, as compose renders the loop with the
+ * override the harness adds for it (`-f <composeFile> --profile <profile>`). Every image built from
+ * outside dmi-e2e must have `dir` as its build context or as an additional one; dmi-e2e's own (the
+ * broker, the mocks) are not meant to, and an override's `<service>-published` base is covered by the
+ * image built FROM it (`service:<name>`). A loop with no block in the override is named here, so a
+ * run can be refused before its report records a checkout that loop's image never got.
+ * @param {string} harnessRoot @param {string} profile @param {string} dir
+ * @param {NodeJS.ProcessEnv} [environment]
+ * @returns {string[]} */
+function composeBuildsWithoutCommon (harnessRoot, profile, dir, environment = process.env) {
+  const args = ['-f', path.join(harnessRoot, commonCheckout.composeFile), '--profile', profile, 'config', '--format', 'json']
+  const services = Object.entries(composeConfig(harnessRoot, args, environment, `which images the ${profile} loop builds`).services ?? {})
+  const contexts = (build) => [build.context, ...Object.values(build.additional_contexts ?? {})].filter((value) => typeof value === 'string')
+  const bases = new Set(services.flatMap(([, { build }]) => build == null ? [] : contexts(build))
+    .filter((value) => value.startsWith('service:'))
+    .map((value) => value.slice('service:'.length)))
+  const inHarness = (context) => {
+    const relative = path.relative(harnessRoot, path.resolve(context))
+    return !relative.startsWith('..') && !path.isAbsolute(relative)
+  }
+  const target = path.resolve(dir)
+  return services
+    .filter(([name, { build }]) => build != null && !bases.has(name) && !inHarness(build.context) &&
+      !contexts(build).some((value) => !value.startsWith('service:') && path.resolve(value) === target))
+    .map(([name]) => name)
+}
+
+/* `docker compose -f docker-compose.yml <args>` with `environment` (so compose reads the project's
+ * .env as it would for a run), parsed as the JSON `config --format json` prints. `question` says, in
+ * the error, what the harness was asking. */
+function composeConfig (harnessRoot, args, environment, question) {
+  /* eslint-disable-next-line @typescript-eslint/no-var-requires */
+  const { execFileSync } = require('child_process')
+  const full = ['compose', '-f', path.join(harnessRoot, 'docker-compose.yml'), ...args]
+  let rendered
+  try {
+    rendered = execFileSync('docker', full, { cwd: harnessRoot, env: environment, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (error) {
+    /* stderr is '' (not null) when compose failed without a word, and null when docker never ran. */
+    throw new Error(`could not ask compose ${question} (docker compose ${args.join(' ')}): ${String(error.stderr ?? '').trim() || error.message}`)
+  }
+  return JSON.parse(rendered)
 }
 
 /* Validates a raw HARNESS_STACK value against the registry. Both parsers — jest.config.js and
@@ -347,7 +379,7 @@ function verifyStacks () {
   }
 }
 
-module.exports = { stacks, defaultStack, commonCheckout, composeCommonCheckout, resolveStack, suiteName, verifyStacks }
+module.exports = { stacks, defaultStack, commonCheckout, composeCommonCheckout, composeBuildsWithoutCommon, resolveStack, suiteName, verifyStacks }
 
 /* CLI for shell callers (scripts/nightly.sh, scripts/slot-tree.sh), so no script re-derives what
  * the registry knows:

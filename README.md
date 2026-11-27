@@ -481,9 +481,11 @@ it holds. How each image takes it:
   code is therefore compiled against the version its lockfile pins and run against the checkout: a
   change in the checkout's types shows in the engine image's build, not here. By hand, a bare
   `docker compose` needs `-f docker-compose.yml -f docker-compose.common-checkout.yml`; a tree made
-  with `--common` names both in its `.env`. The override relies on compose's `service:` build
-  contexts and the build-only services they reference; it has been run with Docker Compose v5.8.0,
-  and no earlier version has been tried.
+  with `--common` names both in its `.env`. A new standalone loop needs a block of its own there:
+  with the variable set, the harness asks compose which images the loop builds and refuses the run,
+  naming the service, if one of them would not take the checkout. The override relies on compose's
+  `service:` build contexts and the build-only services they reference; it has been run with Docker
+  Compose v5.8.0, and no earlier version has been tried.
 
 **dmi-api is not covered.** It depends on dmi-engine-common too (`ProviderError`, the
 shared-subscription decorators, the result types), but the harness runs it on the host from
