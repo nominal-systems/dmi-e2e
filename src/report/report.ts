@@ -231,9 +231,9 @@ function recordHistory (dir: string, run: RunInfo | undefined, summary: Summary 
  * summary beside a fresh run.json — the index shows such a run as incomplete instead. The run also
  * enters the history now, as incomplete, so a night that died early is still a grey mark later. */
 export function beginRun (): RunInfo {
-  const dir = suiteDir(env.report.dir, env.suite)
-  mkdirSync(dir, { recursive: true })
-  for (const stale of ['summary.json', 'index.html']) rmSync(path.join(dir, stale), { force: true })
+  /* What is under test first: reading it can refuse the run (a DMI_ENGINE_COMMON_DIR that names no
+   * checkout, compose failing to answer), and a refused run must leave the previous run's report as
+   * it was, not half-cleared under the previous run.json. */
   const run: RunInfo = {
     suite: env.suite,
     startedAt: new Date().toISOString(),
@@ -242,6 +242,9 @@ export function beginRun (): RunInfo {
     composeProject: env.composeProject,
     locations: locationsUnderTest(),
   }
+  const dir = suiteDir(env.report.dir, env.suite)
+  mkdirSync(dir, { recursive: true })
+  for (const stale of ['summary.json', 'index.html']) rmSync(path.join(dir, stale), { force: true })
   writeJson(path.join(dir, 'run.json'), run)
   recordHistory(dir, run, undefined)
   return run
