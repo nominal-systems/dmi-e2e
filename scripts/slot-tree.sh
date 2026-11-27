@@ -213,6 +213,9 @@ list() {
   local tree n holder up dir common_repo common_var named
   if ! ls -d "$SLOTS"/s* >/dev/null 2>&1; then echo "no slot trees in $SLOTS"; return; fi
   read -r common_repo common_var _ <<< "$(stacks common)"
+  # Each tree is described by its own .env, below. A run takes the variable from its environment
+  # first, though, so a value exported here decides every run started from this shell.
+  [ -z "${!common_var+set}" ] || echo "($common_var='${!common_var}' is in this shell's environment: a run started from here builds against that in any tree, whatever the tree's .env says)"
   for tree in "$SLOTS"/s*/; do
     tree=${tree%/}; n=${tree##*/s}
     case $n in ''|*[!0-9]*) continue ;; esac
@@ -225,10 +228,15 @@ list() {
       printf '    %-38s %s\n' "${dir##*/}" "$(git -C "$dir" symbolic-ref -q --short HEAD || echo "detached @ $(git -C "$dir" rev-parse --short HEAD)")"
     done
     # Whether the tree's runs build against a common checkout, as compose resolves the variable
-    # there — what the harness reads too. Blank for a tree whose dmi-e2e predates the variable.
-    named=$(stacks common-dir "$tree/dmi-e2e" 2>/dev/null || true)
-    if [ -n "$named" ]; then
-      echo "    every loop builds against $named ($common_var, as compose resolves it here)"
+    # from the tree's .env (what the harness reads too), with this shell's value left out. A tree
+    # whose dmi-e2e predates the variable is named only when it holds a common worktree; a query
+    # that fails says so, and is never read as "unset".
+    if ! grep -qF "\${$common_var" "$tree/dmi-e2e/docker-compose.yml" 2>/dev/null; then
+      [ ! -e "$tree/$common_repo/.git" ] || echo "    $common_repo is here, but this tree's dmi-e2e predates $common_var: no run here builds against it"
+    elif ! named=$(unset "$common_var"; stacks common-dir "$tree/dmi-e2e" 2>&1); then
+      echo "    could not tell whether $common_var is set for this tree: ${named%%$'\n'*}"
+    elif [ -n "$named" ]; then
+      echo "    every loop builds against $named ($common_var, as compose resolves it from the tree's .env)"
     elif [ -e "$tree/$common_repo/.git" ]; then
       echo "    $common_repo is here, but $common_var is unset for this tree: a run builds against it only with the variable set"
     fi
@@ -238,7 +246,8 @@ list() {
 case "${1:-}" in
   --remove) [ $# -eq 2 ] || die "usage: $0 --remove <n>"; remove "$2" ;;
   --list) list ;;
-  ''|-h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  # The header's title and usage: everything up to its second empty comment line.
+  ''|-h|--help) awk 'NR > 1 { if ($0 == "#" && ++blank == 2) exit; sub(/^# ?/, ""); print }' "$0" ;;
   -*) die "unknown option $1 (see $0 --help)" ;;
   *) create "$@" ;;
 esac
