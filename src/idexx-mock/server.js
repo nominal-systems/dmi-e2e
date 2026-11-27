@@ -14,7 +14,8 @@
  * `GET /__control__/batches` reads the ledger of results batches (each batch the mock formed, the
  * requisition ids of the results it carried, how many results/latest responses carried it, how
  * each confirm of it was answered, and — for an answer held by the `resultsLatestDelay` scenario —
- * how many results/latest requests arrived while it was held), `POST /__control__/scenarios`
+ * how many results/latest requests arrived while it was held), `GET /__control__/polls` counts the
+ * results and orders polls by the Basic username they carried, `POST /__control__/scenarios`
  * injects a canned answer or holds one results answer (see handleControlScenario), and
  * `POST /__control__/reset` clears all of it.
  *
@@ -87,6 +88,10 @@ function freshState () {
     /* The holds whose answer is still being held (see handleResultsLatest); every results/latest
      * request that arrives meanwhile is counted on each of them. */
     held: new Set(),
+    /* Basic username -> { results, orders }: how many results/latest and orders/external polls
+     * arrived carrying it, read over GET /__control__/polls. An integration's polls carry its own
+     * username, so an integration given a username of its own can be watched polling, or not. */
+    polls: new Map(),
     /* Error/edge injection: { [key]: { status, body } }. Keys are logical operation names, e.g.
      * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices' — plus 'resultsLatestDelay',
      * { delayMs }, which holds an answer instead of replacing it. */
@@ -458,6 +463,23 @@ function validateCreateOrder (payload) {
   return []
 }
 
+/* The username of a request's Basic credentials, or '' when it carries none. */
+function basicUsername (req) {
+  const header = String(req.headers.authorization || '')
+  if (!header.toLowerCase().startsWith('basic ')) return ''
+  const decoded = Buffer.from(header.slice('basic '.length).trim(), 'base64').toString('utf8')
+  const colon = decoded.indexOf(':')
+  return colon === -1 ? decoded : decoded.slice(0, colon)
+}
+
+/* Counted before any scenario can answer the poll: the count is of polls that reached the provider. */
+function countPoll (req, channel) {
+  const username = basicUsername(req)
+  const counts = state.polls.get(username) || { results: 0, orders: 0 }
+  counts[channel] += 1
+  state.polls.set(username, counts)
+}
+
 /* ---- ordering handlers (/api/v1) ---- */
 
 async function handleAuthValidate (req, res) {
@@ -537,6 +559,7 @@ async function handleDeleteOrder (req, res, params) {
 }
 
 async function handleExternalOrders (req, res) {
+  countPoll(req, 'orders')
   /* PIMS-initiated orders the integration would pull in. The harness places orders through dmi-api,
    * not through the provider UI, so this poll is intentionally empty (the integration treats an empty
    * `orders` array as "nothing new"). */
@@ -595,6 +618,7 @@ async function handleUiOrderPut (req, res, params) {
 /* ---- results handlers (/api/v3) ---- */
 
 async function handleResultsLatest (req, res) {
+  countPoll(req, 'results')
   /* Counted on arrival, before anything can answer it: a poll that reaches the provider while
    * another poll's answer is still held is the overlap the delay below exists to expose. */
   for (const hold of state.held) hold.requestsWhileHeld += 1
@@ -781,6 +805,10 @@ function handleControlListBatches (req, res) {
   sendJson(res, 200, { count: state.batches.length, batches: state.batches })
 }
 
+function handleControlListPolls (req, res) {
+  sendJson(res, 200, { polls: Object.fromEntries(state.polls) })
+}
+
 async function handleControlScenario (req, res) {
   /* Inject a canned failure for a logical operation, e.g.
    * { "key": "createOrder", "status": 500, "body": {...}, "once": true }.
@@ -846,6 +874,7 @@ const routes = [
   ['GET', /^\/__control__\/orders$/, handleControlListOrders],
   ['GET', /^\/__control__\/orders\/(?<requisitionId>[^/]+)$/, handleControlGetOrder],
   ['GET', /^\/__control__\/batches$/, handleControlListBatches],
+  ['GET', /^\/__control__\/polls$/, handleControlListPolls],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]

@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import { ApiClient, expectOk } from '../src/api-client'
 import { env } from '../src/env'
 import { clearFailPoints, closeMongo, failInserts } from '../src/mongo'
@@ -891,7 +892,8 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
        * integration sent it: every integration here uses the same harness credentials, so the mock
        * cannot tell them apart. It is 0 because this file has one idexx integration polling. A second
        * one would break all three values with the fix in place: the mock serves its one active batch
-       * to any integration, and its lock has a different key. */
+       * to any integration, and its lock has a different key. (The start/stop block below starts a
+       * second integration, and is last in the file for that reason.) */
       expect(batches.map((batch) => ({
         pollsThatFetchedTheBatch: batch.served,
         confirmsOfTheBatch: batch.confirms,
@@ -930,5 +932,154 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
         reportUpdatedEvents: forTheOrder.filter((type) => type === 'report:updated').length,
       }).toEqual({ reportUpdatedEvents: 1 })
     }, 30_000 + 90_000 + (delayMs + 30_000) + 2 * pollMs + 30_000 + 10_000)
+  })
+
+  /* dmi-api#424: an organization starts and stops its own integration with the API key it uses for
+   * the rest of the API (POST /integrations/:id/start and /stop), where it used to need the Admin API.
+   * The integration is created through POST /integrations, which leaves it NEW and polling nothing;
+   * start must reach the real engine, which schedules the polls, and stop must reach it again, which
+   * removes them. Each step is read from the provider's side: the integration is given an IDEXX
+   * username of its own, and the mock counts the polls that carry it (GET /__control__/polls).
+   *
+   * LAST IN THE FILE ON PURPOSE. The mock serves one results feed to every account, so while this
+   * integration runs it would fetch and confirm a result another test seeded, and the overlap test
+   * above counts every results poll that reaches the mock. Nothing here seeds a result, and the
+   * integration is stopped before the file ends. */
+  describe('an organization starts and stops its own integration with its API key (dmi-api#424)', () => {
+    const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
+    /* Unique per run, so a warm rerun (HARNESS_KEEP_UP) never counts a previous run's integration. */
+    const username = `start-stop-${randomUUID().slice(0, 8)}`
+    let owner: SeededOrg
+
+    interface PollCounts { results: number, orders: number }
+    const pollsFor = async (): Promise<PollCounts> => {
+      const { polls } = expectOk<{ polls: Record<string, PollCounts> }>(
+        await mock.get('/__control__/polls'),
+        'read the mock poll counts',
+      )
+      return polls[username] ?? { results: 0, orders: 0 }
+    }
+    const total = (counts: PollCounts): number => counts.results + counts.orders
+    const statusOf = async (): Promise<string> =>
+      expectOk<{ status: string }>(
+        await owner.api.get(`/integrations/${owner.integrationId}`),
+        'read the integration',
+      ).status
+    const sleep = async (ms: number): Promise<void> => await new Promise((resolve) => setTimeout(resolve, ms))
+
+    beforeAll(async () => {
+      /* An organization of its own: `org`, the loop's, is then "another organization". */
+      owner = await seedOrganization(ApiClient.create(), 'idexx-start-stop', {
+        providerId: 'idexx',
+        configuration: {
+          orderingBaseUrl: env.idexx.orderingBaseUrl,
+          resultBaseUrl: env.idexx.resultBaseUrl,
+          'X-Pims-Id': env.idexx.pimsId,
+          'X-Pims-Version': env.idexx.pimsVersion,
+        },
+        integrationOptions: { username, password: env.idexx.password, locale: env.idexx.locale },
+      })
+    }, 60_000)
+
+    afterAll(async () => {
+      /* Best-effort, as the loop's own stop is: its jobs would outlive a warm run otherwise. */
+      if (owner?.integrationId != null) {
+        await owner.api.post(`/integrations/${owner.integrationId}/stop`).catch(() => undefined)
+      }
+    })
+
+    it('an integration created through the organization API is NEW, and nothing polls for it', async () => {
+      expect(await statusOf()).toBe('NEW')
+      await sleep(2 * pollMs)
+      expect(await pollsFor()).toEqual({ results: 0, orders: 0 })
+    })
+
+    /* The refusal is the one dmi-api gives for an integration the caller cannot see, as restart's is:
+     * the message is dmi-api's own, which a route that does not exist would not answer. */
+    it("another organization's key can neither start nor stop it, and nothing changes", async () => {
+      for (const action of ['start', 'stop']) {
+        const response = await org.api.post(`/integrations/${owner.integrationId}/${action}`)
+        expect({ action, status: response.status, message: response.body?.message }).toEqual({
+          action,
+          status: 404,
+          message: 'The integration was not found',
+        })
+      }
+      expect(await statusOf()).toBe('NEW')
+      await sleep(2 * pollMs)
+      expect(await pollsFor()).toEqual({ results: 0, orders: 0 })
+    })
+
+    it('its own key starts it: 200 { ok }, RUNNING, and the provider sees it poll both channels', async () => {
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 200,
+        body: { ok: 'Integration started' },
+      })
+      expect(await statusOf()).toBe('RUNNING')
+
+      const polls = await pollUntil(pollsFor, (counts) => counts.results > 0 && counts.orders > 0, 4 * pollMs + 15_000, 500)
+      console.log(`[idexx-scenario] polls by ${username} after the start -> ${JSON.stringify(polls)}`)
+      expect({ resultsPolled: polls.results > 0, ordersPolled: polls.orders > 0 }).toEqual({
+        resultsPolled: true,
+        ordersPolled: true,
+      })
+    }, 4 * pollMs + 30_000)
+
+    /* Also the measure for the stop below: a window of three intervals sees this integration poll
+     * while it runs, so the same window seeing none after the stop is evidence the polls ended. */
+    it('starting it again answers that it is running, and it keeps polling', async () => {
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 200,
+        body: { ok: 'Integration is already running' },
+      })
+      expect(await statusOf()).toBe('RUNNING')
+
+      const before = total(await pollsFor())
+      await sleep(3 * pollMs)
+      const after = total(await pollsFor())
+      console.log(`[idexx-scenario] polls by ${username} in three intervals while running -> ${after - before}`)
+      expect(after).toBeGreaterThan(before)
+    }, 3 * pollMs + 15_000)
+
+    it('its own key stops it: 200 { ok }, STOPPED, and the polls end', async () => {
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 200,
+        body: { ok: 'Integration stopped' },
+      })
+      expect(await statusOf()).toBe('STOPPED')
+
+      /* A poll already under way when the jobs were removed may still land: give it an interval. */
+      await sleep(pollMs + 2_000)
+      const settled = await pollsFor()
+      await sleep(3 * pollMs)
+      const later = await pollsFor()
+      console.log(`[idexx-scenario] polls by ${username} after the stop -> ${JSON.stringify(settled)}, three intervals later ${JSON.stringify(later)}`)
+      expect(later).toEqual(settled)
+    }, 4 * pollMs + 20_000)
+
+    it('stopping it again answers that it is stopped', async () => {
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 200,
+        body: { ok: 'Integration is already stopped' },
+      })
+      expect(await statusOf()).toBe('STOPPED')
+    })
+
+    it('a STOPPED integration starts again: RUNNING, and the polls resume', async () => {
+      const before = total(await pollsFor())
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 200,
+        body: { ok: 'Integration started' },
+      })
+      expect(await statusOf()).toBe('RUNNING')
+
+      const polls = await pollUntil(pollsFor, (counts) => total(counts) > before, 4 * pollMs + 15_000, 500)
+      expect(total(polls)).toBeGreaterThan(before)
+    }, 4 * pollMs + 30_000)
   })
 })

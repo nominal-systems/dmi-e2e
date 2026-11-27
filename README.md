@@ -540,6 +540,8 @@ closely enough for the real integration to drive it unmodified:
   The `resultsLatestDelay` scenario (`{ delayMs, once }`) holds the next poll answer that carries a
   batch for `delayMs`, its content fixed on arrival, and the ledger counts the polls that reached
   the mock meanwhile: it is how the loop puts two polls of one integration in flight at once.
+  `GET /__control__/polls` counts the results and orders polls that reached the mock, by the Basic
+  username they carried: an integration given a username of its own can be seen to poll, or not.
 
 All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
 captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
