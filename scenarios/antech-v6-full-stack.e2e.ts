@@ -2024,6 +2024,12 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
       })
       expect(response.body.message).toContain('antech-v6')
 
+      /* What the test list can catch, today: nothing. When the provider cancels, dmi-api saves the
+       * order with the cancelled code appended, and for a code the order already has that writes
+       * nothing (nominal-systems/dmi-api#420), so a save made despite the refusal would not show
+       * here; dmi-api's unit tests pin that none is made. Once #420 takes the code off the order
+       * on success, this list shows such a save. Cancelling a code the order does not have would
+       * show it today, but #420 proposes answering that with 404 before the engine is asked. */
       const order = await org.api.get(`/orders/${id}`)
       expect({
         status: order.body.status,
