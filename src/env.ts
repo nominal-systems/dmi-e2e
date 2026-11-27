@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'fs'
 import * as path from 'path'
 import { applySlot } from './slots'
 import { commonCheckout, composeBuildsWithoutCommon, composeCommonCheckout, resolveStack, stacks, suiteName } from './stacks'
@@ -225,6 +225,7 @@ function port (name: string): number {
 const host = str('HARNESS_HOST', '127.0.0.1')
 const appPort = port('HARNESS_APP_PORT')
 const explicitBaseUrl = process.env.HARNESS_BASE_URL
+const baseUrl = str('HARNESS_BASE_URL', `http://${host}:${appPort}`)
 
 const fullStack = flag('HARNESS_FULL_STACK', false)
 const stack = resolveStack(process.env.HARNESS_STACK)
@@ -248,6 +249,7 @@ function checkoutsUnderTest (): Array<{ name: string, dir: string, fromVariable?
 
 const dmiApiDir = path.resolve(str('DMI_API_DIR', path.join(harnessRoot, '..', 'dmi-api')))
 const manageApp = flag('HARNESS_MANAGE_APP', explicitBaseUrl == null)
+const COMMON_PACKAGE = '@nominal-systems/dmi-engine-common'
 
 function readJson (file: string): any {
   try {
@@ -289,14 +291,10 @@ function resolveCommon (): CommonUnderTest {
   if (!env.manageContainers) return env.fullStack ? { unknown: 'unknown: HARNESS_MANAGE_CONTAINERS=0, the harness builds no image' } : {}
   const dir = composeCommonCheckout(harnessRoot, process.env)
   if (!env.fullStack) return dir == null ? {} : { ignored: dir }
-  if (dir == null) {
-    const [root] = env.checkouts
-    const version = readJson(path.join(root.dir, 'package-lock.json'))?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
-    return { published: `${typeof version === 'string' ? `${version} ` : ''}in the image, as ${root.name}'s lockfile pins it` }
-  }
+  if (dir == null) return { published: publishedCommon() }
   /* Compose takes a variable from the environment whenever it is there, empty or not. */
   const fromEnvironment = process.env[dirVariable] != null
-  if (readJson(path.join(dir, 'package.json'))?.name !== '@nominal-systems/dmi-engine-common') {
+  if (readJson(path.join(dir, 'package.json'))?.name !== COMMON_PACKAGE) {
     throw new Error(
       `${dirVariable} (${fromEnvironment ? 'in the environment' : `in ${path.join(harnessRoot, '.env')}`}) resolves, for compose, to ` +
         `${dir}, which holds no checkout of @nominal-systems/dmi-engine-common. Point it at one, or unset it to build ` +
@@ -315,26 +313,62 @@ function resolveCommon (): CommonUnderTest {
   return { checkout: { dir, fromVariable: fromEnvironment ? dirVariable : `${dirVariable}, from .env` } }
 }
 
+/* The published dmi-engine-common in the loop's images, as the lockfile of the repo they are built
+ * from pins it — claimed only while every checkout's declared range admits that version. A loop
+ * hosted by the engine installs its provider modules over the engine's lockfile (stage 2 of the
+ * engine image), and npm keeps the locked version only for a module whose range admits it: a module
+ * asking for a newer one gets that newer one, and the version is then not claimed. */
+function publishedCommon (): string {
+  const [root] = env.checkouts
+  const version = readJson(path.join(root.dir, 'package-lock.json'))?.packages?.[`node_modules/${COMMON_PACKAGE}`]?.version
+  if (typeof version !== 'string') return `in the image, version unknown: ${root.name}'s lockfile pins none`
+  const apart = env.checkouts.flatMap(({ name, dir }) => {
+    const range = readJson(path.join(dir, 'package.json'))?.dependencies?.[COMMON_PACKAGE]
+    return typeof range !== 'string' || caretAdmits(range, version) ? [] : [`${name} asks for ${range}`]
+  })
+  return apart.length === 0
+    ? `${version} in the image, as ${root.name}'s lockfile pins it`
+    : `in the image, version unknown: ${root.name}'s lockfile pins ${version}, but ${apart.join(' and ')}`
+}
+
+/* Whether the caret range `^a.b.c` (a > 0) admits `version`: the one form these repos declare their
+ * dmi-engine-common in. Any other form counts as not admitting it, so the report never claims a
+ * version it cannot vouch for. */
+function caretAdmits (range: string, version: string): boolean {
+  const floor = /^\^([1-9]\d*)\.(\d+)\.(\d+)$/.exec(range)?.slice(1).map(Number)
+  const found = /^(\d+)\.(\d+)\.(\d+)$/.exec(version)?.slice(1).map(Number)
+  if (floor == null || found == null) return false
+  return found[0] === floor[0] && (found[1] !== floor[1] ? found[1] > floor[1] : found[2] >= floor[2])
+}
+
 /* The dmi-engine-common dmi-api runs with. dmi-api is a host process started from DMI_API_DIR, never
  * an image, so it always loads what that checkout's node_modules holds: DMI_ENGINE_COMMON_DIR does
- * not reach it. Read from the installed copy (and where npm resolved it from), else from the
- * lockfile, saying which. Only read for the run report. */
+ * not reach it. Read from the installed copy (and where it came from), else from the lockfile,
+ * saying which. Only read for the run report. */
 function dmiApiCommonUnderTest (): { version: string, location: string } | undefined {
   if (!fullStack) return undefined
-  if (!manageApp) return { version: 'unknown: dmi-api is external', location: `external, at ${str('HARNESS_BASE_URL', '')}` }
+  if (!manageApp) return { version: 'unknown: dmi-api is external', location: `external, at ${baseUrl}` }
   const own = `dmi-api's own; ${commonCheckout.dirVariable} does not reach it`
-  const installedDir = path.join(dmiApiDir, 'node_modules', '@nominal-systems', 'dmi-engine-common')
+  const installedDir = path.join(dmiApiDir, 'node_modules', COMMON_PACKAGE)
   const installed = readJson(path.join(installedDir, 'package.json'))?.version
   if (typeof installed === 'string') {
-    const resolved = readJson(path.join(dmiApiDir, 'node_modules', '.package-lock.json'))
-      ?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.resolved
-    const from = typeof resolved !== 'string' ? '' : resolved.startsWith('file:') ? ` from ${resolved}` : ' from the registry'
-    return { version: `${installed}, installed in its node_modules${from} (${own})`, location: installedDir }
+    return { version: `${installed}, installed in its node_modules${installedFrom(installedDir)} (${own})`, location: installedDir }
   }
-  const locked = readJson(path.join(dmiApiDir, 'package-lock.json'))?.packages?.['node_modules/@nominal-systems/dmi-engine-common']?.version
+  const locked = readJson(path.join(dmiApiDir, 'package-lock.json'))?.packages?.[`node_modules/${COMMON_PACKAGE}`]?.version
   return typeof locked === 'string'
     ? { version: `${locked}, as its lockfile pins it: none installed in its node_modules (${own})`, location: path.join(dmiApiDir, 'package-lock.json') }
     : { version: `unknown: neither installed in its node_modules nor in its lockfile (${own})`, location: dmiApiDir }
+}
+
+/* Where dmi-api's installed copy came from. A link (`npm link`, `npm install <dir>`) and yalc (which
+ * copies files in and leaves npm's record of the registry install as it was) are read first, since
+ * npm's own record would name the registry for them; else that record's host or path. */
+function installedFrom (installedDir: string): string {
+  if (lstatSync(installedDir).isSymbolicLink()) return ` as a link to ${realpathSync(installedDir)}`
+  if (readJson(path.join(dmiApiDir, 'yalc.lock'))?.packages?.[COMMON_PACKAGE] != null) return ' from yalc'
+  const resolved = readJson(path.join(dmiApiDir, 'node_modules', '.package-lock.json'))?.packages?.[`node_modules/${COMMON_PACKAGE}`]?.resolved
+  if (typeof resolved !== 'string') return ''
+  return /^https?:\/\//.test(resolved) ? ` from ${new URL(resolved).host}` : ` from ${resolved}`
 }
 
 export const env: HarnessEnv = {
@@ -346,7 +380,7 @@ export const env: HarnessEnv = {
   composeProject: slot.project,
   host,
   appPort,
-  baseUrl: str('HARNESS_BASE_URL', `http://${host}:${appPort}`),
+  baseUrl,
   admin: {
     username: str('HARNESS_ADMIN_USERNAME', 'admin'),
     password: str('HARNESS_ADMIN_PASSWORD', 'admin'),

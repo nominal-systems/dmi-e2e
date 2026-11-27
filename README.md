@@ -496,9 +496,11 @@ own dependency moves to the release and the loops run again.
 
 The run report records the checkout like any other (`git describe`, path, and
 `(DMI_ENGINE_COMMON_DIR)`); a run without it records `published <version> in the image`, the version
-the lockfile of the image's repo pins. Either way, a line of its own, `dmi-engine-common in dmi-api`,
-records the copy dmi-api ran with: the version installed in its `node_modules` and where npm
-resolved it from, or its lockfile's when nothing is installed. The fast suite builds no image, so
+the lockfile of the image's repo pins, and `version unknown` instead when that lockfile pins none or
+when a checkout asks for a range the pinned version is outside (a provider module the engine image
+installs, say: npm then installs another). Either way, a line of its own, `dmi-engine-common in
+dmi-api`, records the copy dmi-api ran with: the version installed in its `node_modules` and where it
+came from (a link, yalc, or the host npm fetched it from), or its lockfile's when nothing is installed. The fast suite builds no image, so
 it ignores the variable and says so in its setup log. Expect the tripwires that track a
 dmi-engine-common defect to fire when the checkout fixes it: *"Failing test passed even though it was supposed to fail"* is the
 candidate doing what it should, not a broken run. Leave their markers in place: they come out in
