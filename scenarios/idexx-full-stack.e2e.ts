@@ -1010,10 +1010,10 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(await pollsFor()).toEqual({ results: 0, orders: 0 })
     })
 
-    it('its own key starts it: 200 { ok }, RUNNING, and the provider sees it poll both channels', async () => {
+    it('its own key starts it: 201 { ok }, RUNNING, and the provider sees it poll both channels', async () => {
       const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
       expect({ status: response.status, body: response.body }).toEqual({
-        status: 200,
+        status: 201,
         body: { ok: 'Integration started' },
       })
       expect(await statusOf()).toBe('RUNNING')
@@ -1031,7 +1031,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     it('starting it again answers that it is running, and it keeps polling', async () => {
       const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
       expect({ status: response.status, body: response.body }).toEqual({
-        status: 200,
+        status: 201,
         body: { ok: 'Integration is already running' },
       })
       expect(await statusOf()).toBe('RUNNING')
@@ -1043,10 +1043,10 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(after).toBeGreaterThan(before)
     }, 3 * pollMs + 15_000)
 
-    it('its own key stops it: 200 { ok }, STOPPED, and the polls end', async () => {
+    it('its own key stops it: 201 { ok }, STOPPED, and the polls end', async () => {
       const response = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
       expect({ status: response.status, body: response.body }).toEqual({
-        status: 200,
+        status: 201,
         body: { ok: 'Integration stopped' },
       })
       expect(await statusOf()).toBe('STOPPED')
@@ -1063,7 +1063,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     it('stopping it again answers that it is stopped', async () => {
       const response = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
       expect({ status: response.status, body: response.body }).toEqual({
-        status: 200,
+        status: 201,
         body: { ok: 'Integration is already stopped' },
       })
       expect(await statusOf()).toBe('STOPPED')
@@ -1073,7 +1073,7 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       const before = total(await pollsFor())
       const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
       expect({ status: response.status, body: response.body }).toEqual({
-        status: 200,
+        status: 201,
         body: { ok: 'Integration started' },
       })
       expect(await statusOf()).toBe('RUNNING')
