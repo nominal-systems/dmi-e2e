@@ -214,8 +214,10 @@ list() {
   if ! ls -d "$SLOTS"/s* >/dev/null 2>&1; then echo "no slot trees in $SLOTS"; return; fi
   read -r common_repo common_var _ <<< "$(stacks common)"
   # Each tree is described by its own .env, below. A run takes the variable from its environment
-  # first, though, so a value exported here decides every run started from this shell.
-  [ -z "${!common_var+set}" ] || echo "($common_var='${!common_var}' is in this shell's environment: a run started from here builds against that in any tree, whatever the tree's .env says)"
+  # first, though, so a value exported here (empty included) decides every run started from this shell.
+  if [ -n "${!common_var+set}" ]; then
+    echo "($common_var=${!common_var:-<empty>} is exported in this shell: a run started from here builds against $([ -n "${!common_var}" ] && echo it || echo 'the published package') in any tree, whatever the tree's .env says)"
+  fi
   for tree in "$SLOTS"/s*/; do
     tree=${tree%/}; n=${tree##*/s}
     case $n in ''|*[!0-9]*) continue ;; esac
