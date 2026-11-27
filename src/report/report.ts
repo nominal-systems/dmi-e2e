@@ -369,7 +369,7 @@ function commitOf (version: string): string | undefined {
 function versionLink (name: string, version: string): string {
   const sha = commitOf(version)
   const text = escapeHtml(version)
-  if (sha == null) return text
+  if (sha == null) return /\s/.test(version) ? `<span class="prose">${text}</span>` : text
   return `<a href="https://github.com/${GITHUB_ORG}/${encodeURIComponent(name)}/commit/${sha}">${text}</a>`
 }
 
@@ -583,6 +583,11 @@ ${reports.map(testsBlock).join('\n')}`
   .badge.passed { background: var(--ok); } .badge.failed { background: var(--bad); } .badge.incomplete { background: var(--muted); }
   .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
   .versions { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; white-space: nowrap; }
+  /* A version given as a sentence (dmi-api's common, one the report cannot vouch for) wraps, under
+   * its own first line, rather than widening the table past the window; every other row stays one. */
+  .versions > div { padding-left: 1.5em; text-indent: -1.5em; }
+  .versions .chg { text-indent: 0; }
+  .versions .prose { white-space: normal; }
   .versions a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
   .versions a:hover { border-bottom-style: solid; }
   .chg { display: inline-block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .7rem; font-weight: 700; color: var(--warn); background: var(--warn-bg); border-radius: .3rem; padding: 0 .35rem; margin-left: .25rem; vertical-align: middle; }
