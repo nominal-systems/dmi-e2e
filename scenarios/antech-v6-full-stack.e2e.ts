@@ -1967,34 +1967,74 @@ describe('antech-v6 full-stack (Antech V6 mock)', () => {
     }, 30_000)
   })
 
-  describe('cancel: the integration has no cancel path, and dmi-api leaves the order as it was', () => {
-    it('DELETE /orders/:id is refused with the integration\'s own message, and the order stays SUBMITTED', async () => {
-      /* The integration's `cancelOrder` throws a 501 ("does not support cancelling orders") before
-       * any HTTP call — there is no cancel endpoint in its dialect, so the mock has nothing to
-       * refuse and this pin is about dmi-api's side of the RPC: `cancelOrder` only marks the local
-       * order CANCELLED after the engine RPC RESOLVES, so a rejected RPC must leave the order
-       * exactly as it was, at the provider and in dmi. Whether Antech's API has a cancel surface
-       * the integration could use is unverified — though both placement endpoints DO return the
-       * provider's own numeric order id, which the integration discards, and that is the identifier
-       * such a surface would most likely want — so there is no tripwire here yet, only the pin that
-       * the refusal is loud and lossless. */
+  describe('cancel: the integration has no cancel path, and dmi-api answers 409 and leaves the order as it was', () => {
+    /* The integration's `cancelOrder` and `cancelOrderTest` throw a 501 ("does not support
+     * cancelling …") before any HTTP call — there is no cancel endpoint in its dialect, so the mock
+     * has nothing to refuse and these pins are about dmi-api's side of the RPC. The engine's filter
+     * hands dmi-api a ProviderError with code 501, and dmi-api answers it on both cancel routes
+     * with 409 in its own error body: `errors` is ['CANCELLATION_NOT_SUPPORTED'], the token a
+     * caller acts on, and `message` names the provider (nominal-systems/dmi-api#304; before it,
+     * every refusal was a 400, which a caller could not tell from a request of its own that was
+     * wrong). dmi-api changes the order only after the engine RPC RESOLVES, so a refused RPC must
+     * leave the order exactly as it was, at the provider and in dmi. Whether Antech's API has a
+     * cancel surface the integration could use is unverified — though both placement endpoints DO
+     * return the provider's own numeric order id, which the integration discards, and that is the
+     * identifier such a surface would most likely want. */
+    const CANCELLATION_NOT_SUPPORTED = 'CANCELLATION_NOT_SUPPORTED'
+
+    async function placeToCancel (): Promise<{ id: string, requisitionId: string }> {
       const payload = payloadFor([KIDNEY_PANEL_CODE])
-      const requisitionId = payload.requisitionId as string
       const created = expectOk<{ id: string, status: string }>(
         await org.api.post('/orders', payload, { autoSubmitOrder: true }),
         'place an order to attempt cancelling',
       )
       expect(created.status).toBe('SUBMITTED')
+      return { id: created.id, requisitionId: payload.requisitionId as string }
+    }
 
-      const response = await org.api.delete(`/orders/${created.id}`)
+    it('DELETE /orders/:id answers 409 CANCELLATION_NOT_SUPPORTED naming the provider, and the order stays SUBMITTED', async () => {
+      const { id, requisitionId } = await placeToCancel()
+
+      const response = await org.api.delete(`/orders/${id}`)
       console.log(
         `[antech-v6-scenario] cancel response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
       )
-      expect(response.ok).toBe(false)
-      expect(response.text).toContain('does not support cancelling orders')
+      expect({ status: response.status, errors: response.body.errors }).toEqual({
+        status: 409,
+        errors: [CANCELLATION_NOT_SUPPORTED],
+      })
+      expect(response.body.message).toContain('antech-v6')
 
-      const order = await org.api.get(`/orders/${created.id}`)
+      const order = await org.api.get(`/orders/${id}`)
       expect(order.body.status).toBe('SUBMITTED')
+      const received = await mockOrder(requisitionId)
+      expect(received.orderStatus).toBe('Submitted')
+    }, 60_000)
+
+    it('DELETE /orders/:id/tests/:testCode answers 409 CANCELLATION_NOT_SUPPORTED, and the order keeps its test', async () => {
+      const { id, requisitionId } = await placeToCancel()
+
+      const response = await org.api.delete(`/orders/${id}/tests/${KIDNEY_PANEL_CODE}`)
+      console.log(
+        `[antech-v6-scenario] test cancel response -> HTTP ${response.status}: ${response.text.slice(0, 300)}`,
+      )
+      expect({ status: response.status, errors: response.body.errors }).toEqual({
+        status: 409,
+        errors: [CANCELLATION_NOT_SUPPORTED],
+      })
+      expect(response.body.message).toContain('antech-v6')
+
+      /* What the test list can catch, today: nothing. When the provider cancels, dmi-api saves the
+       * order with the cancelled code appended, and for a code the order already has that writes
+       * nothing (nominal-systems/dmi-api#420), so a save made despite the refusal would not show
+       * here; dmi-api's unit tests pin that none is made. Once #420 takes the code off the order
+       * on success, this list shows such a save. Cancelling a code the order does not have would
+       * show it today, but #420 proposes answering that with 404 before the engine is asked. */
+      const order = await org.api.get(`/orders/${id}`)
+      expect({
+        status: order.body.status,
+        tests: (order.body.tests as Array<{ code: string }>).map((test) => test.code),
+      }).toEqual({ status: 'SUBMITTED', tests: [KIDNEY_PANEL_CODE] })
       const received = await mockOrder(requisitionId)
       expect(received.orderStatus).toBe('Submitted')
     }, 60_000)
