@@ -1082,4 +1082,116 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       expect(total(polls)).toBeGreaterThan(before)
     }, 4 * pollMs + 30_000)
   })
+
+  /* dmi-api#306: every start, stop, restart and delete of an integration is logged with who asked for it, and the
+   * Admin API reads the log back newest first (GET /admin/integrations/:id/log). The integration is started with the
+   * organization's key, then stopped and started again from the Admin API: newest first, the log must name the admin
+   * (`Admin`, the jwt strategy's subject) twice and then the organization. The sequence does not read the same both
+   * ways, so a log served oldest first fails on its entries, not only on their times. A start that finds the
+   * integration running asks nothing of the engine and must add nothing, and a delete with the organization's
+   * provider configuration is recorded too.
+   *
+   * Last in the file, for the reason the block above is: its integration polls the mock while it runs. */
+  describe('an integration\'s log names who started and stopped it, newest first (dmi-api#306)', () => {
+    let owner: SeededOrg
+    let organizationName: string
+
+    interface LogEntry { id: number, action: string, actorType: string, actor: string, error: string | null, createdAt: string }
+    const readLog = async (): Promise<{ total: number, data: LogEntry[] }> =>
+      expectOk<{ total: number, data: LogEntry[] }>(
+        await admin.get(`/admin/integrations/${owner.integrationId}/log`, { limit: 50 }),
+        'read the integration log',
+      )
+
+    beforeAll(async () => {
+      owner = await seedOrganization(ApiClient.create(), 'idexx-log', {
+        providerId: 'idexx',
+        configuration: {
+          orderingBaseUrl: env.idexx.orderingBaseUrl,
+          resultBaseUrl: env.idexx.resultBaseUrl,
+          'X-Pims-Id': env.idexx.pimsId,
+          'X-Pims-Version': env.idexx.pimsVersion,
+        },
+        integrationOptions: {
+          username: `log-${randomUUID().slice(0, 8)}`,
+          password: env.idexx.password,
+          locale: env.idexx.locale,
+        },
+      })
+      organizationName = expectOk<{ name: string }>(
+        await owner.jwt.get(`/organizations/${owner.organizationId}`),
+        'read the organization',
+      ).name
+    }, 60_000)
+
+    afterAll(async () => {
+      if (owner?.integrationId != null) {
+        await owner.api.post(`/integrations/${owner.integrationId}/stop`).catch(() => undefined)
+      }
+    })
+
+    it('a new integration has an empty log', async () => {
+      expect(await readLog()).toMatchObject({ total: 0, data: [] })
+    })
+
+    it('start (organization key), stop and start (Admin API): three entries, newest first, each with its actor', async () => {
+      const steps: Array<[string, ApiClient, string, number]> = [
+        ['start', owner.api, `/integrations/${owner.integrationId}/start`, 201],
+        ['stop', admin, `/admin/integrations/${owner.integrationId}/stop`, 201],
+        ['start', admin, `/admin/integrations/${owner.integrationId}/start`, 201],
+      ]
+      for (const [action, client, path, status] of steps) {
+        const response = await client.post(path)
+        expect({ action, status: response.status }).toEqual({ action, status })
+      }
+
+      const log = await readLog()
+      console.log(`[idexx-scenario] integration log -> ${JSON.stringify(log)}`)
+      expect({
+        total: log.total,
+        entries: log.data.map(({ action, actorType, actor, error }) => ({ action, actorType, actor, error })),
+      }).toEqual({
+        total: 3,
+        entries: [
+          { action: 'start', actorType: 'admin', actor: 'Admin', error: null },
+          { action: 'stop', actorType: 'admin', actor: 'Admin', error: null },
+          { action: 'start', actorType: 'organization', actor: organizationName, error: null },
+        ],
+      })
+      const times = log.data.map((entry) => Date.parse(entry.createdAt))
+      expect(times.every((time) => Number.isFinite(time))).toBe(true)
+      expect([...times].sort((a, b) => b - a)).toEqual(times)
+    }, 60_000)
+
+    it('a start that finds the integration running adds nothing to the log', async () => {
+      const response = await owner.api.post(`/integrations/${owner.integrationId}/start`)
+      expect({ status: response.status, body: response.body }).toEqual({
+        status: 201,
+        body: { ok: 'Integration is already running' },
+      })
+      expect((await readLog()).total).toBe(3)
+    })
+
+    /* Deleting a provider configuration soft-deletes its integrations without going through the integration's own
+     * delete, so it records them on its own. The integration is stopped first: that delete does not stop it. */
+    it("deleting the organization's provider configuration records the integration's delete, and the log outlives it", async () => {
+      const stopped = await owner.api.post(`/integrations/${owner.integrationId}/stop`)
+      expect({ status: stopped.status, body: stopped.body }).toEqual({ status: 201, body: { ok: 'Integration stopped' } })
+      const deleted = await owner.api.delete(`/providers/idexx/configurations/${owner.providerConfigurationId}`)
+      expect(deleted.status).toBe(204)
+      expect((await owner.api.get(`/integrations/${owner.integrationId}`)).status).toBe(404)
+
+      const log = await readLog()
+      expect({
+        total: log.total,
+        newest: log.data.slice(0, 2).map(({ action, actorType, actor, error }) => ({ action, actorType, actor, error })),
+      }).toEqual({
+        total: 5,
+        newest: [
+          { action: 'delete', actorType: 'organization', actor: organizationName, error: null },
+          { action: 'stop', actorType: 'organization', actor: organizationName, error: null },
+        ],
+      })
+    })
+  })
 })
