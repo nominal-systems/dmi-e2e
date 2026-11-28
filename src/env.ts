@@ -62,6 +62,9 @@ export interface HarnessEnv {
   mysql: MysqlEnv
   mongoUri: string
   activemq: { hostname: string, port: number }
+  /* Redis's published host port (full-stack only: the fast suite starts no Redis). The engines reach
+   * it over the compose network; the harness only asks it whether it answers (src/services.ts). */
+  redis: { hostname: string, port: number }
   /* HARNESS_FULL_STACK=1 selects a full-system suite: dmi-api under a normal NODE_ENV against a real
    * provider loop (redis + a provider mock + its integration), instead of the default fast suite
    * (NODE_ENV=seed, dmi-api alone). */
@@ -401,6 +404,10 @@ export const env: HarnessEnv = {
   activemq: {
     hostname: str('HARNESS_ACTIVEMQ_HOST', host),
     port: port('HARNESS_ACTIVEMQ_PORT'),
+  },
+  redis: {
+    hostname: host,
+    port: port('HARNESS_REDIS_PORT'),
   },
   fullStack,
   stack,

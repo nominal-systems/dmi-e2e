@@ -3,21 +3,38 @@
 /* Antech V6 mock provider for the dmi-e2e full-stack harness. A zero-dependency Node HTTP server
  * that speaks Antech's V6 JSON dialect closely enough for the REAL
  * `dmi-engine-antech-v6-integration` — hosted, as production hosts it, inside the `dmi-engine`
- * container — to drive it unmodified: per-request login, the two status feeds, the results feed,
- * both acknowledge channels, the species/breed and test-guide reference endpoints, the TRF
- * document, and BOTH placement endpoints (pre-order and order). A separate control plane
- * (`/__control__/*`) lets tests seed results, promote a draft, inspect what the mock received,
- * inject error scenarios and switch on the redelivery production has shown (load-bearing detail
- * 8), so the order -> result -> report loop is deterministic and CI-safe.
+ * container — to drive it unmodified: login, the two status feeds, the results feed, both
+ * acknowledge channels, the species/breed and test-guide reference endpoints, the TRF document, and
+ * BOTH placement endpoints (pre-order and order). A separate control plane (`/__control__/*`) lets
+ * tests seed results, promote a draft, inspect what the mock received, inject error scenarios,
+ * revoke the tokens it has issued (load-bearing detail 10) and switch on the redelivery production
+ * has shown (load-bearing detail 8), so the order -> result -> report loop is deterministic and
+ * CI-safe.
  *
  * Error scenarios are armed per operation (`placeOrder`, `getStatus`, … — see `freshState`) with
  * `POST /__control__/scenarios`: `{key, status, body, once}` for a body the test spells out, or
  * `{key, envelope, once}` for one of the mock's own error envelopes by name (`ENVELOPES`:
  * `trfUnavailable`, `unknownPath`), sent by the same builder the mock uses where that envelope was
- * observed, so a test that arms it cannot keep an old copy after a new capture. `GET
- * /__control__/scenarios` lists what is still armed (per key: `status`, `once`, `envelope`) and
- * `DELETE /__control__/scenarios/:key` disarms one, so a test that armed a one-shot answer and never
- * reached it can be named and cleaned up instead of leaving that answer for the next call.
+ * observed, so a test that arms it cannot keep an old copy after a new capture. A 429 or 503 the
+ * test spells out can also carry a `Retry-After` header (`retryAfter`: whole seconds, or a string
+ * sent as it is, such as an HTTP date). Arming one answers with its `id`, from the counter the
+ * transport faults' ids come from (src/mock-faults' nextArmingId). `GET /__control__/scenarios`
+ * lists what is still armed (per key: `id`, `status`, `once`, `envelope`, `retryAfter`; and beside
+ * them the token revocation, if one is armed) and `DELETE /__control__/scenarios/:key` disarms one,
+ * so a test that armed a one-shot answer and never reached it can be named and cleaned up instead
+ * of leaving that answer for the next call.
+ *
+ * `GET /__control__/calls/log` is the mock's record of each provider call as it arrived: when, the
+ * operation, the accession it named, the labOrder status polls answered before it, and the status
+ * and `Retry-After` it was answered with. A test reads the gap between a refused call and its retry
+ * there.
+ *
+ * Transport faults (a held answer, a reset connection, a stalled body) come from the module the
+ * mocks share, `src/mock-faults`, armed over the same `POST /__control__/scenarios` with a `fault`
+ * field, on the keys in FAULT_KEYS, and listed beside the scenarios as `faults`.
+ * `DELETE /__control__/scenarios/:key[?id=]` disarms a key's scenario and its fault; with `id`, only
+ * whichever of the two is that arming, so a test whose cleanup runs late cannot disarm a later
+ * test's scenario or fault on the same key.
  *
  * A result is seeded (`POST /__control__/orders/:id/results`) only for an order the orders poll has
  * already acknowledged; a seed for any other is answered 409. Seeding moves the order's
@@ -141,6 +158,33 @@
  *    order's TRF, then emits, one poll at a time, so that is the status the form went out with, and
  *    a test can tell which fetch's form dmi-api stored.
  *
+ * 10. A TOKEN IS GOOD FOR THE LIFE OF THE PROCESS, UNTIL A TEST REVOKES IT. The login response
+ *    carries no expiry (OBSERVED), and the integration caches each token per user and clinic for 12
+ *    hours, in each engine process separately (`ACCESS_TOKEN_TTL` in `antechV6-api.service.ts`;
+ *    the api process and the worker each hold their own). So this mock honours every token it has
+ *    issued, and a second login does not invalidate the first (OBSERVED, and the reason a token
+ *    string-built into a pre-order's submissionUri stays usable): an expiring mock token would break
+ *    the loop for a reason the vendor has not been seen to produce. What a vendor CAN do, and Wisdom
+ *    Panel did on 2026-11-23 after a maintenance, is stop accepting the tokens it has issued while
+ *    its login keeps working. `POST /__control__/revocation` (`{status}`, 401 by default) stages
+ *    that: every token issued before it is refused, on every endpoint that takes one, in that
+ *    endpoint's own answer to a token it does not accept, with the status given (on `/Tests/v6`,
+ *    whose answer to such a token is its 404, the 404 whatever the status); every token a login
+ *    issues after it is accepted. It counts what it refused, per operation (keyed as
+ *    `GET /__control__/calls` keys its counters), and the logins it saw, and it is listed with
+ *    those counts (`GET /__control__/revocation`, and beside the scenarios) until
+ *    `DELETE /__control__/revocation?id=<n>` disarms it, answering with the final counts. Only one
+ *    can be armed at a time. Arming it answers with its `id` (from the counter the transport faults'
+ *    ids come from, src/mock-faults), and a disarm by id disarms it only while it is that arming, so
+ *    a test whose cleanup runs late cannot disarm a later test's revocation; with no id the disarm
+ *    takes whatever is armed, which only the sweep after each test does. Disarming makes the revoked
+ *    tokens good again — a harness rule, not a provider one: the integration keeps a token for 12
+ *    hours, and a test that ended with an engine process still holding a refused token would leave
+ *    every later test's polls failing. How Antech answers
+ *    a token it revoked is not known (the endpoint was never asked about a token it had not
+ *    issued, see `requireHeaderToken`), so the 401 envelope is the mock's answer to an unknown
+ *    token, and any other status in it is INVENTED.
+ *
  * ---------------------------------------------------------------------------------------------
  * WHAT THIS MOCK DELIBERATELY DOES **NOT** MODEL
  *
@@ -175,6 +219,7 @@
 
 const http = require('http')
 const { createHash, randomInt, randomUUID } = require('crypto')
+const { createFaults } = require('../mock-faults')
 
 const PORT = Number(process.env.PORT || 3000)
 
@@ -208,6 +253,15 @@ let nextVendorId = 900000000 + (Date.now() % 1000000)
 function log (message) {
   console.log(`[antech-v6-mock] ${message}`)
 }
+
+/* The keys a transport fault can be armed on (src/mock-faults), each one route and named as the
+ * route's status scenario is: the status feed (`getStatus`, both service types, which is the orders
+ * poll's first call) and the order endpoint (`placeOrder`, an auto-submitted point-of-care order).
+ * A key is wired only together with a test that arms a fault on it; adding one is a line at the top
+ * of its route's handler and a name here. Outside the resettable state: POST /__control__/reset
+ * disarms every fault and destroys the connections they hold. */
+const FAULT_KEYS = ['getStatus', 'placeOrder']
+const faults = createFaults({ keys: FAULT_KEYS, log })
 
 /* A W3C `traceparent`-shaped id, as the validation-error envelope carries. Synthetic and random. */
 function traceId () {
@@ -509,11 +563,12 @@ function defaultUnitCodeResults () {
 
 function freshState () {
   return {
-    /* Tokens the mock has issued, token -> { userId, issuedAt }. A fresh token per login (the
-     * integration logs in before EVERY request — there is no token cache upstream), and a second
-     * login does NOT invalidate the first: OBSERVED, and the reason a token string-built into a
-     * pre-order's submissionUri stays usable. */
+    /* Tokens the mock has issued, token -> { userId, issuedAt }. A fresh token per login, and a
+     * second login does NOT invalidate the first (load-bearing detail 10). */
     tokens: new Map(),
+    /* The armed token revocation, or null (load-bearing detail 10): { id, status, armedAt, revoked
+     * (the tokens issued before it), refused (per operation), logins }. */
+    revocation: null,
     /* ClinicAccessionID -> order record. Antech keys everything on this id: the integration sends
      * it at placement, assigns it as BOTH requisitionId and externalId, and dmi-api reconciles a
      * polled result to its order purely on it (the antech-v6 result mapper attaches no `.order` to
@@ -546,8 +601,15 @@ function freshState () {
     /* Most distinct lab accession ids ever acknowledged in one AckStatus POST, so a test can prove
      * a multi-result batch was acked as one rather than inferring it from two reports. */
     maxLabAccessionIdsInOneAck: 0,
+    /* Every provider call as it arrived, oldest first, capped (GET /__control__/calls/log). */
+    callLog: [],
+    nextCallSeq: 0,
   }
 }
+
+/* The call log is capped so a long run cannot grow the mock's heap without bound; the tests read
+ * its recent end, so dropping the oldest entries is the right end to lose. */
+const MAX_CALL_LOG = 4000
 
 let state = freshState()
 
@@ -647,6 +709,21 @@ function sendMissingAccessToken (res) {
   })
 }
 
+/* The same envelope for a token the mock does not accept: one it never issued (INVENTED, see
+ * `requireHeaderToken`), or one a revocation refuses, at the status the revocation was armed with
+ * (load-bearing detail 10; any status but 401 INVENTED). The `type` names the status sent, as the
+ * observed one does. */
+function sendInvalidAccessToken (res, status = 401) {
+  sendJson(res, status, {
+    type: `https://www.rfc-editor.org/rfc/rfc9110.html#status.${status}`,
+    message: 'Access token is invalid.',
+    status,
+    errorDetails: {},
+    isSuccess: false,
+    requestId: randomUUID(),
+  })
+}
+
 /* 400 RFC 9110 validation problem+json. OBSERVED verbatim for a malformed `serviceType`; the
  * `errors` map is keyed by the offending field. The integration's error mapper DOES read `title`
  * and `errors`, so a rejection in this shape reaches the operator with the provider's wording.
@@ -738,6 +815,8 @@ function takeScenario (key) {
 }
 
 function sendScenario (res, scenario, fallback) {
+  /* Set before the builder writes its head, which keeps it: Node merges the two. */
+  if (scenario.retryAfter != null) res.setHeader('retry-after', scenario.retryAfter)
   if (scenario.envelope != null) {
     ENVELOPES.get(scenario.envelope).send(res)
     return
@@ -758,13 +837,28 @@ function issueToken () {
   /* 32 characters, matching the shape OBSERVED live. Random per login. */
   const token = (randomUUID() + randomUUID()).replace(/-/g, '').slice(0, 32)
   state.tokens.set(token, { userId: USER_ID, issuedAt: new Date().toISOString() })
+  /* A login while a revocation is armed is the recovery the revocation stages; it is counted, and
+   * its token is not among the revoked ones. */
+  if (state.revocation != null) state.revocation.logins += 1
   return token
 }
 
+/* Whether an armed revocation refuses this token: it was issued before the revocation was. */
+function isRevoked (token) {
+  return state.revocation != null && state.revocation.revoked.has(token)
+}
+
+/* Count a refused call against the operation it was (load-bearing detail 10). */
+function countRefusal (operation) {
+  const refused = state.revocation.refused
+  refused[operation] = (refused[operation] ?? 0) + 1
+  log(`revoked token refused on ${operation} (${refused[operation]} so far, answered ${state.revocation.status})`)
+}
+
 /* The `accessToken` REQUEST HEADER, required on every endpoint except /Users/v6/Login and
- * /Tests/v6 (which takes query auth — load-bearing detail 5). Returns the token string, or null
- * having already answered. */
-function requireHeaderToken (req, res) {
+ * /Tests/v6 (which takes query auth — load-bearing detail 5). `operation` names the call for a
+ * revocation's refusal count. Returns the token string, or null having already answered. */
+function requireHeaderToken (req, res, operation) {
   const token = req.headers.accesstoken
   if (typeof token !== 'string' || token === '') {
     sendMissingAccessToken(res)
@@ -775,14 +869,12 @@ function requireHeaderToken (req, res) {
      * Refusing it keeps the mock from accepting a token the integration never obtained — a
      * permissive check here would let a broken login path stay green, since every call would carry
      * *something*. Same envelope, different wording, so the difference is legible in a log. */
-    sendJson(res, 401, {
-      type: 'https://www.rfc-editor.org/rfc/rfc9110.html#status.401',
-      message: 'Access token is invalid.',
-      status: 401,
-      errorDetails: {},
-      isSuccess: false,
-      requestId: randomUUID(),
-    })
+    sendInvalidAccessToken(res)
+    return null
+  }
+  if (isRevoked(token)) {
+    countRefusal(operation)
+    sendInvalidAccessToken(res, state.revocation.status)
     return null
   }
   return token
@@ -808,8 +900,9 @@ function requireClinicId (res, value, field) {
 
 /* POST /Users/v6/Login
  *
- * The integration authenticates before EVERY request (no token cache), so this is the most-hit
- * endpoint in the loop. The response's two load-bearing fields are `Token` and `UserInfo.ID` — the
+ * The integration logs in once per engine process and caches the token for 12 hours, logging in
+ * again only when a call is refused with a 401 (load-bearing detail 10), and a `testAuth` logs in
+ * without caching. The response's two load-bearing fields are `Token` and `UserInfo.ID` — the
  * latter is what /Tests/v6 wants as its `userId` query parameter. OBSERVED: the live body carries
  * six top-level keys, not the two the integration's interface declares, and `UserInfo` carries 18
  * fields; a representative handful of INVENTED ones is included so a mock-built integration cannot
@@ -869,8 +962,19 @@ async function handleLogin (req, res) {
  * has not acknowledged; `overrideAck=true` returns them regardless; an omitted parameter behaves
  * as `false` (OBSERVED: omitting it returned the same empty list `false` did). An unknown
  * `ClinicAccessionID` filter is a 200 with both arrays empty — NOT an error (OBSERVED). */
+
+/* The two feeds are two operations, counted apart as `GET /__control__/calls` counts them: the
+ * orders poll reads the labOrder feed and the results poll does not read this endpoint at all. */
+function getStatusOperation (query) {
+  const serviceType = query.get('serviceType')
+  if (serviceType === 'labOrder') return 'getStatusLabOrder'
+  if (serviceType === 'labResult') return 'getStatusLabResult'
+  return 'getStatus'
+}
+
 function handleGetStatus (req, res, params, query) {
-  if (requireHeaderToken(req, res) == null) return
+  if (faults.intercept('getStatus', req, res)) return
+  if (requireHeaderToken(req, res, getStatusOperation(query)) == null) return
 
   const serviceType = query.get('serviceType')
   if (serviceType !== 'labOrder' && serviceType !== 'labResult') {
@@ -1010,7 +1114,7 @@ function buildLabResultStatus (order) {
  * exception is a test's own: a result whose order has its results-channel redelivery switched on
  * is served whether or not it was acknowledged (load-bearing detail 8). */
 function handleGetAllResults (req, res) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'getAllResults') == null) return
   state.calls.getAllResults += 1
 
   const scenario = takeScenario('getAllResults')
@@ -1050,7 +1154,7 @@ function isRedeliveringResult (result) {
  * bare array so that a mock-driven ref/diagnostic sweep does not 404 here, and deliberately never
  * populated — this harness seeds no orphans, so nothing asserts on them. */
 function handleOrphanResults (req, res) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'orphanResults') == null) return
   state.calls.orphanResults += 1
   sendJson(res, 200, [])
 }
@@ -1070,7 +1174,7 @@ function handleOrphanResults (req, res) {
  * and recorded the same way and counted in the window, and leaves the record on the feed until
  * the switch goes off. */
 async function handleAckStatus (req, res) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'ackStatus') == null) return
 
   const scenario = takeScenario('ackStatus')
   if (scenario != null) {
@@ -1159,7 +1263,7 @@ async function handleAckStatus (req, res) {
  * `getBreeds` flattens `value.data[].breed[]`, so a missing `breed` array on any species would
  * throw inside dmi-api's ref sync. */
 function handleSpeciesBreed (req, res, params, query) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'speciesBreed') == null) return
   if (!requireClinicId(res, query.get('ClinicID'), 'ClinicID')) return
   state.calls.speciesBreed += 1
   sendJson(res, 200, {
@@ -1184,6 +1288,13 @@ function handleTestGuide (req, res, params, query) {
   }
   if (!state.tokens.has(token)) {
     sendNotFound(res, '/Tests/v6 called with a token this mock never issued')
+    return
+  }
+  if (isRevoked(token)) {
+    /* This endpoint's answer to a token it does not take is its 404, so a revoked token gets that
+     * 404 whatever status the revocation was armed with (load-bearing detail 10). */
+    countRefusal('testGuide')
+    sendNotFound(res, '/Tests/v6 called with a revoked token')
     return
   }
   const userId = query.get('userId')
@@ -1251,7 +1362,7 @@ function handleTestGuide (req, res, params, query) {
  * else — an unknown accession, or a PRE-ORDER, which is a draft and has no form — returns 500,
  * not 404. */
 function handleTrf (req, res, params) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'trf') == null) return
   state.calls.trf += 1
 
   const order = state.orders.get(params.clinicAccessionId)
@@ -1461,7 +1572,7 @@ function mintLabAccessionId () {
  *
  * A draft enters NEITHER status feed and has NO TRF (load-bearing detail 6). */
 async function handlePreOrderPlacement (req, res) {
-  if (requireHeaderToken(req, res) == null) return
+  if (requireHeaderToken(req, res, 'preOrderPlacement') == null) return
   state.calls.preOrderPlacement += 1
 
   const scenario = takeScenario('placePreOrder')
@@ -1488,7 +1599,10 @@ async function handlePreOrderPlacement (req, res) {
  * because nothing reads it — `createOrder` throws the placement response away and maps the REQUEST
  * instead. Reproduced as the wire sends it rather than as the interface declares it. */
 async function handleOrderPlacement (req, res) {
-  if (requireHeaderToken(req, res) == null) return
+  /* A held placement is recorded on arrival, as the provider would have it: the order exists at
+   * Antech whatever becomes of the answer. */
+  if (faults.intercept('placeOrder', req, res)) return
+  if (requireHeaderToken(req, res, 'orderPlacement') == null) return
   state.calls.orderPlacement += 1
 
   const scenario = takeScenario('placeOrder')
@@ -1983,15 +2097,38 @@ function handleControlResultState (req, res, params) {
   })
 }
 
+/* The statuses a `Retry-After` goes with: RFC 9110 defines it for a 503, RFC 6585 for a 429.
+ * Whether Antech ever sends one is NOT OBSERVED — no capture carries it — so this is a harness
+ * option for the integration's HTTP layer, which honours the header (dmi-engine-common's
+ * `BaseApiService`), and the mock refuses to send it with any other status. */
+const RETRY_AFTER_STATUSES = [429, 503]
+
 /* Arm a scenario: `{key, status, body, once}`, or `{key, envelope, once}` with `envelope` naming
- * one of `ENVELOPES`, whose builder then sends its own status and body. Arming a key that is
- * already armed replaces it. */
+ * one of `ENVELOPES`, whose builder then sends its own status and body. The first takes
+ * `retryAfter` with a 429 or a 503: whole seconds, sent as the header's delta-seconds, or a string
+ * sent as it is (an HTTP date, say). Arming a key that is already armed replaces it. Answers with
+ * the scenario as it is listed, `id` included: the arming's, from the mock's one arming counter
+ * (src/mock-faults' nextArmingId), for a disarm that names it. */
 async function handleControlScenario (req, res) {
   const body = await readJson(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
     return
   }
+  /* A body with `fault` arms a transport fault instead, on a key in FAULT_KEYS, with
+   * src/mock-faults' options: { "key": "getStatus", "fault": "hold" | "reset" | "stall", "times": 1,
+   * ... }. It sits beside any status scenario on the same key: a held route answers late with
+   * whatever it, or its scenario, answers. */
+  if (body.fault !== undefined) {
+    const armed = faults.arm(body)
+    if (armed.error != null) {
+      sendJson(res, 400, { message: armed.error })
+      return
+    }
+    sendJson(res, 200, { ok: true, key: body.key, fault: armed.fault })
+    return
+  }
+  let scenario
   if (body.envelope !== undefined) {
     const envelope = ENVELOPES.get(body.envelope)
     if (envelope === undefined) {
@@ -2006,35 +2143,162 @@ async function handleControlScenario (req, res) {
       })
       return
     }
-    state.scenarios[body.key] = { status: envelope.status, body: undefined, envelope: body.envelope, once: body.once === true }
+    scenario = { status: envelope.status, body: undefined, envelope: body.envelope, once: body.once === true }
   } else {
-    state.scenarios[body.key] = { status: body.status || 500, body: body.body, envelope: null, once: body.once === true }
+    scenario = { status: body.status || 500, body: body.body, envelope: null, once: body.once === true }
   }
-  sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
+  scenario.retryAfter = null
+  if (body.retryAfter !== undefined) {
+    const value = body.retryAfter
+    const valid = (Number.isInteger(value) && value >= 0) || (typeof value === 'string' && value.trim() !== '')
+    if (!valid) {
+      sendJson(res, 400, { message: `retryAfter must be whole seconds (an integer >= 0) or a non-empty string, got ${JSON.stringify(value)}` })
+      return
+    }
+    if (!RETRY_AFTER_STATUSES.includes(scenario.status)) {
+      sendJson(res, 400, {
+        message: `retryAfter goes with a ${RETRY_AFTER_STATUSES.join(' or a ')}, and this scenario answers ${scenario.status}`,
+      })
+      return
+    }
+    if (scenario.body == null) {
+      /* Some keys' default answers send a status of their own whatever was armed (the TRF's is its
+       * 500), which would put the header on an answer it does not go with. */
+      sendJson(res, 400, { message: 'retryAfter needs the answer spelled out: a "status" and a "body"' })
+      return
+    }
+    scenario.retryAfter = String(value)
+  }
+  scenario.id = faults.nextArmingId()
+  state.scenarios[body.key] = scenario
+  sendJson(res, 200, { ok: true, key: body.key, scenario: publicScenario(scenario), scenarios: Object.keys(state.scenarios) })
 }
 
-/* What is still armed, per key. A one-shot that is listed here after the test that armed it has
- * finished was never consumed: the call it was armed for did not happen. */
+/* A status scenario as the control plane lists it. */
+function publicScenario (scenario) {
+  return { id: scenario.id, status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null, retryAfter: scenario.retryAfter }
+}
+
+/* Everything armed in the mock: the status scenarios per key, the transport faults per key
+ * (src/mock-faults: `id`, `fault`, its options, `times`, `hits`, `remaining`, `open`, and what
+ * became of each request it took; a fault stays listed once spent, until it is disarmed), and the
+ * token revocation (null when none is armed). A one-shot scenario that is listed here after the
+ * test that armed it has finished was never consumed: the call it was armed for did not happen. */
 function handleControlListScenarios (req, res) {
   sendJson(res, 200, {
-    scenarios: Object.fromEntries(
-      Object.entries(state.scenarios).map(([key, scenario]) => [
-        key,
-        { status: scenario.status, once: scenario.once, envelope: scenario.envelope ?? null },
-      ]),
-    ),
+    scenarios: Object.fromEntries(Object.entries(state.scenarios).map(([key, scenario]) => [key, publicScenario(scenario)])),
+    faults: faults.list(),
+    revocation: publicRevocation(state.revocation),
   })
 }
 
-/* Disarm one scenario. 200 either way; `cleared` says whether one was armed. */
-function handleControlClearScenario (req, res, params) {
-  const cleared = Object.prototype.hasOwnProperty.call(state.scenarios, params.key)
-  delete state.scenarios[params.key]
-  if (cleared) log(`control: scenario '${params.key}' cleared`)
-  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios) })
+/* ---- token revocation (load-bearing detail 10) ---- */
+
+function publicRevocation (revocation) {
+  if (revocation == null) return null
+  return {
+    /* The arming's id, which its disarm names. */
+    id: revocation.id,
+    status: revocation.status,
+    armedAt: revocation.armedAt,
+    /* How many tokens it refuses: every one issued before it was armed. */
+    revokedTokens: revocation.revoked.size,
+    /* Calls refused, per operation. */
+    refused: { ...revocation.refused },
+    /* Logins while armed, each issuing a token it accepts. */
+    logins: revocation.logins,
+  }
+}
+
+/* Arm a revocation: `{status}`, any HTTP error status, 401 if left out. Answers with it, and its `id`
+ * from the mock's one arming counter (src/mock-faults' nextArmingId). Refused while one is armed, and
+ * while no token has been issued (it would refuse nothing). */
+async function handleControlArmRevocation (req, res) {
+  const body = await readJson(req)
+  const unknown = Object.keys(body).filter((key) => key !== 'status')
+  if (unknown.length > 0) {
+    sendJson(res, 400, { message: `a revocation takes only "status"; unknown ${unknown.map((key) => `"${key}"`).join(', ')}` })
+    return
+  }
+  const status = body.status === undefined ? 401 : body.status
+  if (!Number.isInteger(status) || status < 400 || status > 599) {
+    sendJson(res, 400, { message: `status must be an HTTP error status (an integer, 400-599), got ${JSON.stringify(body.status)}` })
+    return
+  }
+  if (state.revocation != null) {
+    sendJson(res, 409, {
+      message: `a revocation is already armed (id ${state.revocation.id}, since ${state.revocation.armedAt}); DELETE /__control__/revocation?id=${state.revocation.id} first`,
+      revocation: publicRevocation(state.revocation),
+    })
+    return
+  }
+  if (state.tokens.size === 0) {
+    sendJson(res, 409, { message: 'no token has been issued yet, so a revocation would refuse nothing' })
+    return
+  }
+  state.revocation = {
+    id: faults.nextArmingId(),
+    status,
+    armedAt: new Date().toISOString(),
+    revoked: new Set(state.tokens.keys()),
+    refused: {},
+    logins: 0,
+  }
+  log(`control: revocation ${state.revocation.id} armed (${status}) over ${state.revocation.revoked.size} token(s)`)
+  sendJson(res, 200, { revocation: publicRevocation(state.revocation) })
+}
+
+/* Disarm it, and answer with what it did. `?id=<n>` disarms it only while it is that arming, so a
+ * test whose cleanup runs late (after a jest timeout, say) cannot disarm a later test's revocation;
+ * with no id, whatever is armed is disarmed, which only the sweep after each test does. 200 either
+ * way, as a transport fault's disarm is: `cleared` says whether one was disarmed, and `revocation` is
+ * it with its final counts, or null. An id that is not a number names no arming, as for a fault. The
+ * tokens it refused are good again. */
+function handleControlClearRevocation (req, res, params, query) {
+  const id = query.get('id')
+  const armed = state.revocation
+  if (armed == null || (id != null && armed.id !== Number(id))) {
+    if (armed != null) log(`control: revocation ${armed.id} left armed by a disarm naming id ${id}`)
+    sendJson(res, 200, { cleared: false, revocation: null })
+    return
+  }
+  const revocation = publicRevocation(armed)
+  state.revocation = null
+  log(`control: revocation ${revocation.id} cleared (refused ${JSON.stringify(revocation.refused)}, ${revocation.logins} login(s) while armed)`)
+  sendJson(res, 200, { cleared: true, revocation })
+}
+
+/* `GET /__control__/calls/log[?operation=][&since=]`: the provider calls logged after `since` (a
+ * `seq`), optionally of one operation, oldest first. */
+function handleControlCallLog (req, res, params, query) {
+  const since = Number(query.get('since') || 0)
+  const operation = query.get('operation')
+  sendJson(res, 200, {
+    lastSeq: state.nextCallSeq,
+    calls: state.callLog.filter((call) => call.seq > since && (operation === null || call.operation === operation)),
+  })
+}
+
+/* Disarm a key: its status scenario and its transport fault, with every connection the fault still
+ * holds or stalls. `?id=<n>` disarms only whichever of the two is that arming, while it is (the ids
+ * come from one counter, so it is at most one of them), so a late cleanup cannot disarm a later
+ * test's scenario or fault on the key. An id that is not a number names no arming, as for a fault
+ * (src/mock-faults). 200 either way: `cleared` says whether the scenario was disarmed, `fault` is the
+ * fault disarmed, with its final count, or null. */
+function handleControlClearScenario (req, res, params, query) {
+  const raw = query.get('id')
+  const id = raw == null ? undefined : Number(raw)
+  const scenario = Object.prototype.hasOwnProperty.call(state.scenarios, params.key) ? state.scenarios[params.key] : null
+  const cleared = scenario != null && (id === undefined || scenario.id === id)
+  if (cleared) delete state.scenarios[params.key]
+  const fault = faults.disarm(params.key, id)
+  if (cleared) log(`control: scenario '${params.key}' (id ${scenario.id}) cleared`)
+  else if (scenario != null) log(`control: scenario '${params.key}' (id ${scenario.id}) left armed by a disarm naming id ${raw}`)
+  sendJson(res, 200, { cleared, scenarios: Object.keys(state.scenarios), fault })
 }
 
 function handleControlReset (req, res) {
+  faults.reset()
   state = freshState()
   log('state reset')
   sendJson(res, 200, { ok: true })
@@ -2047,17 +2311,18 @@ const routes = [
   ['GET', /^\/health$/, (req, res) => sendJson(res, 200, { status: 'ok' })],
 
   /* Provider endpoints, at the paths `AntechV6Endpoints` declares — appended to the provider
-   * configuration's baseUrl with no prefix of their own. */
-  ['POST', /^\/Users\/v6\/Login$/, handleLogin],
-  ['GET', /^\/LabResults\/v6\/GetStatus$/, handleGetStatus],
-  ['GET', /^\/LabResults\/v6\/GetAllResults$/, handleGetAllResults],
-  ['GET', /^\/LabResults\/v6\/OrphanResults$/, handleOrphanResults],
-  ['POST', /^\/LabResults\/v6\/AckStatus$/, handleAckStatus],
-  ['GET', /^\/Master\/v6\/GetSpeciesBreed$/, handleSpeciesBreed],
-  ['GET', /^\/Tests\/v6$/, handleTestGuide],
-  ['GET', /^\/HTPDF\/trf\/pims\/(?<clinicAccessionId>[^/]+)$/, handleTrf],
-  ['POST', /^\/LabOrders\/v6\/PreOrderPlacement$/, handlePreOrderPlacement],
-  ['POST', /^\/LabOrders\/v6\/Order$/, handleOrderPlacement],
+   * configuration's baseUrl with no prefix of their own. The fourth field names the operation the
+   * call log records, as `GET /__control__/calls` names its counters. */
+  ['POST', /^\/Users\/v6\/Login$/, handleLogin, 'login'],
+  ['GET', /^\/LabResults\/v6\/GetStatus$/, handleGetStatus, getStatusOperation],
+  ['GET', /^\/LabResults\/v6\/GetAllResults$/, handleGetAllResults, 'getAllResults'],
+  ['GET', /^\/LabResults\/v6\/OrphanResults$/, handleOrphanResults, 'orphanResults'],
+  ['POST', /^\/LabResults\/v6\/AckStatus$/, handleAckStatus, 'ackStatus'],
+  ['GET', /^\/Master\/v6\/GetSpeciesBreed$/, handleSpeciesBreed, 'speciesBreed'],
+  ['GET', /^\/Tests\/v6$/, handleTestGuide, 'testGuide'],
+  ['GET', /^\/HTPDF\/trf\/pims\/(?<clinicAccessionId>[^/]+)$/, handleTrf, 'trf'],
+  ['POST', /^\/LabOrders\/v6\/PreOrderPlacement$/, handlePreOrderPlacement, 'preOrderPlacement'],
+  ['POST', /^\/LabOrders\/v6\/Order$/, handleOrderPlacement, 'orderPlacement'],
 
   /* Control plane. Host-facing only; the integration never sees these. */
   [
@@ -2098,6 +2363,7 @@ const routes = [
       }),
   ],
   ['GET', /^\/__control__\/calls$/, (req, res) => sendJson(res, 200, { ...state.calls, maxLabAccessionIdsInOneAck: state.maxLabAccessionIdsInOneAck })],
+  ['GET', /^\/__control__\/calls\/log$/, handleControlCallLog],
   [
     'GET',
     /^\/__control__\/tokens\/(?<token>[^/]+)$/,
@@ -2107,6 +2373,8 @@ const routes = [
         /* So a scenario can prove the token string-built into a pre-order's submissionUri came out
          * of a real login rather than being invented somewhere in the chain. */
         userId: state.tokens.get(params.token)?.userId ?? null,
+        /* Whether an armed revocation refuses it (load-bearing detail 10). */
+        revoked: isRevoked(params.token),
       }),
   ],
   ['GET', /^\/__control__\/tokens$/, (req, res) => sendJson(res, 200, { count: state.tokens.size })],
@@ -2121,8 +2389,37 @@ const routes = [
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
   ['GET', /^\/__control__\/scenarios$/, handleControlListScenarios],
   ['DELETE', /^\/__control__\/scenarios\/(?<key>[^/]+)$/, handleControlClearScenario],
+  ['POST', /^\/__control__\/revocation$/, handleControlArmRevocation],
+  ['GET', /^\/__control__\/revocation$/, (req, res) => sendJson(res, 200, { revocation: publicRevocation(state.revocation) })],
+  ['DELETE', /^\/__control__\/revocation$/, handleControlClearRevocation],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
+
+/* Log a provider call as it arrives, and fill in its answer once the response is done (`close`
+ * fires whether the response finished or the connection went first; a call whose head was never
+ * written keeps a null status). Harness bookkeeping, read through GET /__control__/calls/log. */
+function logCall (req, res, url, params, operation) {
+  state.nextCallSeq += 1
+  const call = {
+    seq: state.nextCallSeq,
+    at: new Date().toISOString(),
+    method: req.method,
+    path: url.pathname,
+    operation: typeof operation === 'function' ? operation(url.searchParams) : operation,
+    clinicAccessionId: params.clinicAccessionId ?? url.searchParams.get('ClinicAccessionID') ?? null,
+    /* How many labOrder status polls the mock had answered when this call arrived. Two calls that
+     * carry the same number were made with no orders poll begun between them: within one poll. */
+    labOrderPolls: state.calls.getStatusLabOrder,
+    status: null,
+    retryAfter: null,
+  }
+  state.callLog.push(call)
+  if (state.callLog.length > MAX_CALL_LOG) state.callLog.splice(0, state.callLog.length - MAX_CALL_LOG)
+  res.on('close', () => {
+    call.status = res.headersSent ? res.statusCode : null
+    call.retryAfter = res.getHeader('retry-after') ?? null
+  })
+}
 
 const server = http.createServer(async (req, res) => {
   let url
@@ -2134,13 +2431,14 @@ const server = http.createServer(async (req, res) => {
   }
   const pathname = url.pathname.replace(/\/+$/, '') || '/'
 
-  for (const [method, pattern, handler] of routes) {
+  for (const [method, pattern, handler, operation] of routes) {
     if (req.method !== method) continue
     const match = pattern.exec(pathname)
     if (match == null) continue
     const params = Object.fromEntries(
       Object.entries(match.groups || {}).map(([key, value]) => [key, decodeURIComponent(value)]),
     )
+    if (operation !== undefined) logCall(req, res, url, params, operation)
     try {
       await handler(req, res, params, url.searchParams)
     } catch (error) {

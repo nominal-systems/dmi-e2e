@@ -13,6 +13,6 @@
     "noEmit": true,
     "allowJs": true
   },
-  "include": ["src/**/*.ts", "scenarios/**/*.ts"],
+  "include": ["src/**/*.ts", "scenarios/**/*.ts", "src/mock-faults/index.js"],
   "exclude": ["node_modules"]
 }

@@ -97,16 +97,24 @@ services:
   # inline (a one-line COPY) rather than bind-mounted so the image is self-contained on any host, and
   # it needs no GHP_TOKEN. `orderingBaseUrl`/`resultBaseUrl` in the dmi-api provider config point at
   # this service's compose-network name, never at live *.vetconnectplus.com.
+  #
+  # The transport faults the mocks share (src/mock-faults) come in as a second, named build context
+  # and land beside the server, as `../mock-faults` from it, the path it requires in the repo too.
+  # A named context rather than `context: ./src`, so the image is built from exactly the two
+  # directories it runs (compose ≥ 2.17, as the engine image's build already needs).
   idexx-mock:
     profiles: ['idexx']
     build:
       context: ./src/idexx-mock
+      additional_contexts:
+        mock-faults: ./src/mock-faults
       dockerfile_inline: |
         FROM node:20-alpine
         WORKDIR /app
-        COPY server.js ./
+        COPY server.js ./idexx-mock/
+        COPY --from=mock-faults index.js ./mock-faults/
         EXPOSE 3000
-        CMD ["node", "server.js"]
+        CMD ["node", "idexx-mock/server.js"]
     environment:
       PORT: '3000'
     ports:
@@ -137,6 +145,12 @@ services:
       # The integration's own default, set here so that the overlapping-polls test, whose held
       # answer has to come inside it, reads the same value instead of repeating the default.
       IDEXX_HTTP_TIMEOUT_MS: '${HARNESS_IDEXX_HTTP_TIMEOUT_MS:-30000}'
+      # The create POST's own timeout, dialled down from the integration's 80 s to under the 10 s
+      # dmi-api waits for the engine here (src/env.ts), so that a create held past it fails at the
+      # integration, naming its timeout, before dmi-api gives up on the RPC. A create to the mock
+      # answers in milliseconds, so nothing else in the loop comes near it. It differs from
+      # IDEXX_HTTP_TIMEOUT_MS, so the error says which of the two the create waited for.
+      IDEXX_CREATE_ORDER_TIMEOUT_MS: '${HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS:-5000}'
       # How long the results poll lock lasts as first taken. Shorter than the overlapping-polls
       # test holds a poll in flight (three poll intervals), so the lock would run out under that
       # poll: only a lock that is extended while its poll runs still keeps the other replica out.
@@ -219,12 +233,16 @@ services:
     profiles: ['antech-v6']
     build:
       context: ./src/antech-v6-mock
+      # The transport faults the mocks share, beside the server, as for idexx-mock above.
+      additional_contexts:
+        mock-faults: ./src/mock-faults
       dockerfile_inline: |
         FROM node:20-alpine
         WORKDIR /app
-        COPY server.js ./
+        COPY server.js ./antech-v6-mock/
+        COPY --from=mock-faults index.js ./mock-faults/
         EXPOSE 3000
-        CMD ["node", "server.js"]
+        CMD ["node", "antech-v6-mock/server.js"]
     environment:
       PORT: '3000'
     ports:

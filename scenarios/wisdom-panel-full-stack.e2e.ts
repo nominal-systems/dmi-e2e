@@ -141,6 +141,15 @@ const KIT_PROBE_PENDING = 'WPKIT-P006'
 const KIT_BATCH_BEFORE = 'WPKIT-P007'
 const KIT_BATCH_NAMELESS_OWNER = 'WPKIT-P008'
 const KIT_BATCH_AFTER = 'WPKIT-P009'
+/* The token-revocation tripwire's two provider-side kits: one that becomes an order before the
+ * revocation and gets its result set after it (the results feed), and one activated after it (the
+ * kits feed). */
+const KIT_REVOCATION_RESULT = 'WPKIT-P010'
+const KIT_REVOCATION_ORDER = 'WPKIT-P011'
+/* A kit code the mock does not hold, for the activation its revocation refuses: the bearer check
+ * comes first, so a revocation that failed to refuse the call would be answered with the unknown
+ * kit's WIS_VOY__105 instead, and the assertion would name it. */
+const KIT_NOT_HELD = 'WPKIT-NOT-HELD'
 
 /* A hospital the seeded integration is not configured for. The mock holds its kits and its feeds
  * scope them away, which is what the negative below proves. */
@@ -255,8 +264,21 @@ interface MockCall {
   accept: string | null
   authorization: string | null
   body: any
+  /* The status the mock answered with. */
+  status: number | null
   /* On a kits-feed request: the kits that page served, in its order. */
   servedKitIds?: string[]
+}
+
+/* The mock's token revocation, as its control plane lists it (the mock's header, load-bearing
+ * detail 5): the arming's id, how many tokens it refuses (with a 401), the calls it refused per
+ * endpoint, and the logins made while it was armed. */
+interface Revocation {
+  id: number
+  armedAt: string
+  revokedTokens: number
+  refused: Record<string, number>
+  logins: number
 }
 
 interface MockCallLog {
@@ -264,6 +286,7 @@ interface MockCallLog {
   fetches: { simplified: Record<string, number>, pdf: Record<string, number> }
   tokens: string[]
   acceptBearers: boolean
+  revocation: Revocation | null
   lastSeq: number
   calls: MockCall[]
 }
@@ -522,6 +545,35 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
     )
   }
 
+  /* Revoke every token the mock has issued so far, refused with a 401; the tokens later logins issue
+   * are accepted. The answer carries the arming's id, for its disarm. */
+  async function armRevocation (): Promise<Revocation> {
+    return expectOk<{ revocation: Revocation }>(
+      await mock.post('/__control__/revocation', {}),
+      'revoke the tokens the mock has issued',
+    ).revocation
+  }
+
+  async function revocationNow (): Promise<Revocation | null> {
+    return expectOk<{ revocation: Revocation | null }>(
+      await mock.get('/__control__/revocation'),
+      'read the revocation at the mock',
+    ).revocation
+  }
+
+  /* Disarm the revocation armed as `id`, and return what it did: null once that arming is no longer
+   * the one armed (disarmed already, or a later test armed its own). By id, so that a disarm that
+   * runs late, from a `finally` jest reaches after the test timed out, cannot take the next test's
+   * revocation. `null` disarms whatever is armed, and is for the sweep after each test alone. The
+   * tokens it refused are good again. Safe to call twice: each test disarms as soon as it is done
+   * with it, and again in its `finally`. */
+  async function disarmRevocation (id: number | null): Promise<Revocation | null> {
+    return expectOk<{ revocation: Revocation | null }>(
+      await mock.delete(id == null ? '/__control__/revocation' : `/__control__/revocation?id=${id}`),
+      id == null ? 'disarm whatever revocation is armed at the mock' : `disarm revocation ${id} at the mock`,
+    ).revocation
+  }
+
   /* The provider endpoints need a bearer and an `Accept` the mock's JSON:API half will take, so
    * the direct probes below go out over plain fetch rather than through the harness's ApiClient
    * (which always sends `Accept: application/json` — a 406 here, deliberately). */
@@ -658,6 +710,13 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
         mongo: { status: 'up' },
         activemq: { status: 'up' },
       })
+    })
+
+    it('the mock starts the run with nothing armed: every bearer accepted, no token revocation', async () => {
+      /* Both switches are listed until they are disarmed, so a run that inherited one from a warm
+       * rerun, or a mock that came up armed, is named here before any test can be confused by it. */
+      const log = await mockCalls()
+      expect({ acceptBearers: log.acceptBearers, revocation: log.revocation }).toEqual({ acceptBearers: true, revocation: null })
     })
 
     it('the wisdom-panel mock is reachable', async () => {
@@ -2336,11 +2395,12 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
    * response is to delete the marker, not to relax the assertion.
    *
    * Each is paired with a positive that proves the mechanism is live, and each cleans up in a
-   * `finally` so the tests after it are unaffected. Two of them POISON THE POLLS while they run, by
-   * making the mock refuse the engine's tokens, and a failed Bull job is retried three times with
-   * exponential backoff, so that backlog has to drain before anything else can be believed: the
-   * audit tripwire is followed by the test that proves the polls resume, and the
-   * re-authentication tripwire, which has nothing after it, comes LAST. */
+   * `finally` so the tests after it are unaffected. Three tests here POISON THE POLLS while they
+   * run, by making the mock refuse the engine's tokens, and a failed Bull job is retried three times
+   * with exponential backoff, so that backlog has to drain before anything else can be believed: the
+   * audit tripwire is followed by the test that proves the polls resume, the revocation's positive
+   * twin ends by proving the same, and the token-revocation tripwire, which has nothing after it,
+   * comes LAST. */
   describe('tripwires: behaviours the loop should have and does not', () => {
     it.failing('POST /admin/refs/sync/<provider> stores the reference data it fetched', async () => {
       /* EXPECTED: the admin ref sync fetches the provider's species/breeds/sexes (it does — the
@@ -2477,37 +2537,240 @@ describe('wisdom-panel full-stack (Wisdom Panel mock)', () => {
       expect((await mockCalls()).counters.login).toBe(loginsBefore)
     }, ORDER_WAIT_MS + 60_000)
 
-    it.failing('the integration re-authenticates when the provider stops accepting its token', async () => {
-      /* EXPECTED: a 401 from the provider makes the integration fetch a new token. ACTUAL: it never
-       * does — so a credential that is rotated or revoked at the vendor fails every call for up to
-       * TEN DAYS rather than recovering.
-       *
-       * `authenticate` caches the token per username for `expires_in * 0.25`, and the vendor's
-       * `expires_in` is 3 456 000 seconds — 40 days OBSERVED, so a 10-day cache — and nothing
-       * anywhere invalidates that entry on a 401. The mock reproduces the vendor's half faithfully:
-       * its revocation switch keeps the tokens it issued and simply stops accepting them, exactly
-       * as a revoked credential would, so a re-authentication would succeed and the loop would
-       * recover within one poll.
-       *
-       * Measured at the grant endpoint rather than in dmi-api, because the results path throws a
-       * plain `Error` that never reaches dmi-api as a provider error: the only observable is
-       * whether a new token was ever asked for. LAST, because the failing polls it provokes are
-       * retried three times each with exponential backoff and the backlog has to drain. */
-      const before = (await mockCalls()).counters.login
+    describe('a token Wisdom revokes (nominal-systems/dmi-engine-wisdom-panel-integration#53)', () => {
+      /* Both tests arm the revocation and disarm it in a `finally`, by the id its arming answered
+       * with, so a `finally` that runs late cannot disarm the next test's. A test that failed or
+       * timed out before its `finally` ran would leave the engine's token refused for every test
+       * after it, so after each one whatever is still armed (the revocation, or bearer acceptance
+       * switched off) is cleared and then named as a failure; jest reports a failing `afterEach` on
+       * the test it followed. */
+      afterEach(async () => {
+        const log = await mockCalls()
+        if (log.revocation != null) await disarmRevocation(null)
+        if (!log.acceptBearers) {
+          expectOk(await mock.post('/__control__/bearer', { accept: true }), 'restore bearer acceptance at the mock')
+        }
+        expect({ leftoverRevocation: log.revocation, acceptBearers: log.acceptBearers }).toEqual({
+          leftoverRevocation: null,
+          acceptBearers: true,
+        })
+      })
 
-      try {
-        expectOk(await mock.post('/__control__/bearer', { accept: false }), 'revoke bearer acceptance at the mock')
+      it('a revocation refuses the tokens issued before it on both feeds and at activation, accepts a token issued after it, and disarmed the polls resume', async () => {
+        /* The positive twin of the tripwire below, which cannot tell "never recovers" from "the
+         * revocation never reached the polls". The mock's revocation (its header, load-bearing
+         * detail 5) refuses the tokens issued before it and accepts every later one, as Wisdom did on
+         * 2026-11-23. Shown here: the worker's polls are refused on both feeds; the token this
+         * scenario minted at setup is refused in the vendor's JSON:API 401 while one minted now is
+         * accepted; an activation through dmi-api is refused with the sentence production logged for
+         * every activation of that outage (nominal-systems/dmi-engine-wisdom-panel-integration#53);
+         * and once the revocation is disarmed the polls are answered again. */
+        /* Both engine processes hold a token the revocation will refuse, as they do after any
+         * earlier test: the api process once it has read the service list, the worker once it has
+         * answered a poll of each feed. Done here so that the test does not depend on the ones
+         * before it: run on its own, the revocation could fall before a process's first login,
+         * which would then be accepted. */
+        await services()
+        const workerPolled = await pollUntil(
+          async () => {
+            const log = await mockCalls()
+            const polls = (path: string): number =>
+              log.calls.filter(
+                (call) =>
+                  call.path === path && call.status === 200 && call.query['filter[hospital_number]'] === env.wisdomPanel.hospitalNumber,
+              ).length
+            return { kits: polls('/api/v1/kits'), resultSets: polls('/api/v1/result-sets') }
+          },
+          (polled) => polled.kits >= 1 && polled.resultSets >= 1,
+          ORDER_WAIT_MS,
+          500,
+        )
+        expect({ kitsPolled: workerPolled.kits >= 1, resultSetsPolled: workerPolled.resultSets >= 1 }).toEqual({
+          kitsPolled: true,
+          resultSetsPolled: true,
+        })
 
-        const logins = await pollUntil(
-          async () => (await mockCalls()).counters.login,
-          (count) => count > before,
-          NEGATIVE_WAIT_MS,
+        const kitsUrl = `${env.wisdomPanel.mockBaseUrl}/api/v1/kits?filter%5Bhospital_number%5D=${PROBE_HOSPITAL_NUMBER}`
+        let revocation: Revocation | null = null
+        let polls: Revocation | null = null
+        let oldAnswer: { status: number, body: unknown } = { status: 0, body: null }
+        let newStatus = 0
+        let activation: { ok: boolean, status: number, errors: unknown } = { ok: true, status: 0, errors: null }
+        let disarmedAt = 0
+        const armed = await armRevocation()
+        try {
+          /* At least the worker's, the api process's and the setup probe's. */
+          expect(armed.revokedTokens).toBeGreaterThanOrEqual(3)
+
+          /* A disarm naming another arming's id leaves this one armed: what keeps a cleanup that runs
+           * late from disarming a later test's revocation. */
+          const byAnotherId = expectOk<{ cleared: boolean, revocation: Revocation | null }>(
+            await mock.delete(`/__control__/revocation?id=${armed.id + 1}`),
+            'disarm the revocation by an id it does not have',
+          )
+          const stillArmed = await revocationNow()
+          expect({ byAnotherId, stillArmed: stillArmed?.id }).toEqual({
+            byAnotherId: { cleared: false, revocation: null },
+            stillArmed: armed.id,
+          })
+
+          polls = await pollUntil(
+            revocationNow,
+            (now) => (now?.refused.kits ?? 0) >= 1 && (now?.refused.resultSets ?? 0) >= 1,
+            NEGATIVE_WAIT_MS,
+            500,
+          )
+
+          const old = await fetch(kitsUrl, { headers: { authorization: `Bearer ${probeToken}`, accept: '*/*' } })
+          oldAnswer = { status: old.status, body: await old.json() }
+          const freshToken = await mintProbeToken()
+          probeLogins += 1
+          newStatus = (await fetch(kitsUrl, { headers: { authorization: `Bearer ${freshToken}`, accept: '*/*' } })).status
+
+          const refused = await org.api.post('/orders', payloadFor(KIT_NOT_HELD))
+          console.log(
+            `[wisdom-panel-scenario] activation under revocation -> HTTP ${refused.status}: ${refused.text.slice(0, 400)}`,
+          )
+          activation = { ok: refused.ok, status: refused.status, errors: refused.body?.errors }
+
+          disarmedAt = (await mockCalls()).lastSeq
+          revocation = await disarmRevocation(armed.id)
+        } finally {
+          await disarmRevocation(armed.id)
+        }
+
+        expect({
+          kitsFeedRefused: (polls?.refused.kits ?? 0) >= 1,
+          resultSetsFeedRefused: (polls?.refused.resultSets ?? 0) >= 1,
+          refused: polls?.refused,
+        }).toEqual({ kitsFeedRefused: true, resultSetsFeedRefused: true, refused: polls?.refused })
+        expect(oldAnswer).toEqual({
+          status: 401,
+          body: { errors: [{ title: 'Permission Denied', detail: 'The access token is invalid', code: 401, status: '401' }] },
+        })
+        expect(newStatus).toBe(200)
+        expect(activation).toEqual({
+          ok: false,
+          status: activation.status,
+          errors: [
+            'Failed to create pet',
+            `Failed to POST ${env.wisdomPanel.baseUrl}/api/voyager/pet`,
+            'WIS_VOY__001: You do not have permission to access these records. Must have a valid token.',
+          ],
+        })
+        /* Refused once at activation; and the one login in the window is this test's own, though a
+         * fixed integration would add its own, so only the floor is pinned. */
+        expect({ activationRefused: revocation?.refused.createPet, loggedIn: (revocation?.logins ?? 0) >= 1 }).toEqual({
+          activationRefused: 1,
+          loggedIn: true,
+        })
+
+        /* Disarmed, the polls are answered again: a kits poll of the seeded hospital, after the
+         * disarm, answered 200. */
+        const resumed = await pollUntil(
+          async () =>
+            (await mockCalls({ path: '/api/v1/kits', method: 'GET', since: disarmedAt })).calls.filter(
+              (call) => call.query['filter[hospital_number]'] === env.wisdomPanel.hospitalNumber && call.status === 200,
+            ),
+          (calls) => calls.length > 0,
+          ORDER_WAIT_MS,
           1_000,
         )
-        expect(logins).toBeGreaterThan(before)
-      } finally {
-        expectOk(await mock.post('/__control__/bearer', { accept: true }), 'restore bearer acceptance at the mock')
-      }
-    }, NEGATIVE_WAIT_MS + 60_000)
+        expect({ kitsPollsAnswered200AfterTheDisarm: resumed.length > 0 }).toEqual({ kitsPollsAnswered200AfterTheDisarm: true })
+      }, NEGATIVE_WAIT_MS + ORDER_WAIT_MS + 60_000)
+
+      it.failing('the integration logs in again when the provider revokes its token, and both polls resume', async () => {
+        /* EXPECTED: when Wisdom refuses the token the engine holds with a 401, as it did from
+         * 2026-11-23 after a maintenance, the integration obtains a new one and both polls are read
+         * again: a kit activated at the provider after the revocation becomes an order (the kits
+         * feed), and a result set released for an older kit reaches dmi-api as a FINAL report (the
+         * result-sets feed). ACTUAL: no new token is ever asked for, so nothing is delivered for as
+         * long as the token stays refused — up to the ten days it is cached for. In production that
+         * lasted more than a day, until the engine was restarted.
+         *
+         * WHY: `authenticate` caches the token per username for `expires_in * 0.25`, and the vendor's
+         * `expires_in` is 3 456 000 seconds — 40 days OBSERVED, so a 10-day cache — and nothing
+         * anywhere removes that entry when a call is refused. And with the dmi-engine-common that
+         * dmi-engine resolves (1.7.0) the polls could not tell a refused token anyway: the logging
+         * interceptor hands the 401's body to `extractAccessionIds`, which calls `body.data.forEach`
+         * (kits) and `body.included.forEach` (result sets) on it, and the TypeError that replaces the
+         * 401 reaches the poll as a 500. A fix that reacts to a 401 therefore needs a dmi-engine-common
+         * release carrying nominal-systems/dmi-engine-common#33 as well. Tracked in
+         * nominal-systems/dmi-engine-wisdom-panel-integration#53, which discusses the fix (a shorter
+         * cache, a new login on a 401, or both); this test asserts the outcome, not either fix.
+         *
+         * The mock refuses the tokens issued before the revocation and accepts every later one, so a
+         * new login would recover the loop within a poll. The test before this one is its positive
+         * twin. LAST, because the polls it fails are retried three times each with exponential
+         * backoff and the backlog has to drain. */
+        const older = await provisionKit({
+          code: KIT_REVOCATION_RESULT,
+          hospitalNumber: env.wisdomPanel.hospitalNumber,
+          hospitalName: env.wisdomPanel.hospitalName,
+          veterinarianName: 'Kim Vet',
+          activated: true,
+          stage: 'processing',
+          acknowledged: false,
+          pet: { name: 'Bramble', sex: 'female', species: 'dog', ownerFirstName: 'Sam', ownerLastName: 'Poe' },
+        })
+        const olderOrder = await pollUntil(
+          async () => await orderByExternalId(older.id),
+          (order) => order !== undefined,
+          ORDER_WAIT_MS,
+          1_000,
+        )
+        if (olderOrder === undefined) {
+          throw new Error(`precondition: kit ${KIT_REVOCATION_RESULT} did not become an order before the revocation, so the polls were not running`)
+        }
+
+        let revocation: Revocation | null = null
+        let delivered: { orderStatus: unknown, reportStatus: unknown } = { orderStatus: undefined, reportStatus: undefined }
+        const armed = await armRevocation()
+        try {
+          const newer = await provisionKit({
+            code: KIT_REVOCATION_ORDER,
+            hospitalNumber: env.wisdomPanel.hospitalNumber,
+            hospitalName: env.wisdomPanel.hospitalName,
+            veterinarianName: 'Kim Vet',
+            activated: true,
+            stage: 'processing',
+            acknowledged: false,
+            pet: { name: 'Juniper', sex: 'female', species: 'dog', ownerFirstName: 'Sam', ownerLastName: 'Poe' },
+          })
+          await seedResultSet(KIT_REVOCATION_RESULT, { breeds: BREEDS, idealWeight: IDEAL_WEIGHT, notable: NOTABLE_NONE })
+
+          const relogin = await pollUntil(revocationNow, (now) => (now?.logins ?? 0) >= 1, NEGATIVE_WAIT_MS, 1_000)
+          expect({ loggedInAgain: (relogin?.logins ?? 0) >= 1, refused: relogin?.refused }).toEqual({
+            loggedInAgain: true,
+            refused: relogin?.refused,
+          })
+
+          const order = await pollUntil(
+            async () => await orderByExternalId(newer.id),
+            (found) => found !== undefined,
+            ORDER_WAIT_MS,
+            1_000,
+          )
+          const report = await pollUntil(
+            async () => await org.api.get(`/orders/${olderOrder.id}/report`),
+            (response) => response.body?.status === 'FINAL',
+            COMPLETION_WAIT_MS,
+            1_000,
+          )
+          delivered = { orderStatus: order?.status, reportStatus: report.body?.status }
+          revocation = await disarmRevocation(armed.id)
+        } finally {
+          await disarmRevocation(armed.id)
+        }
+
+        /* `processing` maps to PARTIAL. */
+        expect(delivered).toEqual({ orderStatus: 'PARTIAL', reportStatus: 'FINAL' })
+        expect({
+          kitsFeedRefused: (revocation?.refused.kits ?? 0) >= 1,
+          resultSetsFeedRefused: (revocation?.refused.resultSets ?? 0) >= 1,
+          loggedInAgain: (revocation?.logins ?? 0) >= 1,
+        }).toEqual({ kitsFeedRefused: true, resultSetsFeedRefused: true, loggedInAgain: true })
+      }, ORDER_WAIT_MS * 2 + NEGATIVE_WAIT_MS + COMPLETION_WAIT_MS + 60_000)
+    })
   })
 })

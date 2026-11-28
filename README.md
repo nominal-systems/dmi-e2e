@@ -65,7 +65,8 @@ That does the whole thing from a clean state:
    dependency reports up.
 5. Run the scenarios, one file at a time (`maxWorkers: 1`): they share one database, one event
    stream and one `seq` counter, and must not race.
-6. Stop dmi-api and `docker compose down -v`.
+6. Stop dmi-api (and any dmi-api a scenario started again; see "Service control") and
+   `docker compose down -v`.
 
 Faster iteration:
 
@@ -88,7 +89,10 @@ job from an earlier run could race a later run for its results. Each loop's scen
 integration it started in `afterAll`, which removes its jobs. If a run is interrupted before that,
 `docker compose --profile <loop> down -v` clears Redis (outside a slot tree, in slot n add
 `-p dmi-e2e-s<n>`; see "Parallel runs — slots" below). A run without `HARNESS_KEEP_UP` tears Redis
-down every time, so it is never affected.
+down every time, so it is never affected. A container a killed run's scenario had paused (see
+"Service control") is unpaused before the next run starts its containers, since `compose up` refuses
+a paused one, and setup does not go on until every container of the project is running. A Mongo
+failpoint a killed run left armed is turned off the same way, before dmi-api starts.
 
 ### Parallel runs — slots
 
@@ -290,7 +294,10 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   own sibling checkouts (the engine's Dockerfile would install the published packages instead) and
   both loaded, as in production — a boot-time incompatibility between them fails this loop too.
   Plus dmi-api + ActiveMQ + Redis + the **antech-v6 mock** (`src/antech-v6-mock`), behind the
-  `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`.
+  `antech-v6` compose profile. Runs `scenarios/antech-v6-full-stack.e2e.ts`. Its last describe
+  restarts the engine's worker with Redis stopped: the worker must exit with code 1, naming every
+  queue it could not initialize, which the engine services' `restart: on-failure` relies on, and must
+  be polling again once Redis is back ([dmi-engine#68](https://github.com/nominal-systems/dmi-engine/pull/68)).
   In November 2026 production twice saw Antech V6 return records the integration had already
   acknowledged, unchanged, on every poll and on both feeds, while answering every `AckStatus` 200,
   until it stopped by itself: the same results from `GetAllResults`, and the same orders from the
@@ -318,6 +325,53 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   order itself is one `order:updated`, stored with the form fetched for it, however often the
   changed order is re-offered after; and once the redelivery stops, both records stay off the
   feeds.
+  The mock can also stop accepting the tokens it has issued while its login keeps working, as Wisdom
+  Panel did after a maintenance in November 2026 (load-bearing detail 10 in its header).
+  `POST /__control__/revocation` with `{status}` (401 if left out) refuses every token issued before
+  it, on every endpoint that takes one, in the envelope that endpoint answers a token it does not
+  take with, at that status (`/Tests/v6` answers with its own 404 whatever the status), and accepts
+  every token a later login issues. It counts the calls it refused, per operation, and the logins it
+  saw, and it is listed with those counts, on `GET /__control__/revocation` and beside the error
+  scenarios on `GET /__control__/scenarios`, until `DELETE /__control__/revocation?id=<id>` disarms
+  it and answers with the final counts. Arming it answers with its `id`, from the counter the
+  transport faults' ids come from, and a disarm by id disarms it only while that arming is the one
+  armed, answering `cleared: false` and `revocation: null` otherwise, so a test whose cleanup runs
+  late (after a jest timeout) cannot disarm a later test's revocation; with no id it disarms
+  whatever is armed, which only the sweeps after each test do. Disarming makes the refused tokens
+  good again: the integration caches a token for 12 hours in each engine process, and a test that
+  ended with one still held would leave the polls failing for the rest of the run. With it, the
+  loop shows that a placement whose cached token is refused with a 401 logs in again and goes
+  through, and that a refusal answered 500 makes nothing log in; and it pins, as a tripwire, that
+  the two polls do not recover
+  ([dmi-engine-antech-v6-integration#95](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/95)).
+  Arming an error scenario answers with its `id`, from the same counter (`scenario.id`), and
+  `DELETE /__control__/scenarios/<key>?id=<id>` disarms whichever of the key's scenario and
+  transport fault is that arming, and nothing else: `cleared` says whether it was the scenario,
+  `fault` whether it was the fault. Without an id it disarms both, as the sweeps after each test do.
+  An error scenario answering 429 or 503 can carry a `Retry-After` header (`retryAfter` on
+  `POST /__control__/scenarios`: whole seconds, or a string sent as it is, such as an HTTP date);
+  whether Antech ever sends one is not known. `GET /__control__/calls/log` lists each provider call
+  as it arrived (`?operation=`, `?since=`): when, its operation and accession, how many labOrder
+  status polls had been answered before it, and the status and `Retry-After` it was answered with.
+  The loop uses the two to show that the integration's HTTP layer honours the header
+  ([dmi-engine-common#27](https://github.com/nominal-systems/dmi-engine-common/pull/27)): a one-shot
+  503 with `Retry-After: 2` on an order form is retried about two seconds later, within the same
+  poll, rather than after the default 100 ms, and the form the retry fetched is the one dmi-api
+  stores. Each test that arms the revocation or a `Retry-After` disarms it in a `finally`, by its
+  id, and checks from the counts or the call log that it fired, the describes they are in check after each
+  test that nothing is left armed (as the refusals' describe does for its one-shot answers), and the
+  run begins by asserting that nothing is.
+  The mock also takes transport faults (see "Transport faults in the mocks") on two keys:
+  `getStatus`, the status feed, whose labOrder call is the orders poll's first, and `placeOrder`,
+  the order endpoint; they are listed as `faults` beside the scenarios and the revocation on
+  `GET /__control__/scenarios`. A status poll held past the integration's 60 s HTTP timeout
+  ([dmi-engine-antech-v6-integration#70](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/pull/70))
+  is given up on at 60 s and asked again within a second (dmi-engine-common's one retry), and an
+  order placed meanwhile is delivered; without the timeout the held answer would simply come late.
+  That test holds the poll 62 s, and is most of what it costs the loop. A placement held past the
+  10 s dmi-api waits for the engine, which the provider then completes, is a tripwire for
+  [dmi-api#365](https://github.com/nominal-systems/dmi-api/issues/365), beside a placement held
+  3 s that is placed as usual.
 - **`wisdom-panel`** — the loop for **Wisdom Panel** (provider id `wisdom-panel`), pet DNA: an
   "order" activates a physical kit the clinic already holds, there is no test catalogue and no
   cancel, and a result is breed percentages, an ideal-weight estimate, genetic health findings and a
@@ -355,6 +409,30 @@ engine over MQTT) against a real provider loop. Which loop is picked by `HARNESS
   served (`servedKitIds`), so a scenario can prove which kits travelled in one batch. The loop uses
   both to assert that one order dmi-api cannot save costs only that order
   ([dmi-api#411](https://github.com/nominal-systems/dmi-api/issues/411)).
+  The mock refuses bearers in two ways (load-bearing detail 5 in its header).
+  `POST /__control__/bearer {"accept": false}` refuses every bearer, the tokens issued already and
+  any a login issues meanwhile, with a 401, and switched back on it accepts the same tokens again: a
+  vendor that refuses whatever it is shown. The audit tripwire uses it, and the test after it shows
+  the polls resuming with no new login. `POST /__control__/revocation`, with an empty body, refuses
+  only the tokens issued before it, with a 401, and accepts every later one, which is what Wisdom
+  did from 2026-11-23
+  ([dmi-engine-wisdom-panel-integration#53](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/53)):
+  the feeds answer with JSON:API's 401, and the voyager endpoints with the
+  `WIS_VOY__001: You do not have permission to access these records. Must have a valid token.` 401
+  production logged for every activation of that outage. It counts the calls it refused, per
+  endpoint, and the logins it saw, and it is listed with those counts, on
+  `GET /__control__/revocation` and on the call log, until `DELETE /__control__/revocation?id=<id>`
+  disarms it and answers with the final counts. As on the antech-v6 mock, arming it answers with its
+  `id`, a disarm by id takes it only while that arming is the one armed, and with no id, which only
+  the sweep after each test uses, whatever is armed. Disarming makes the refused tokens good again:
+  the integration caches its token for ten days. Each call-log entry records the status it was
+  answered with. The loop shows the revocation refusing both feeds and an activation and accepting
+  a token issued after it, and pins, as a tripwire, that the integration never logs in again, so
+  that neither feed is read until the revocation is lifted. The revocation always refuses with 401, and takes no options: a
+  body that names any, a `status` say, is refused with a 400 naming what it takes. No test here
+  stages another status, because nothing the integration does today depends on it (it logs in again
+  on none, and with dmi-engine-common 1.7.0 its polls see a 500 whatever the vendor answered); a
+  status option comes with the first test that needs another.
 
 ```bash
 # idexx (default): builds the mock image (no token) + the idexx integration image (needs a GitHub
@@ -413,7 +491,36 @@ the next ticks fall due meanwhile — and with the held poll occupying its repli
 the other replica can take them — and the batch must still be fetched once and confirmed once, with
 one `report:updated` for it. Compose also gives the integration's results poll lock a lifetime shorter
 than that hold (`HARNESS_IDEXX_RESULTS_LOCK_TTL_MS`), so the test fails as well on a lock that is not
-extended while its poll runs.
+extended while its poll runs. Before it, one `describe` fails one IDEXX call of a placement at a time
+with a transport fault (see "Transport faults in the mocks"):
+[dmi-engine-idexx-integration#81](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/81)'s
+create timeout, with a create held past it (`HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS`), and its manifest
+fetch that no longer fails the create;
+[dmi-engine-idexx-integration#83](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/83)'s
+named transport errors, with a create reset or stalled and a device list cut short after its headers;
+a failed confirm step that still reports the created order, `WAITING_FOR_INPUT` with IDEXX's id, as
+[dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)
+decided; a failed results confirm, whose batch a
+later poll delivers again and confirms, and which the PIMS sees as one `report:updated`
+([dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409)); and
+[dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s
+tripwire, an order the confirm submitted whose manifest fetch after it fails. A describe of its own,
+after the loop's, takes the stack's services away from under an integration of its own (see
+"Service control" below), each test pinning a merged change: with Redis frozen, the integration
+answers a restart with its failure within seconds instead of not at all, and polling resumes once
+Redis answers (dmi-engine-idexx-integration#74); after Redis is flushed, dmi-api's
+`ensure-integration-status` brings polling back, retrying an integration
+whose engine missed its first attempt (dmi-api#346); and after a broker restart, device lookups and
+order placement get their replies again, at worst after one timeout, including two lookups in flight
+at once (dmi-api#367). Its last test sends dmi-api a SIGTERM with a device lookup held in flight at
+the mock: the lookup gets its answer after dmi-api has stopped taking connections, and dmi-api exits
+within `SHUTDOWN_TIMEOUT_MS` and is started again
+([dmi-api#399](https://github.com/nominal-systems/dmi-api/pull/399)). Which way it exits is not
+asserted, and every run so far has had the same one: at the deadline, with code 1, about 10 s after
+the signal, the lookup answered at about 6.9 s. The lookup's keep-alive connection is busy when the
+shutdown begins, so it is not among the idle connections the server closes then, and the server's
+close waits on it until the deadline. Sent with `Connection: close`, the same lookup lets dmi-api
+exit by the signal about 20 ms after its answer; with nothing in flight it exits at about 4 s.
 
 **The antech-v3 loop closes end to end**, the same way and with the same guarantees: `POST /orders` →
 the integration logs in to the mock and places the order (`External/OrderPlacement`) → its results
@@ -524,7 +631,18 @@ closely enough for the real integration to drive it unmodified:
   scenario pins the empty device list at the control plane instead.
 - **confirmOrder handshake**: `POST /order` returns a `uiURL` that points back at the mock; the mock
   serves that HTML page (setting a cookie), then accepts the follow-up XHR `GET`/`PUT` the
-  integration issues to submit the order.
+  integration issues to submit the order. The `PUT` answers with the order's `pdfURL`, which the
+  integration fetches once more after the submission. Whether the live confirm answers with one has
+  not been probed here.
+- **Manifest**: the create answer carries a `pdfURL` in IDEXX's shape, `/api/v1/pdf/<order id>?token=
+  <token>&orderId=<order id>`, pointing back at the mock, and the mock serves the order's form there
+  as a real PDF (synthetic text naming the order). Like every ordering call it needs HTTP Basic, and
+  the token must be the order's: a URL rebuilt without it is answered 404, like an unknown order (a
+  body of the mock's own; IDEXX's answer to a bad token has not been seen). So every placement runs
+  the integration's manifest fetch: once after the create, and with autoSubmitOrder once more after
+  the confirm. `GET /__control__/orders/<requisition>` reports the order's `pdfURL`, the order's status
+  at each fetch the mock answered (`manifestFetches`) and the SHA-256 of the PDF (`pdfSha256`), so a
+  test can tell which fetches ran and that dmi-api stored these bytes.
 - **Results** (`/api/v3/*`): the latest-results batch poll, its `confirm/:batchId` ack, and search.
   A batch stays on the poll until it is confirmed — a result that arrives meanwhile joins the next
   batch, formed after the confirm, as IDEXX's spec has each batch acknowledged before the next can be
@@ -540,6 +658,20 @@ closely enough for the real integration to drive it unmodified:
   The `resultsLatestDelay` scenario (`{ delayMs, once }`) holds the next poll answer that carries a
   batch for `delayMs`, its content fixed on arrival, and the ledger counts the polls that reached
   the mock meanwhile: it is how the loop puts two polls of one integration in flight at once.
+  `GET /__control__/scenarios` lists everything armed — the status scenarios (with `hits`; a `once`
+  scenario leaves the list when it is used) and the transport faults — and
+  `DELETE /__control__/scenarios/<key>` disarms one key. The status-scenario keys are
+  `authValidate`, `createOrder`, `resultsLatest`, `ivlsDevices` and `resultsLatestDelay`; a scenario
+  on any other key is refused.
+- **Transport faults** (see "Transport faults in the mocks" below) are armed on `createOrder`, the
+  three steps of the handshake above (`uiPage` the UI page, `uiOrderGet` the order setup,
+  `uiOrderPut` the submission), `manifest` (the PDF), `ivlsDevices` and `resultsConfirm`. A confirm a
+  fault takes never reaches the batch, which stays the one being served, and the batch ledger
+  records only the confirms the route answered. `resultsLatestDelay` stays a scenario of its own
+  rather than a `hold`: it waits for
+  the first answer that carries a batch, letting empty polls through, and the batch ledger counts
+  the polls that reach the mock while it holds. The dmi-engine-idexx-integration#88 test reads both.
+  A `hold` on a route takes its next request, whatever the answer.
 
 All of the mock's canned data is **synthetic** — invented values shaped like IDEXX responses, never
 captured clinic/patient data — and the mock never authenticates for real (the integration's dummy
@@ -652,6 +784,74 @@ invented. It never authenticates for real, and it builds the `link href`s it adv
 request's own `Host` header, so even the URLs the integration POSTs back to resolve to the mock rather
 than anywhere real.
 
+### Transport faults in the mocks
+
+A status scenario answers a call with the wrong thing. Some failures are not an answer at all: the
+answer comes late, the connection closes with no answer, or the headers arrive and the body never
+finishes. `src/mock-faults/index.js` stages those three, and every mock that wires it stages them
+the same way. It is zero-dependency CommonJS like the mocks. Each mock image copies it beside its
+server through a second named build context (`additional_contexts: mock-faults` in
+docker-compose.yml), so the server requires it as `../mock-faults` in the repo and in the image alike.
+
+A fault is armed on one of the mock's **route keys** over the control route its status scenarios
+use, for the next `times` requests to that route (default 1). After those the route answers as
+usual again. The model is the Mongo failpoint in `src/mongo.ts`: one target, a number of attempts,
+and a count of what it hit, read back to prove the fault fired.
+
+| `fault` | Options | What the mock does | What a Node client sees (Node 20, axios on `http`) |
+|---|---|---|---|
+| `hold` | `delayMs` (required, ≤ 10 min) | Runs the route's handler on arrival, so its answer and whatever else it does (an order created, a scenario used up) are fixed then, and sends the answer `delayMs` later. | The answer, late. A client whose timeout is shorter gives up first and gets nothing. |
+| `reset` | `close`: `rst` (default) or `fin` | Never runs the route. Once the request has arrived whole, closes the connection with no response: a TCP RST (`socket.resetAndDestroy()`), or a plain FIN (`socket.destroy()`). | `rst`: `ECONNRESET`, "read ECONNRESET". `fin`: `ECONNRESET`, "socket hang up". The same for GET and POST, with keep-alive or without. |
+| `stall` | `bytes` (default 0), `capMs` (default 120 s, ≤ 10 min) | Runs the route's handler on arrival, sends its status line and headers and the first `bytes` bytes of its body (never all of it: the headers still announce its full length), then nothing. After `capMs` the connection is closed. | A response whose body never completes. Its own timeout fires, or, at `capMs`, the body is cut short. axios 1.17 reports both alike, with the response attached: `ERR_BAD_RESPONSE`, "stream has been aborted", not a timeout. |
+
+```
+POST   /__control__/scenarios           {"key": "createOrder", "fault": "hold", "delayMs": 15000}
+                                         -> {"ok": true, "key": "createOrder", "fault": {"id": 7, ...}}
+GET    /__control__/scenarios           -> {"scenarios": {...}, "faults": {"createOrder": {...}}}
+DELETE /__control__/scenarios/<key>?id=<id>   -> {"scenario": null, "fault": {... its final count ...}}
+POST   /__control__/reset
+```
+
+A fault reads back as `{id, fault, <its options>, times, hits, remaining, open, requests}`. `requests`
+lists, in arrival order, each request it took: its `outcome` and the milliseconds from arrival to
+it (`ms`, null while open). The outcomes are `held` and `stalled` (still open), `answered` (a hold
+sent its answer), `client-closed` (the client closed the connection first, e.g. on its own
+timeout), `capped` (a stall reached `capMs`), `destroyed` (disarmed or reset while open), and
+`reset`. A fault stays listed once it is used up, with that record, until it is disarmed. Options
+a fault does not take, and keys the mock does not have, are refused with a 400 naming the allowed
+ones.
+
+**Nothing leaks into the next test.**
+
+- Disarming a key (`DELETE`) and `POST /__control__/reset` destroy every connection its fault still
+  holds or stalls. The client sees the request fail; it never gets a late answer.
+- Every open connection also has its own end: a hold's `delayMs`, a stall's `capMs`.
+- `DELETE …?id=<id>` disarms the fault only while it is that arming, so a cleanup that runs late
+  (after a jest timeout) cannot disarm the next test's fault on the same key. The ids come from one
+  counter per mock that never restarts while it runs, not on `POST /__control__/reset` either, so an
+  id never comes back.
+- This covers the module's faults only. The idexx mock's older `resultsLatestDelay` scenario is not
+  one of them: it holds one results answer for its `delayMs` and ends by itself, it is not listed
+  among the faults, and neither `POST /__control__/reset` nor the key's `DELETE` ends a hold already
+  in progress, whose answer can still go out after the test that armed it has ended.
+
+A scenario that arms a fault disarms it in a `finally` with its id. It then asserts the count the
+`DELETE` returns: a fault that never fired fails the test. A `describe` that arms faults asserts at
+its start that nothing is armed, and after each test, that the test left nothing armed.
+
+**Wiring it into a mock** is three things:
+
+- `const faults = createFaults({ keys, log })`;
+- `if (faults.intercept('<key>', req, res)) return` as the first line of each route's handler;
+- the control routes above calling `faults.arm`, `faults.list`, `faults.disarm` and `faults.reset`;
+  and `faults.nextArmingId()` for any switch of the mock's own that is disarmed by id the same way
+  (the antech-v6 mock's status scenarios and its token revocation), so that no two armings in a mock
+  share an id.
+
+`intercept` answers true only for a reset, which has taken the request. For a hold or a stall the
+handler answers as it always does, and the module sends that answer late or in part. A key is wired
+only together with a test that arms a fault on it. Which keys each mock has is in its own section.
+
 ### The MQTT broker
 
 The harness broker is **`eclipse-mosquitto:2`**, not ActiveMQ. dmi-api and the provider integrations
@@ -663,6 +863,79 @@ the loop can't close. Mosquitto routes shared subscriptions for both MQTT 3.1.1 
 compose service is still named `activemq` so all `ACTIVEMQ_*` / `MQTT_HOST` configuration is
 unchanged, and dmi-api's `activemq: up` health check (a generic MQTT ping) still passes, so the fast
 suite is unaffected.
+
+### Service control: the broker, Redis, an engine or dmi-api taken away mid-run
+
+A scenario can take one service of its own stack away and put it back, to test what happens while
+it is gone and after it returns. `src/services.ts` stops, starts, pauses, unpauses or restarts a
+compose service of the run's project — the broker (`activemq`), `redis`, an engine container —
+flushes Redis, and stops dmi-api with a signal and starts it again (`src/dmi-api.ts` keeps the
+processes).
+The Mongo failpoint (`src/mongo.ts`) is the model: a fault is scoped to one target, the harness
+undoes it, and it reports what it reached, so a test asserts that it fired.
+
+```ts
+const faults = serviceFaults()                    // this test's controls
+let paused: Disruption
+try {
+  paused = await faults.pause(REDIS)              // or stop(), restart(), flushRedis()
+  /* … the test, with Redis frozen … */
+} finally {
+  await faults.restore(REDIS)
+}
+expect(paused.containers).toEqual([`${env.composeProject}-redis-1`])
+```
+
+- **Only this run's containers.** Every operation goes through the harness's own compose invocation
+  (`compose()` in `src/containers.ts`: the files, profile and project `composeUp` uses, the project
+  named with `-p` as well as through `COMPOSE_PROJECT_NAME`, so that it does not depend on the
+  environment of the process that calls it), and is first run in compose's `--dry-run` mode:
+  compose names the containers the command would touch, and the command is refused unless each one
+  is a container compose lists for the slot's project. Pausing one replica of a replicated service
+  (`pause(service, { replica: n })`) has no compose command; the container is the one compose lists
+  for that replica, and `docker pause` gets its id.
+- **Only a stack the harness started.** With `HARNESS_MANAGE_CONTAINERS=0` the containers are
+  whoever's started them, so `stop`, `pause`, `restart` and `flushRedis` refuse before they touch
+  anything: `refusing to pause redis: with HARNESS_MANAGE_CONTAINERS=0 the stack is not the harness's
+  to stop (it did not start it)`. `stopDmiApi` refuses the same way with `HARNESS_MANAGE_APP=0`. A
+  test that faults a service therefore fails at its first control, naming the variable.
+- **Nothing stays down.** Each fault is entered in a ledger as it is made (`disrupted()` lists it:
+  service, fault, containers, since when, by which test). `restoreServices()` undoes every entry,
+  waits until compose reports every container of the project running, and checks each restored
+  service answers (Redis a `PING`, the broker an MQTT publish, MySQL a query, the mock `/status`);
+  it throws naming whatever is still down. A describe that injects faults calls it from
+  `afterEach`, so a test that fails or times out midway still hands the next test a whole stack,
+  and asserts at its start, with `assertStackWhole()`, that every container is running and nothing
+  is in the ledger. A test's controls (`serviceFaults()`) stop working once `restoreServices()` has
+  run after it: jest keeps running a test body it abandoned on a timeout, and that body must not
+  fault the stack under the next test.
+- **Redis.** `flushRedis()` empties it (`FLUSHALL`, through `redis-cli` in the container: no client
+  library) and reports the key count before and after; `repeatableJobsNaming(id)` lists the Bull
+  repeat registrations that name an integration; `redisAnswers(ms)` says whether Redis answers a
+  `PING` on its published port. A paused Redis accepts the connection and never answers.
+- **What an engine did.** `watchExits(service)` collects the exit code of each of the service's
+  containers as it exits, from Docker's event stream: a container under a restart policy is up
+  again before its state could be read, and the daemon keeps too few past events, for every
+  container on the machine, to be asked afterwards. `serviceLogs(service, since)` reads its log.
+- **dmi-api.** Global setup starts dmi-api, and a scenario cannot see that process's handle: it runs
+  in a module registry of its own (in band, in jest's main process, with `maxWorkers: 1`; in a
+  worker otherwise). So every dmi-api a run starts is recorded, with its exit as its parent saw it,
+  in a file of the slot's beside its lock (`~/.cache/dmi-e2e/slot-locks/slot-<n>.dmi-api.json`).
+  `faults.stopDmiApi('SIGTERM')` enters dmi-api in the ledger as the signal goes out, and resolves
+  once it has exited, with how long that took and how: a code (1 is dmi-api's shutdown timeout) or
+  the signal (a shutdown that finished re-raises it). Restoring it, from the test's `finally` or
+  from `afterEach`, waits for that process to be gone (15 s at most, then kills it) and starts
+  dmi-api again from the run's build (`startDmiApi({ build: false, startedBy })`), so a test that
+  fails right after the signal still hands the next one a healthy dmi-api. Global teardown stops
+  every dmi-api the file lists as alive, whoever started it, so no run leaves one holding the slot's
+  port. `runDmiApiScript(script, args)` runs one of
+  dmi-api's npm scripts from the checkout under test with the app's environment, the way an operator
+  runs `ensure-integration-status` beside a deployment.
+- **A kept-up stack.** Global setup unpauses any container a killed run left paused (`compose up`
+  refuses a paused container), and does not go on until every container of the project is running.
+  On a Mongo it finds already up, it turns the `failCommand` failpoint off (`src/mongo.ts`), which a
+  run killed between arming it and clearing it leaves armed, and logs one line naming what it
+  found armed.
 
 ### Ports
 
@@ -738,6 +1011,7 @@ defaults are slot 0's: under `HARNESS_SLOT=n` each is 10 × n higher.
 | `HARNESS_IDEXX_REPLICAS` | `2` | idexx only. How many replicas of the integration container compose runs, each with the integration's default of one results worker. When the integration runs as more than one replica, two results polls of one integration can be in flight at once; with one replica the loop could never show that. The overlapping-polls test needs at least 2 and refuses to run with fewer. It reads the variable from its own environment, so set it there: a value in a slot tree's `.env` reaches compose but not the test. |
 | `HARNESS_IDEXX_RESULTS_LOCK_TTL_MS` | `5000` | idexx only. How long the integration's results poll lock lasts as first taken (its `IDEXX_RESULTS_LOCK_TTL_MS`), dialed down from the integration's default so that it runs out while the overlapping-polls test still holds a poll in flight: the test then also fails on a lock that is not extended while its poll runs. It has to be a positive number of milliseconds under two poll intervals, and the test refuses to run otherwise: the integration replaces any other value with its own default, which outlasts the hold. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
 | `HARNESS_IDEXX_HTTP_TIMEOUT_MS` | `30000` | idexx only. The integration's HTTP timeout (its `IDEXX_HTTP_TIMEOUT_MS`), at the integration's own default. It is set so that the overlapping-polls test reads the value the integration runs with: the answer that test holds for three poll intervals has to come inside it, and the test refuses to run otherwise. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
+| `HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS` | `5000` | idexx only. The integration's timeout for the create POST (its `IDEXX_CREATE_ORDER_TIMEOUT_MS`, 80 s by default), dialled down to under the 10 s dmi-api waits for the engine here, so that a create held past it fails at the integration, naming its timeout, before dmi-api gives up on the RPC. The held-create test refuses to run unless it is below dmi-api's `ENGINE_RESPONSE_TIMEOUT` and differs from `HARNESS_IDEXX_HTTP_TIMEOUT_MS`, which the error would otherwise not tell apart. Like `HARNESS_IDEXX_REPLICAS`, the test reads it from its own environment. |
 | `HARNESS_ANTECH_V3_MOCK_PORT` | `3013` | antech-v3 only. Host port for the antech-v3 mock (its `/__control__` plane and `/status`). |
 | `HARNESS_ANTECH_V3_MOCK_URL` | `http://$HARNESS_HOST:3013` | antech-v3 only. Host-facing mock base URL the scenario drives. |
 | `HARNESS_ANTECH_V3_BASE_URL` | `http://antech-v3-mock:3000` | antech-v3 only. Compose-network base URL stored in the provider config; the integration appends `/api/v1.1/<endpoint>` to it. Never point at a live Antech host. |
@@ -810,12 +1084,19 @@ src/
   env.ts                      all configuration, resolved once; HARNESS_HOST / HARNESS_FULL_STACK / HARNESS_STACK
   slots.js                    harness slots: the host-port table, HARNESS_SLOT / .harness-slot, the per-slot lock, and `verifySlots()` (every published port slotted, no image shared across slots), which every run runs at start
   stacks.js                   the stack registry: one entry per full-system loop (provider id, scenario, compose profile, the checkouts it is built from, mock endpoint, poll class); `npm run check:stacks` verifies entries against the files they name, and the slot table (`src/slots.js`) against docker-compose.yml (every run does both too, at start)
-  containers.ts               compose up/down (profile-aware), readiness polling, dmi-api migrations
-  dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill
+  containers.ts               compose up/down (profile-aware), the harness's one compose invocation, the
+                              project's containers as compose lists them, readiness polling, dmi-api migrations
+  dmi-api.ts                  build, spawn `node dist/main`, poll /health, kill; the record of every dmi-api
+                              a run starts (signal it, start it again, stop them all at teardown); dmi-api's
+                              own npm scripts, run beside it
+  services.ts                 failure injection on the stack: stop, start, pause, restart a compose service
+                              of the run's project, flush Redis; the ledger of what is down, and its restore
   api-client.ts               immutable HTTP client: basic / bearer / api-key
   sql.ts                      mysql2 pool for setup and assertions
   mongo.ts                    mongodb client for failure injection: arms the `failCommand` failpoint so
                               one command on one of dmi-api's collections fails, and reads back how often
+  mock-faults/index.js        transport faults the mocks share (hold, reset, stall), armed per route key
+                              with a count of what each took; built into each mock image that wires it
   seed.ts                     the quickstart flow; two independent orgs; provider config; admin login
   refs.ts                     canonical dmi ref codes looked up by name over GET /refs/*, for the ref-mapping value assertions
   idexx-mock/server.js        the VetConnect Plus mock provider (zero-dependency Node HTTP server)
@@ -846,13 +1127,22 @@ scenarios/
   engine-failures.e2e.ts      an engine that does not answer is a 504 (devices and refs), not a 404
   idexx-full-stack.e2e.ts     the idexx loop (HARNESS_FULL_STACK=1); closes end to end, an order
                               throttled on every event write is still sent to the provider (dmi-api#371),
-                              and two results polls in flight deliver a batch once
-                              (dmi-engine-idexx-integration#88)
+                              IDEXX calls that time out, reset or stall fail named, and a failed manifest
+                              or confirm step still reports the created order
+                              (dmi-engine-idexx-integration#81, #83, #93), and two results polls in
+                              flight deliver a batch once (dmi-engine-idexx-integration#88); the loop
+                              outlives Redis frozen (dmi-engine-idexx-integration#74) and flushed
+                              (dmi-api#346), the broker restarted (dmi-api#367) and dmi-api stopped
+                              with a request in flight (dmi-api#399)
   antech-v3-full-stack.e2e.ts the antech-v3 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v3); closes end to end
   zoetis-full-stack.e2e.ts    the zoetis loop (HARNESS_FULL_STACK=1 HARNESS_STACK=zoetis); closes end to end
   antech-v6-full-stack.e2e.ts the antech-v6 loop (HARNESS_FULL_STACK=1 HARNESS_STACK=antech-v6); closes end to end,
-                              and a result or order the provider redelivers unchanged changes nothing
-                              (dmi-api#409)
+                              a result or order the provider redelivers unchanged changes nothing
+                              (dmi-api#409), a 503's Retry-After is honoured (dmi-engine-common#27),
+                              a token the provider revokes is replaced at placement, a status poll
+                              held past 60 s is given up on and asked again
+                              (dmi-engine-antech-v6-integration#70); an engine that cannot reach
+                              Redis at start exits, and recovers once Redis is back (dmi-engine#68)
   wisdom-panel-full-stack.e2e.ts the wisdom-panel loop (HARNESS_FULL_STACK=1 HARNESS_STACK=wisdom-panel); closes
                               end to end, and one order dmi-api cannot save does not cost the rest of its
                               batch (dmi-api#411)
@@ -886,11 +1176,14 @@ guards has broken — and the fix belongs where the break is, not in the asserti
 |---|---|---|---|
 | fast (`smoke`) | `rejects an unauthenticated POST /users` | 401. Today 500 "Unknown authentication strategy 'basic'": dmi-api never registers its HTTP Basic auth, so no user can be created over HTTP | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
 | fast (`smoke`) | `rejects the wrong admin password on POST /users` | 401. Today 500, same cause | [dmi-api#379](https://github.com/nominal-systems/dmi-api/issues/379) |
+| idexx | `the order is reported SUBMITTED` (under `a confirm that succeeds and a manifest fetch after it that fails`) | An order the confirm submitted is reported `SUBMITTED`, whatever becomes of the manifest fetch after it. Today, when that fetch fails, `WAITING_FOR_INPUT`, the status from before the confirm, while the order sits submitted at IDEXX | [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93) |
 | zoetis | `the dmi order's local test list shrinks to the remaining code` | Cancelling one test removes it from the dmi order's test list. Today the provider-side cancel happens, but dmi-api appends the cancelled test to the order's list instead of removing it | not yet filed |
 | antech-v6 | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | 201, and the provider's species, breeds and sexes stored. Today 400 and nothing stored, for every provider — which is why both engine loops seed their reference rows themselves | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | antech-v6 | `a provider error on the status poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none: the logging interceptor throws on the error body before it records anything | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
+| antech-v6 | `the integration logs in again when Antech stops accepting its token, and both polls deliver again` | A new login on each refused poll, one or two since the two polls share a tick, and no more over two further orders polls; a draft completed at the provider delivered as SUBMITTED and a result as a FINAL report. Today no poll logs in again: on the polls the 401 reaches the integration as a 500, because the logging interceptor throws on the error body, so its re-login on a 401 never runs and nothing is delivered while the token stays refused (it is cached for 12 hours) | [dmi-engine-antech-v6-integration#95](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/95) |
+| antech-v6 | `an order the provider created after dmi-api stopped waiting ends with the provider's id and SUBMITTED, never a bare ERROR` | Every dmi order for a placement held past `ENGINE_RESPONSE_TIMEOUT` that the provider then completes is SUBMITTED, carrying the provider's id. Today dmi-api answers 504 and records the order ERROR with no external id and discards the engine's late answer; the orders poll, unable to match the provider's order to an order with no id, records it as an order of its own beside it | [dmi-api#365](https://github.com/nominal-systems/dmi-api/issues/365) |
 | antech-v6 | `an order for a patient with no species OR breed mapping is still placeable` | The order is placed. Today the provider refuses it: the integration's default species and default breed are not a valid pair | [dmi-engine-antech-v6-integration#88](https://github.com/nominal-systems/dmi-engine-antech-v6-integration/issues/88) |
 | wisdom-panel | `POST /admin/refs/sync/<provider> stores the reference data it fetched` | As in the antech-v6 loop: dmi-api's defect, not the provider's | [dmi-api#378](https://github.com/nominal-systems/dmi-api/issues/378) |
 | wisdom-panel | `a result whose ideal-weight section is empty yields no ideal-weight items` | No ideal-weight panel. Today three DONE items with no value | [dmi-engine-wisdom-panel-integration#46](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/46) |
 | wisdom-panel | `a provider error on the orders poll is recorded in the audit trail` | An audit record carrying the provider's error. Today none, as in the antech-v6 loop | [a comment on dmi-engine-common#29](https://github.com/nominal-systems/dmi-engine-common/issues/29#issuecomment-5909649362) |
-| wisdom-panel | `the integration re-authenticates when the provider stops accepting its token` | A new token after a 401. Today the token is cached for ten days and never refreshed, so a credential rotated at the provider fails every call until the cache expires | no open issue |
+| wisdom-panel | `the integration logs in again when the provider revokes its token, and both polls resume` | A new token once the vendor refuses the old one with a 401, and both feeds read again. Today the token is cached for ten days and nothing replaces it on a refusal, so nothing is delivered until the cache expires or the engine restarts | [dmi-engine-wisdom-panel-integration#53](https://github.com/nominal-systems/dmi-engine-wisdom-panel-integration/issues/53) |

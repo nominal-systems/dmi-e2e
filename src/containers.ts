@@ -68,7 +68,7 @@ async function run (command: string, args: string[], options: RunOptions): Promi
   })
 }
 
-async function waitForTcp (
+export async function waitForTcp (
   host: string,
   port: number,
   label: string,
@@ -111,14 +111,71 @@ function composeProfile (): string {
   return stacks[env.stack].composeProfile
 }
 
+/* Every compose command the harness runs, from global setup or from a scenario: the files and
+ * profile above and the slot's project, named with -p. The project also reaches compose as
+ * COMPOSE_PROJECT_NAME, which applySlot (src/slots.js) writes into the environment, but -p does not
+ * depend on which process's environment a call inherits: global setup's, or a scenario's, which
+ * runs in a jest worker or, in band, under a copy of it. */
 function composeBaseArgs (): string[] {
-  const args = ['compose', '-f', env.composeFile]
+  const args = ['compose', '-p', env.composeProject, '-f', env.composeFile]
   /* Against a dmi-engine-common checkout, the images built from their own repos' Dockerfiles take
    * it from the override; docker-compose.yml builds the engine image against it itself. Whether
    * there is one is compose's own answer (commonUnderTest), so the two cannot disagree. */
   if (env.fullStack && commonUnderTest().checkout != null) args.push('-f', path.join(env.harnessRoot, commonCheckout.composeFile))
   if (env.fullStack) args.push('--profile', composeProfile())
   return args
+}
+
+/* Runs `docker compose <base args> <args>` and returns its output, throwing with the command and the
+ * tail of its stderr when it fails. For the commands whose output the harness reads (src/services.ts);
+ * composeUp and composeDown stream theirs. */
+export async function compose (args: string[], timeoutMs = 120_000): Promise<{ stdout: string, stderr: string }> {
+  const fullArgs = [...composeBaseArgs(), ...args]
+  try {
+    return await promisify(execFile)('docker', fullArgs, {
+      cwd: env.harnessRoot,
+      env: { ...process.env, COMPOSE_PROJECT_NAME: env.composeProject },
+      timeout: timeoutMs,
+      maxBuffer: 64 * 1024 * 1024,
+    })
+  } catch (error) {
+    const stderr = String((error as { stderr?: string }).stderr ?? '').trim().split(/\r?\n/).slice(-10).join('\n')
+    throw new Error(`docker ${fullArgs.join(' ')} failed: ${(error as Error).message.split('\n')[0]}${stderr === '' ? '' : `\n${stderr}`}`)
+  }
+}
+
+/* One container of the project, as `docker compose ps` reports it. */
+export interface ComposeContainer {
+  id: string
+  name: string
+  service: string
+  project: string
+  /* running, paused, exited, restarting, created */
+  state: string
+  exitCode: number
+}
+
+/* Every container of the project (or of one of its services), stopped ones included, as compose
+ * lists it. Throws if compose lists one under another project: that would be the harness's compose
+ * invocation reaching another slot. */
+export async function projectContainers (service?: string): Promise<ComposeContainer[]> {
+  const { stdout } = await compose(['ps', '--all', '--format', 'json', ...(service == null ? [] : [service])])
+  const trimmed = stdout.trim()
+  /* One JSON object per line; compose before 2.21 printed one array. */
+  const rows: any[] = trimmed === '' ? [] : trimmed.startsWith('[') ? JSON.parse(trimmed) : trimmed.split(/\r?\n/).map((line) => JSON.parse(line))
+  const containers = rows.map((row) => ({
+    id: String(row.ID),
+    name: String(row.Name),
+    service: String(row.Service),
+    project: String(row.Project),
+    state: String(row.State),
+    exitCode: Number(row.ExitCode),
+  }))
+  const foreign = containers.filter((container) => container.project !== env.composeProject)
+  if (foreign.length > 0) {
+    throw new Error(`compose listed containers of another project for ${env.composeProject}: ${foreign.map((c) => `${c.name} (${c.project})`).join(', ')}`)
+  }
+  return containers
 }
 
 /* Refuses to start into a compose project that already has containers another checkout created.
@@ -174,7 +231,7 @@ export async function composeDown (removeVolumes: boolean): Promise<void> {
 /* Poll an HTTP endpoint until it answers 2xx. Used for the selected loop's mock, whose /status
  * answers only once its server is listening, so a 2xx means "really ready", not merely "port
  * published". */
-async function waitForHttpOk (url: string, label: string, timeoutMs: number): Promise<void> {
+export async function waitForHttpOk (url: string, label: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown
   while (Date.now() < deadline) {

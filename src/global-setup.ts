@@ -1,13 +1,18 @@
 import { ChildProcess } from 'child_process'
-import { assertProjectIsOurs, composeUp, runMigrations, waitForDependencies } from './containers'
-import { assertAppPortFree, startDmiApi } from './dmi-api'
+import { assertProjectIsOurs, composeUp, projectContainers, runMigrations, waitForDependencies } from './containers'
+import { assertAppPortFree, forgetDmiApiProcesses, startDmiApi } from './dmi-api'
 import { commonUnderTest, env } from './env'
+import { closeMongo, turnOffLeftoverFailPoint } from './mongo'
 import { beginRun } from './report/report'
+import { unpauseLeftovers, waitForEveryServiceRunning } from './services'
 import { acquireSlot, releaseSlot } from './slots'
 import { commonCheckout } from './stacks'
 
 /* Jest runs globalSetup and globalTeardown in the same process, so the app handle can be parked
- * on globalThis for teardown to reclaim. Test files run in workers and never see it. */
+ * on globalThis for teardown to reclaim. Test files never see it: with `maxWorkers: 1` jest runs them
+ * in band, in this same process (one pid, measured), but each in a VM context and module registry of
+ * its own, whose globalThis is not this one. Hence src/dmi-api.ts's record of every dmi-api a run
+ * starts. */
 declare global {
   // eslint-disable-next-line no-var
   var __HARNESS_APP__: ChildProcess | undefined
@@ -46,10 +51,30 @@ async function setUp (log: (message: string) => void): Promise<void> {
 
   if (env.manageContainers) {
     await assertProjectIsOurs()
+    /* A stack an earlier run left up (HARNESS_KEEP_UP=1) can hold a container that run's scenario
+     * had paused when it was killed, and `compose up` refuses one ("cannot start a paused
+     * container"). */
+    const unpaused = await unpauseLeftovers()
+    if (unpaused.length > 0) log(`unpaused ${unpaused.join(', ')}, left paused by an earlier run`)
+    /* Likewise its Mongo can still hold the failCommand failpoint that run's scenario had armed
+     * (src/mongo.ts), which would fail this run's writes before any scenario armed one. */
+    const mongoWasUp = (await projectContainers('mongo')).some((container) => container.state === 'running')
     log('starting dependency containers')
     await composeUp()
     log('waiting for MySQL, Mongo and ActiveMQ')
     await waitForDependencies()
+    if (mongoWasUp) {
+      try {
+        const leftover = await turnOffLeftoverFailPoint()
+        if (leftover != null) log(`turned off the Mongo failCommand failpoint an earlier run left armed: ${JSON.stringify(leftover)}`)
+      } finally {
+        await closeMongo()
+      }
+    }
+    /* Nothing stopped, paused or crash-looping: the scenarios that fault a service start by asserting
+     * the stack is whole, and none of them should find it broken by an earlier run. */
+    const down = await waitForEveryServiceRunning(env.timeouts.depsReadyMs)
+    if (down.length > 0) throw new Error(`containers of ${env.composeProject} are not running: ${JSON.stringify(down)}`)
     log(`running dmi-api migrations from ${env.dmiApiDir}`)
     await runMigrations()
   } else {
@@ -58,6 +83,9 @@ async function setUp (log: (message: string) => void): Promise<void> {
 
   if (env.manageApp) {
     log(`building and starting dmi-api on ${env.baseUrl}`)
+    /* A new run, a new record of the dmi-api processes it starts (src/dmi-api.ts). Nothing an earlier
+     * run recorded is still listening: assertAppPortFree said so above. */
+    forgetDmiApiProcesses()
     globalThis.__HARNESS_APP__ = await startDmiApi()
     log('dmi-api is healthy')
   } else {

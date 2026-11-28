@@ -1,9 +1,23 @@
-import { ApiClient, expectOk } from '../src/api-client'
-import { env } from '../src/env'
+import { createHash } from 'crypto'
+import { ApiClient, ApiResponse, expectOk } from '../src/api-client'
+import { appPortInUse, DmiApiScriptRun, runDmiApiScript, runningDmiApi } from '../src/dmi-api'
+import { appEnv, env } from '../src/env'
 import { clearFailPoints, closeMongo, failInserts } from '../src/mongo'
 import { pollUntil } from '../src/poll'
 import { lookupRefCode } from '../src/refs'
 import { adminLogin, orderPayload, OrderPayloadOverrides, seedOrganization, SeededOrg } from '../src/seed'
+import {
+  assertStackWhole,
+  BROKER,
+  Disruption,
+  DMI_API,
+  REDIS,
+  redisAnswers,
+  repeatableJobsNaming,
+  restoreServices,
+  serviceFaults,
+  sleep,
+} from '../src/services'
 import { closePool, countOrdersForOrganization } from '../src/sql'
 
 /* Full-system gate for IDEXX (HARNESS_FULL_STACK=1, HARNESS_STACK=idexx — the default):
@@ -749,6 +763,466 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     }, 30_000 + 3 * 2_000)
   })
 
+  /* ---- transport faults and the steps of a placement: dmi-engine-idexx-integration#81, #83, #93 ----
+   *
+   * Past the test catalogue (cached), a placement is up to six IDEXX calls in a row: the create
+   * POST, the manifest PDF its answer points at, and with autoSubmitOrder the three steps of the
+   * confirm handshake (the UI page, the order setup, the submission) and the manifest once
+   * more. The tests here fail one of those calls at a time, by its route key at the mock, with a transport fault (src/mock-faults; the
+   * README's "Transport faults in the mocks"): an answer held, a connection reset, a body stalled.
+   * Each test arms one fault and disarms it in a `finally` (withFault), and asserts from the count the
+   * disarm returns that the fault fired. The describe checks that nothing is armed when it starts,
+   * and after each test that the test left nothing armed. Each test places an order of its own, so
+   * the loop above sees none of it; the one test that seeds a result waits for its batch to be
+   * confirmed, so the overlapping-polls test below starts on an empty feed. */
+  describe('IDEXX calls that time out, reset or stall, and the steps of a placement (dmi-engine-idexx-integration#81, #83, #93)', () => {
+    /* How long dmi-api waits for the engine's answer here, and the integration's timeouts for the
+     * create POST and for every other call. The two integration values are read as
+     * docker-compose.yml reads them, from the environment with compose's default
+     * (HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS, 5000; HARNESS_IDEXX_HTTP_TIMEOUT_MS, 30000), like the
+     * overlapping-polls test's below; dmi-api's from the environment the harness starts it with. */
+    const engineTimeoutMs = Number(appEnv().ENGINE_RESPONSE_TIMEOUT)
+    const createOrderTimeoutMs = Number(process.env.HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS || 5_000)
+    const httpTimeoutMs = Number(process.env.HARNESS_IDEXX_HTTP_TIMEOUT_MS || 30_000)
+    /* What dmi-api answers POST /orders with when the integration replies with a ProviderError: 400,
+     * this message, and the integration's description of what failed as the one error. */
+    const PLACEMENT_REFUSED = 'Error while trying to place an order with idexx'
+
+    /* A fault as the mock reports it (GET /__control__/scenarios, and the answer to its disarm). */
+    type Fault = {
+      id: number
+      fault: string
+      times: number
+      hits: number
+      remaining: number
+      open: number
+      requests: Array<{ outcome: string, ms: number | null }>
+    }
+    type Armed = { scenarios: Record<string, unknown>, faults: Record<string, Fault> }
+    /* A dmi order as dmi-api reads it back, and the same order as the mock holds it. */
+    type StoredOrder = {
+      id: string
+      status: string
+      externalId: string
+      manifest: { uri: string, contentType: string, data: string } | null
+    }
+    type AtIdexx = {
+      idexxOrderId: string
+      status: string
+      pdfURL: string
+      manifestFetches: string[]
+      pdfSha256: string
+    }
+
+    async function armedAtMock (): Promise<Armed> {
+      return expectOk<Armed>(await mock.get('/__control__/scenarios'), 'list what is armed at the mock')
+    }
+
+    /* Arm one fault, run the test's step, and disarm the fault whatever the step did: by its id, so a
+     * disarm that runs late cannot take a later test's fault. Returns the step's result and the fault
+     * as its disarm left it, with every request it took. */
+    async function withFault<T> (
+      spec: { key: string, fault: string } & Record<string, unknown>,
+      step: () => Promise<T>,
+    ): Promise<{ result: T, fault: Fault }> {
+      const armed = expectOk<{ fault: Fault }>(
+        await mock.post('/__control__/scenarios', spec),
+        `arm a ${spec.fault} on ${spec.key} at the mock`,
+      )
+      let result: T | undefined
+      let fault: Fault | null = null
+      try {
+        result = await step()
+      } finally {
+        fault = expectOk<{ fault: Fault | null }>(
+          await mock.delete(`/__control__/scenarios/${spec.key}?id=${armed.fault.id}`),
+          `disarm the ${spec.fault} on ${spec.key}`,
+        ).fault
+      }
+      if (fault == null) {
+        throw new Error(`the ${spec.fault} armed on ${spec.key} (id ${armed.fault.id}) was gone before the test disarmed it`)
+      }
+      return { result: result as T, fault }
+    }
+
+    /* What a fault did, for one assertion: how many requests it took, and what became of each. */
+    function fired (fault: Fault): { hits: number, outcomes: string[] } {
+      return { hits: fault.hits, outcomes: fault.requests.map((request) => request.outcome) }
+    }
+
+    /* A refused placement as one value, so a red names status, message and errors together. */
+    function refusal (response: ApiResponse): { status: number, message: unknown, errors: unknown } {
+      return { status: response.status, message: response.body?.message, errors: response.body?.errors }
+    }
+
+    /* The loop's own order: the in-house code with the clinic's analyzer and the ref-mapped patient. */
+    function placement (): { payload: Record<string, unknown>, requisitionId: string } {
+      const payload = refMappedOrderPayload({ testCodes: [{ code: serviceCode }], devices: [deviceSerial] })
+      return { payload, requisitionId: payload.requisitionId as string }
+    }
+
+    async function storedOrder (id: string): Promise<StoredOrder> {
+      return expectOk<StoredOrder>(await org.api.get(`/orders/${id}`), 'read the dmi order back')
+    }
+
+    async function atIdexx (requisitionId: string): Promise<AtIdexx> {
+      return expectOk<AtIdexx>(
+        await mock.get(`/__control__/orders/${requisitionId}`),
+        'read the order from the mock control plane',
+      )
+    }
+
+    /* The manifest dmi-api stored, as what a test compares: its uri, its type, the digest of the
+     * bytes its base64 data decodes to, and whether those begin as a PDF does. */
+    function manifestOf (order: StoredOrder): { uri: string, contentType: string, sha256: string, isPdf: boolean } | null {
+      if (order.manifest == null) return null
+      const bytes = Buffer.from(order.manifest.data, 'base64')
+      return {
+        uri: order.manifest.uri,
+        contentType: order.manifest.contentType,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        isPdf: bytes.subarray(0, 5).toString('latin1') === '%PDF-',
+      }
+    }
+
+    afterEach(async () => {
+      /* A test that failed before its `finally` ran, or timed out inside it, must not leave anything
+       * armed for the next: disarm whatever is left, then fail the test that left it. */
+      const left = await armedAtMock()
+      for (const key of new Set([...Object.keys(left.scenarios), ...Object.keys(left.faults)])) {
+        await mock.delete(`/__control__/scenarios/${key}`)
+      }
+      expect({ leftArmed: left }).toEqual({ leftArmed: { scenarios: {}, faults: {} } })
+    })
+
+    it('nothing is armed at the mock when these tests start', async () => {
+      expect(await armedAtMock()).toEqual({ scenarios: {}, faults: {} })
+    })
+
+    /* Regression guard (dmi-engine-idexx-integration#81): the create POST has a timeout of its own,
+     * IDEXX_CREATE_ORDER_TIMEOUT_MS, and a create held past it fails at the integration, which tells
+     * the caller it timed out and that IDEXX may still have the order. Before #81 the integration
+     * waited on a held create for as long as it was held, and dmi-api gave up on the RPC with its own
+     * 504, naming nobody. The answer is held past dmi-api's timeout too, so a create that waited for
+     * anything longer than its own timeout shows as that 504. The hold runs the create at the mock
+     * on arrival, as IDEXX would: the order exists at the provider, never confirmed, which is what
+     * "may still have processed it" warns of. */
+    it('a create held past IDEXX_CREATE_ORDER_TIMEOUT_MS fails naming that timeout, and the order is at IDEXX unconfirmed', async () => {
+      /* Refused at once, saying why, when the stack cannot show it: only a create timeout that dmi-api
+       * outwaits reaches the caller as the integration's error, and only one that differs from the
+       * HTTP timeout says which of the two the create waited for. */
+      if (!(createOrderTimeoutMs > 0 && createOrderTimeoutMs < engineTimeoutMs && createOrderTimeoutMs !== httpTimeoutMs)) {
+        throw new Error(
+          `HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_MS is ${createOrderTimeoutMs}: this test needs a create timeout under dmi-api's ` +
+            `ENGINE_RESPONSE_TIMEOUT (${engineTimeoutMs} ms), or dmi-api gives up first, and other than ` +
+            `HARNESS_IDEXX_HTTP_TIMEOUT_MS (${httpTimeoutMs} ms), or the error cannot say which timeout the create had`,
+        )
+      }
+      const { payload, requisitionId } = placement()
+
+      const { result: response, fault } = await withFault(
+        { key: 'createOrder', fault: 'hold', delayMs: engineTimeoutMs + 5_000 },
+        async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      )
+      console.log(`[idexx-scenario] held create -> HTTP ${response.status}: ${response.text.slice(0, 300)}; fault ${JSON.stringify(fault)}`)
+
+      expect(refusal(response)).toEqual({
+        status: 400,
+        message: PLACEMENT_REFUSED,
+        errors: [`idexx did not respond within ${createOrderTimeoutMs} ms: POST /api/v1/order. idexx may still have processed it.`],
+      })
+      /* The integration gave up on the held create, not the mock on the integration. */
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['client-closed'] })
+      expect((await atIdexx(requisitionId)).status).toBe('CREATED')
+    }, engineTimeoutMs + 20_000)
+
+    /* Regression guard (dmi-engine-idexx-integration#83, merged into #81's branch): a connection reset
+     * on an IDEXX call reaches dmi-api as a ProviderError naming the cause, ECONNRESET, and the call.
+     * Before #83 the cause was lost on the way: dmi-api answered 500 with a TypeError's message
+     * ("Cannot read properties of undefined …") and no errors, naming neither the reset nor the call.
+     * Both ways a connection can close with no answer, a TCP RST and a FIN, since a Node client words
+     * them differently. The reset comes before the route runs, so the mock never has the order. */
+    it.each([
+      ['rst', 'read ECONNRESET'],
+      ['fin', 'socket hang up'],
+    ])('a create whose connection is reset (%s) fails naming ECONNRESET, not as an internal server error', async (close, cause) => {
+      const { payload, requisitionId } = placement()
+
+      const { result: response, fault } = await withFault(
+        { key: 'createOrder', fault: 'reset', close },
+        async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      )
+      console.log(`[idexx-scenario] reset (${close}) create -> HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+
+      expect(refusal(response)).toEqual({
+        status: 400,
+        message: PLACEMENT_REFUSED,
+        errors: [`A request to idexx failed without a response (ECONNRESET: ${cause}): POST /api/v1/order. idexx may still have processed it.`],
+      })
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
+      expect((await mock.get(`/__control__/orders/${requisitionId}`)).status).toBe(404)
+    }, engineTimeoutMs + 10_000)
+
+    /* Regression guard (dmi-engine-idexx-integration#83): the headers of the create's answer arrive,
+     * then part of its body, then nothing, until the create timeout ends the wait. That reaches
+     * dmi-api as a ProviderError saying IDEXX answered but its body did not arrive. Before #83 it
+     * reached the caller as the same 500 with a TypeError's message as the reset above did. The cause
+     * it names is in the HTTP client's words, as the client reports a timeout that fires once the
+     * response has begun: the body's stream aborted, the same words as a body cut short (the
+     * device-list test below), not the timeout. The stall runs the route, so the order exists at
+     * IDEXX. */
+    it('a create whose answer stalls after its headers fails naming the body that did not arrive, not as an internal server error', async () => {
+      const { payload, requisitionId } = placement()
+
+      const { result: response, fault } = await withFault(
+        { key: 'createOrder', fault: 'stall', bytes: 16 },
+        async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      )
+      console.log(`[idexx-scenario] stalled create -> HTTP ${response.status}: ${response.text.slice(0, 300)}; fault ${JSON.stringify(fault)}`)
+
+      expect(refusal(response)).toEqual({
+        status: 400,
+        message: PLACEMENT_REFUSED,
+        errors: [`idexx answered 200 but the body did not arrive (ERR_BAD_RESPONSE: stream has been aborted): POST /api/v1/order. idexx may still have processed it.`],
+      })
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['client-closed'] })
+      expect((await atIdexx(requisitionId)).status).toBe('CREATED')
+    }, engineTimeoutMs + 10_000)
+
+    /* Regression guard (dmi-engine-idexx-integration#83), on a GET: the device list's headers arrive,
+     * then part of its body, and then the connection closes (the stall's cap, at 2 s, well inside the
+     * integration's 30 s timeout). dmi-api's devices route names the provider's failure since
+     * dmi-api#364, so the caller reads what the integration made of it: IDEXX answered, the body did
+     * not arrive. No "may still have processed it": a GET changes nothing at IDEXX. */
+    it('a device list cut short after its headers is a 502 naming the body that did not arrive', async () => {
+      const { result: response, fault } = await withFault(
+        { key: 'ivlsDevices', fault: 'stall', bytes: 16, capMs: 2_000 },
+        async () => await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`),
+      )
+      console.log(`[idexx-scenario] cut-short device list -> HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+
+      expect({ status: response.status, message: response.body?.message }).toEqual({
+        status: 502,
+        message: 'The provider idexx failed to list devices with status 502: idexx answered 200 but the body did not arrive (ERR_BAD_RESPONSE: stream has been aborted): GET /api/v1/ivls/devices.',
+      })
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['capped'] })
+    }, engineTimeoutMs + 10_000)
+
+    /* What every test here leans on when it fails midway: disarming a key ends what its fault still
+     * holds, there and then, and a disarm by any other arming's id leaves the fault alone. A device
+     * list is held for far longer than dmi-api waits, and disarmed once the mock holds it: the
+     * integration's call fails at once, its connection closed, instead of being answered late. */
+    it('disarming a held call ends it at once, and a disarm by another id leaves the fault armed', async () => {
+      const armed = expectOk<{ fault: Fault }>(
+        await mock.post('/__control__/scenarios', { key: 'ivlsDevices', fault: 'hold', delayMs: 120_000 }),
+        'hold the device list at the mock',
+      )
+      try {
+        const pending = org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+        await pollUntil(armedAtMock, (now) => now.faults.ivlsDevices?.open === 1, engineTimeoutMs, 200)
+
+        const byAnotherId = expectOk<{ fault: Fault | null }>(
+          await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id + 1}`),
+          'disarm the hold by an id it does not have',
+        )
+        const stillArmed = (await armedAtMock()).faults.ivlsDevices
+        const cleared = expectOk<{ fault: Fault }>(
+          await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`),
+          'disarm the hold',
+        )
+        const response = await pending
+        console.log(`[idexx-scenario] disarmed held device list -> HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+
+        expect({ byAnotherId: byAnotherId.fault, stillArmed: stillArmed?.id }).toEqual({ byAnotherId: null, stillArmed: armed.fault.id })
+        expect(fired(cleared.fault)).toEqual({ hits: 1, outcomes: ['destroyed'] })
+        /* Closed by the mock's disarm, with a FIN, long before dmi-api's own timeout: a hold left to
+         * run would have been dmi-api's 504 instead. */
+        expect({ status: response.status, message: response.body?.message }).toEqual({
+          status: 502,
+          message: 'The provider idexx failed to list devices with status 502: A request to idexx failed without a response (ECONNRESET: socket hang up): GET /api/v1/ivls/devices.',
+        })
+      } finally {
+        /* By its id, like every other cleanup here: a late one must not disarm a later test's fault. */
+        await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`)
+      }
+    }, engineTimeoutMs + 10_000)
+
+    /* The positive twin of the manifest test below: an order placed without autoSubmitOrder is
+     * created, waiting for input, and dmi-api stores the PDF its create answer points at — the
+     * bytes the mock served, fetched once, before any confirm. */
+    it('an order placed without autoSubmitOrder is created with the manifest IDEXX serves for it', async () => {
+      const { payload, requisitionId } = placement()
+
+      const created = expectOk<{ id: string, status: string, externalId: string }>(
+        await org.api.post('/orders', payload),
+        'place an idexx order without autoSubmitOrder',
+      )
+      const stored = await storedOrder(created.id)
+      const provider = await atIdexx(requisitionId)
+
+      expect({ status: created.status, externalId: created.externalId }).toEqual({ status: 'WAITING_FOR_INPUT', externalId: provider.idexxOrderId })
+      expect(provider.manifestFetches).toEqual(['CREATED'])
+      expect(manifestOf(stored)).toEqual({ uri: provider.pdfURL, contentType: 'application/pdf', sha256: provider.pdfSha256, isPdf: true })
+    }, 30_000)
+
+    /* Regression guard (dmi-engine-idexx-integration#81): once IDEXX has created an order, a manifest
+     * fetch that fails no longer fails the create. Before #81 it did: the caller got an error for an
+     * order that existed at IDEXX, and lost its id. Now the order is reported as created, with IDEXX's
+     * id and without a manifest. Without autoSubmitOrder, so the fetch after the create is the only
+     * one. */
+    it('an order whose manifest fetch fails is still created, with IDEXX\'s id and no manifest', async () => {
+      const { payload, requisitionId } = placement()
+
+      const { result: response, fault } = await withFault(
+        { key: 'manifest', fault: 'reset' },
+        async () => await org.api.post('/orders', payload),
+      )
+      console.log(`[idexx-scenario] create with a failed manifest -> HTTP ${response.status}: ${response.text.slice(0, 300)}`)
+      const provider = await atIdexx(requisitionId)
+
+      expect({ status: response.status, orderStatus: response.body?.status, externalId: response.body?.externalId })
+        .toEqual({ status: 201, orderStatus: 'WAITING_FOR_INPUT', externalId: provider.idexxOrderId })
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
+      const stored = await storedOrder(response.body.id)
+      expect({ externalId: stored.externalId, manifest: manifestOf(stored) }).toEqual({ externalId: provider.idexxOrderId, manifest: null })
+    }, 30_000)
+
+    /* A failed step of the confirm handshake does not fail the create: the order exists at IDEXX
+     * by then, and failing would lose its id. dmi-engine-idexx-integration#93 decided the caller's
+     * side (2026-11-27): no contract change, so the create keeps answering 201 with IDEXX's id and
+     * the status IDEXX gave the order, `WAITING_FOR_INPUT`, since it was never submitted. The fix
+     * the issue defers makes the failure visible to an operator and records it in the audit trail;
+     * that record can be asserted here once it exists. Each of the three steps in turn, each failing
+     * with a reset. */
+    it.each([
+      ['uiPage', 'the UI page'],
+      ['uiOrderGet', 'the order setup'],
+      ['uiOrderPut', 'the submission'],
+    ])('an auto-submitted order whose confirm step %s (%s) fails is still created, with IDEXX\'s id and WAITING_FOR_INPUT', async (key) => {
+      const { payload, requisitionId } = placement()
+
+      const { result: response, fault } = await withFault(
+        { key, fault: 'reset' },
+        async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      )
+      console.log(`[idexx-scenario] create with a failed ${key} -> HTTP ${response.status}: status ${response.body?.status}, externalId ${response.body?.externalId}`)
+      const provider = await atIdexx(requisitionId)
+
+      expect({ status: response.status, orderStatus: response.body?.status, externalId: response.body?.externalId })
+        .toEqual({ status: 201, orderStatus: 'WAITING_FOR_INPUT', externalId: provider.idexxOrderId })
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
+      const stored = await storedOrder(response.body.id)
+      expect({ externalId: stored.externalId, status: stored.status }).toEqual({ externalId: provider.idexxOrderId, status: 'WAITING_FOR_INPUT' })
+    }, 30_000)
+
+    /* Regression guard (dmi-api#409, fixed in dmi-api#410), through IDEXX's results confirm: a
+     * confirm that fails leaves the batch at IDEXX, the next poll fetches it again and delivers it
+     * again, and confirms it. The second delivery is identical to the first, and since dmi-api#410
+     * dmi-api leaves a report alone when a result arrives again unchanged, so the PIMS sees one
+     * `report:updated`. Before it, every delivery was another `report:updated` for a report that had
+     * not changed. The mock's ledger shows the redelivery from the provider's side: the batch served
+     * at least twice, and confirmed once, by the route, after the fault took the first confirm. This
+     * test seeds a result, and waits for its batch's confirm, so the overlapping-polls test below
+     * starts on an empty feed. */
+    it('a results confirm that fails is delivered again and confirmed by a later poll, and the PIMS sees one report:updated', async () => {
+      const { payload, requisitionId } = placement()
+      const created = expectOk<{ id: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place the idexx order whose results confirm will fail',
+      )
+      type LedgerBatch = { batchId: string, requisitionIds: string[], served: number, confirms: number[] }
+      const batchesFor = async (): Promise<LedgerBatch[]> =>
+        expectOk<{ batches: LedgerBatch[] }>(await mock.get('/__control__/batches'), 'read the mock results-batch ledger')
+          .batches.filter((batch) => batch.requisitionIds.includes(requisitionId))
+
+      const { result: batches, fault } = await withFault(
+        { key: 'resultsConfirm', fault: 'reset' },
+        async () => {
+          expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed the result whose confirm will fail')
+          return await pollUntil(batchesFor, (now) => now.some((batch) => batch.confirms.includes(200)), 60_000, 500)
+        },
+      )
+      console.log(`[idexx-scenario] results-batch ledger after a failed confirm -> ${JSON.stringify(batches)}; fault ${JSON.stringify(fault)}`)
+
+      expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
+      expect(batches.map((batch) => ({ fetchedAgain: batch.served >= 2, confirms: batch.confirms })))
+        .toEqual([{ fetchedAgain: true, confirms: [200] }])
+
+      const completed = await pollUntil(async () => await storedOrder(created.id), (order) => order.status === 'COMPLETED', 30_000, 1_000)
+      expect(completed.status).toBe('COMPLETED')
+      const report = expectOk<{ id: string }>(await org.api.get(`/orders/${created.id}/report`), 'read the order report')
+      /* Polled until the first `report:updated` is in; the second delivery came before the confirm
+       * the ledger shows, so a second one would be in by then too. */
+      const types = await pollUntil(
+        async () => expectOk<{ data: Array<{ type: string, data?: { orderId?: string, reportId?: string } }> }>(
+          await org.api.get('/events', { start_seq: 0, limit: 1000 }),
+          'list events',
+        ).data
+          .filter((event) => event.data?.orderId === created.id || event.data?.reportId === report.id)
+          .map((event) => event.type),
+        (now) => now.includes('report:updated'),
+        30_000,
+        1_000,
+      )
+      expect({ reportUpdatedEvents: types.filter((type) => type === 'report:updated').length }).toEqual({ reportUpdatedEvents: 1 })
+    }, 30_000 + 60_000 + 30_000 + 30_000 + 10_000)
+
+    /* dmi-engine-idexx-integration#93's second case: the confirm succeeds, and the manifest fetch
+     * after it fails. The positive twin first: with both succeeding, an auto-submitted order is
+     * SUBMITTED, and dmi-api stores the PDF fetched after the confirm — the mock answered two
+     * fetches, one before the submission and one after. */
+    it('an auto-submitted order is SUBMITTED, with the manifest fetched after its confirm', async () => {
+      const { payload, requisitionId } = placement()
+
+      const created = expectOk<{ id: string, status: string, externalId: string }>(
+        await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        'place an auto-submitted idexx order',
+      )
+      const stored = await storedOrder(created.id)
+      const provider = await atIdexx(requisitionId)
+
+      expect({ status: created.status, stored: stored.status, atIdexx: provider.status }).toEqual({ status: 'SUBMITTED', stored: 'SUBMITTED', atIdexx: 'SUBMITTED' })
+      expect(provider.manifestFetches).toEqual(['CREATED', 'SUBMITTED'])
+      expect(manifestOf(stored)).toEqual({ uri: provider.pdfURL, contentType: 'application/pdf', sha256: provider.pdfSha256, isPdf: true })
+    }, 30_000)
+
+    describe('a confirm that succeeds and a manifest fetch after it that fails (dmi-engine-idexx-integration#93)', () => {
+      /* The order the plain test places; the tripwire reads how dmi-api recorded it. */
+      let submittedOrderId: string
+
+      /* The setup half of the tripwire below, a test of its own so that a red names which half broke:
+       * both manifest fetches fail (the one after the create, which the integration tolerates, and
+       * the one after the confirm), the confirm itself succeeds, and the order is submitted at IDEXX.
+       * A red here means the state the tripwire reads was never reached. */
+      it('with both manifest fetches failing, an auto-submitted order is still created and submitted at IDEXX', async () => {
+        const { payload, requisitionId } = placement()
+
+        const { result: response, fault } = await withFault(
+          { key: 'manifest', fault: 'reset', times: 2 },
+          async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+        )
+        console.log(`[idexx-scenario] confirmed order with failed manifests -> HTTP ${response.status}: ${response.text.slice(0, 200)}`)
+        const provider = await atIdexx(requisitionId)
+
+        expect({ status: response.status, externalId: response.body?.externalId }).toEqual({ status: 201, externalId: provider.idexxOrderId })
+        expect(fired(fault)).toEqual({ hits: 2, outcomes: ['reset', 'reset'] })
+        expect(provider.status).toBe('SUBMITTED')
+        submittedOrderId = response.body.id
+      }, 30_000)
+
+      /* TRIPWIRE (dmi-engine-idexx-integration#93). Expected: an order the confirm submitted is
+       * reported SUBMITTED, whatever becomes of the manifest fetch after it. Today the loop sees it
+       * reported WAITING_FOR_INPUT, the status it had before the confirm, while the mock has it
+       * submitted: a failed fetch after the confirm leaves the order as if the confirm had not run.
+       * The order sits at IDEXX submitted while dmi-api, and the PIMS, wait for input that is not
+       * needed. The positive twin is the test above this describe; the plain test just above reaches
+       * the state this reads. */
+      it.failing('the order is reported SUBMITTED', async () => {
+        expect((await storedOrder(submittedOrderId)).status).toBe('SUBMITTED')
+      })
+    })
+  })
+
   /* ---- dmi-engine-idexx-integration#88 guard ----
    *
    * The integration polls IDEXX's results with one Bull repeat job per integration. Each run GETs
@@ -931,4 +1405,398 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
       }).toEqual({ reportUpdatedEvents: 1 })
     }, 30_000 + 90_000 + (delayMs + 30_000) + 2 * pollMs + 30_000 + 10_000)
   })
+})
+
+/* ---- service control: the broker, Redis and the engine taken away under the loop ----
+ *
+ * Merged changes that make the stack survive losing one of its services, each pinned end to end:
+ * Redis frozen and resumed (dmi-engine-idexx-integration#74), Redis emptied and the operator's
+ * repair pass (dmi-api#346), the broker restarted (dmi-api#367). The faults come from src/services.ts,
+ * scoped to this slot's compose project, each restored in the test's `finally` and again by
+ * `afterEach`, so that a test that fails or times out midway still hands the next one a whole stack.
+ *
+ * Self-contained, and after the loop's own describe: an organization and an integration of its own,
+ * started here and stopped in afterAll. It must be the only idexx integration polling while it runs:
+ * the mock serves its one active results batch to whichever integration polls first (every one uses
+ * the harness's credentials), so another one polling would take this describe's results. The faults
+ * run least disruptive first: the Redis pause, then the flush, whose pass re-registers the polling
+ * jobs whatever the pause left behind, then the broker restart, which needs no polling at all. */
+describe('the loop outlives its broker, Redis and engine going away (service control)', () => {
+  /* The integration's compose service: two replicas (HARNESS_IDEXX_REPLICAS). */
+  const ENGINE = 'dmi-engine-idexx-integration'
+  /* The integration's poll interval, as docker-compose.yml reads it (see the #88 describe above). */
+  const pollMs = Number(process.env.HARNESS_IDEXX_POLL_MS || 3_000)
+
+  const mock = ApiClient.create(env.idexx.mockBaseUrl)
+  let org: SeededOrg
+  let admin: ApiClient
+  let serviceCode: string
+  let deviceSerial: string
+
+  /* An order with this describe's integration, its in-house code and the clinic's analyzer. */
+  async function placeOrder (): Promise<{ orderId: string, requisitionId: string }> {
+    const payload = orderPayload(org.integrationId, { testCodes: [{ code: serviceCode }], devices: [deviceSerial] })
+    const created = expectOk<{ id: string, status: string }>(
+      await org.api.post('/orders', payload, { autoSubmitOrder: true }),
+      'place an idexx order for the service-control tests',
+    )
+    expect(created.status).toBe('SUBMITTED')
+    return { orderId: created.id, requisitionId: payload.requisitionId as string }
+  }
+
+  async function orderStatus (orderId: string): Promise<string | undefined> {
+    return (await org.api.get(`/orders/${orderId}`)).body?.status
+  }
+
+  beforeAll(async () => {
+    /* A run starts with nothing stopped or paused, by this harness or anything else. */
+    await assertStackWhole()
+    /* As in the loop's own beforeAll: only load-bearing for warm reruns (HARNESS_KEEP_UP). */
+    await mock.post('/__control__/reset').catch(() => undefined)
+
+    const catalogue = expectOk<{ list: Array<{ code: string, inHouse: boolean }> }>(
+      await mock.get('/api/v1/ref/tests'),
+      'read the mock orderable-test catalogue',
+    )
+    const inHouse = catalogue.list.find((service) => service.inHouse)
+    if (inHouse == null) throw new Error('the mock catalogue advertises no in-house test code')
+    serviceCode = inHouse.code
+    deviceSerial = expectOk<{ ivlsDeviceList: Array<{ deviceSerialNumber: string }> }>(
+      await mock.get('/api/v1/ivls/devices'),
+      'read the mock IVLS device list',
+    ).ivlsDeviceList[0].deviceSerialNumber
+
+    const root = ApiClient.create()
+    org = await seedOrganization(root, 'idexx-services', {
+      providerId: 'idexx',
+      configuration: {
+        orderingBaseUrl: env.idexx.orderingBaseUrl,
+        resultBaseUrl: env.idexx.resultBaseUrl,
+        'X-Pims-Id': env.idexx.pimsId,
+        'X-Pims-Version': env.idexx.pimsVersion,
+      },
+      integrationOptions: { username: env.idexx.username, password: env.idexx.password, locale: env.idexx.locale },
+    })
+    admin = await adminLogin(root)
+    expectOk(await admin.post(`/admin/integrations/${org.integrationId}/start`), 'start the service-control integration')
+  }, 120_000)
+
+  /* The backstop: whatever a test left stopped or paused, even one jest abandoned on its timeout, is
+   * restored before the next test starts, and the stack is checked whole. */
+  afterEach(async () => {
+    await restoreServices()
+  }, 180_000)
+
+  /* ---- dmi-engine-idexx-integration#74 guard ----
+   *
+   * Since dmi-engine-idexx-integration#74, an integration restart sent while Redis does not answer is
+   * answered, with its failure, within a bound of the integration's own (10 s unless configured
+   * otherwise; the harness leaves it there). Before #74 such a restart got no answer from the
+   * integration at all, and the caller learned nothing until its own engine timeout: in production
+   * 90 s, after which the restart that should have repaired polling had failed without a word from
+   * the engine. Redis is paused, which freezes it with every connection left open, as a Redis that
+   * stops answering does. The restart is asked for by the operator's pass
+   * (`ensure-integration-status`, one attempt, this integration only), run with an engine timeout of
+   * its own well above the integration's bound: the loop's dmi-api waits 10 s, which would race it.
+   * Then Redis resumes, and the next restart must bring polling back.
+   *
+   * Pausing Redis alone, and resuming it, proves nothing here: polling resumes once Redis answers
+   * again, with #74 or without it (that staging passed against the integration with #74's change
+   * taken out). How soon the restart is answered is what #74 changes. */
+  it('with Redis frozen, a restart fails within 20 s instead of hanging, and polling resumes once Redis answers (dmi-engine-idexx-integration#74)', async () => {
+    const faults = serviceFaults()
+    const { orderId, requisitionId } = await placeOrder()
+
+    const passEngineTimeoutMs = 30_000
+    let paused: Disruption
+    let answeredWhilePaused: boolean
+    let frozenPass: DmiApiScriptRun
+    let askedAt: number | undefined
+    let failedAt: number | undefined
+    try {
+      paused = await faults.pause(REDIS)
+      answeredWhilePaused = await redisAnswers(2_000)
+      frozenPass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`, '--attempts=1'], {
+        timeoutMs: passEngineTimeoutMs + 60_000,
+        environment: { ENGINE_RESPONSE_TIMEOUT: String(passEngineTimeoutMs) },
+        onLine: (line) => {
+          /* The pass logs what it found just before it sends the first engine request. */
+          if (askedAt == null && /Found .*integration/.test(line)) askedAt = Date.now()
+          if (failedAt == null && line.includes(org.integrationId) && /fail|error/i.test(line)) failedAt = Date.now()
+        },
+      })
+    } finally {
+      await faults.restore(REDIS)
+    }
+    console.log(`[idexx-scenario] restart while Redis was frozen -> exit ${frozenPass.code}, failed ${failedAt == null || askedAt == null ? '(never)' : `${failedAt - askedAt} ms`} after the request:\n${frozenPass.output.filter((line) => /IntegrationsService|ensuring/.test(line)).join('\n')}`)
+    /* The fault fired: the project's one Redis was paused, and it did not answer while it was. */
+    expect({ containers: paused.containers, answeredWhilePaused }).toEqual({
+      containers: [`${env.composeProject}-redis-1`],
+      answeredWhilePaused: false,
+    })
+    /* THE POINT OF THIS TEST: the engine answered the restart, with its failure, inside its 10 s
+     * bound plus slack, and not at the pass's own timeout at 30 s. */
+    expect({
+      exitCode: frozenPass.code,
+      restartFailed: failedAt != null,
+      answeredWithin20s: failedAt != null && askedAt != null && failedAt - askedAt < 20_000,
+    }).toEqual({ exitCode: 1, restartFailed: true, answeredWithin20s: true })
+
+    /* Redis answers again: the next restart succeeds, and polling resumes — a result seeded now is
+     * delivered. */
+    expect(await redisAnswers(2_000)).toBe(true)
+    const pass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`], { timeoutMs: 120_000 })
+    expect({ exitCode: pass.code, pollingJobs: (await repeatableJobsNaming(org.integrationId)).length }).toEqual({ exitCode: 0, pollingJobs: 2 })
+    expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed a result after Redis resumed')
+    const completed = await pollUntil(async () => await orderStatus(orderId), (status) => status === 'COMPLETED', 60_000, 1_000)
+    expect(completed).toBe('COMPLETED')
+  }, 30_000 + 90_000 + 120_000 + 60_000 + 30_000)
+
+  /* ---- dmi-api#346 guard ----
+   *
+   * An integration's polling jobs live only in Redis: after a cutover to an empty Redis (or a flush,
+   * or an eviction) the integration stays RUNNING in dmi-api with nothing polling, and nothing
+   * re-creates the jobs. `npm run ensure-integration-status` is the operator's repair: it restarts
+   * each integration, so the engine registers its jobs again. dmi-api#346 made it usable for that:
+   * an integration whose restart fails is retried with a backoff, and the pass carries on and reports
+   * it, where before the first failure was the last word. Here the engine misses the pass's first
+   * attempt: both replicas are paused until the pass reports that attempt failed, as an engine that
+   * stops answering for a while (a pod restarted for the cutover) would. The pass must still bring
+   * polling back. Against the pass before dmi-api#346 the attempt that failed is the last one, the
+   * pass exits 0, and nothing polls. */
+  it('after Redis is flushed, ensure-integration-status brings polling back, though the engine misses its first attempt (dmi-api#346)', async () => {
+    const faults = serviceFaults()
+
+    /* The integration's two polling jobs (results and orders), as Bull registers them. */
+    const registered = await repeatableJobsNaming(org.integrationId)
+    const flushed = await faults.flushRedis()
+    const registeredAfter = await repeatableJobsNaming(org.integrationId)
+    expect({ registered: registered.length, keysAfter: flushed.keysAfter, registeredAfter }).toEqual({
+      registered: 2,
+      keysAfter: 0,
+      registeredAfter: [],
+    })
+
+    /* Polling is dead: a result seeded now is not delivered over four poll intervals. */
+    const { orderId, requisitionId } = await placeOrder()
+    expectOk(await mock.post(`/__control__/orders/${requisitionId}/results`, {}), 'seed a result after the flush')
+    await sleep(4 * pollMs)
+    expect(await orderStatus(orderId)).toBe('SUBMITTED')
+
+    /* The pass, for this integration only, with the engine unable to answer until the pass reports
+     * a failed attempt for it. */
+    let unpausing: Promise<void> | undefined
+    let pass: DmiApiScriptRun
+    try {
+      await faults.pause(ENGINE)
+      pass = await runDmiApiScript('ensure-integration-status', [`--integration-id=${org.integrationId}`], {
+        timeoutMs: 120_000,
+        onLine: (line) => {
+          if (unpausing == null && line.includes(org.integrationId) && /fail|error/i.test(line)) unpausing = faults.restore(ENGINE)
+        },
+      })
+    } finally {
+      await unpausing
+      await faults.restore(ENGINE)
+    }
+    const sawFailedAttempt = unpausing != null
+    console.log(`[idexx-scenario] ensure-integration-status -> exit ${pass.code}:\n${pass.output.join('\n')}`)
+    expect({ exitCode: pass.code, sawFailedAttempt }).toEqual({ exitCode: 0, sawFailedAttempt: true })
+    expect({ pollingJobsAfterThePass: (await repeatableJobsNaming(org.integrationId)).length }).toEqual({ pollingJobsAfterThePass: 2 })
+
+    const completed = await pollUntil(async () => await orderStatus(orderId), (status) => status === 'COMPLETED', 60_000, 1_000)
+    expect(completed).toBe('COMPLETED')
+  }, 30_000 + 4 * 3_000 + 120_000 + 60_000 + 30_000)
+
+  /* ---- dmi-api#367 guard ----
+   *
+   * dmi-api's MQTT client subscribes to a pattern's reply channel (`<pattern>/reply`) on demand and
+   * counts the requests in flight on it. Before dmi-api#367 it unsubscribed the channel whenever that
+   * count fell to zero, and subscribed again only when a request found it at zero. A broker outage
+   * breaks the count: a request made while the broker is down never gets its subscription (mqtt.js
+   * fails it with the connection), yet its timeout still counts it out, so from then on the count
+   * runs one below the requests in flight. When the first of two overlapping requests completes,
+   * the channel is unsubscribed under the other, whose reply is lost: dmi-api answers it 504 after
+   * its 10 s. Since dmi-api#367 the client never unsubscribes a reply channel, and subscribes it
+   * again after a timeout.
+   *
+   * So the test sends two device lookups at once, one of them held for 3 s, before the restart: both
+   * are answered, which shows the probe itself works. A lookup made while the broker is stopped is
+   * the one timeout the outage costs. Afterwards a lookup may time out once more, if it is published
+   * before the engine's replicas are back on the broker, and then the overlapping pair is sent again
+   * and both must be answered. Last, an order is placed (placeOrder asserts SUBMITTED, which is the
+   * engine's reply). Against dmi-api before #367 the pair after the restart loses the held lookup. */
+  it('a broker restart leaves the device and order round trips answering, at worst after one timeout (dmi-api#367)', async () => {
+    const faults = serviceFaults()
+    const lookup = async (): Promise<{ status: number, ms: number }> => {
+      const started = Date.now()
+      const response = await org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`)
+      return { status: response.status, ms: Date.now() - started }
+    }
+    /* Two lookups in flight at once, one held: replica 1 of the integration is paused for holdMs, and
+     * the broker hands a shared subscription's messages to its subscribers in turn, so one lookup
+     * waits on the paused replica while the other is answered. */
+    const holdMs = 3_000
+    const overlapping = async (): Promise<Array<{ status: number, ms: number }>> => {
+      let answers: Promise<Array<{ status: number, ms: number }>>
+      try {
+        await faults.pause(ENGINE, { replica: 1 })
+        answers = Promise.all([lookup(), lookup()])
+        await sleep(holdMs)
+      } finally {
+        await faults.restore(ENGINE, { replica: 1 })
+      }
+      return (await answers).sort((a, b) => a.ms - b.ms)
+    }
+
+    const before = await overlapping()
+    console.log(`[idexx-scenario] overlapping lookups before the broker restart -> ${JSON.stringify(before)}`)
+
+    let duringOutage: { status: number, ms: number }
+    try {
+      await faults.stop(BROKER)
+      duringOutage = await lookup()
+    } finally {
+      await faults.restore(BROKER)
+    }
+    /* Afterwards, at worst one more timeout: a request published before the engine's replicas are
+     * back on the broker reaches nobody (they reconnect shortly after dmi-api does). */
+    const after = [await lookup()]
+    if (after[0].status !== 200) after.push(await lookup())
+    const overlappingAfter = await overlapping()
+    console.log(`[idexx-scenario] broker restart -> during ${JSON.stringify(duringOutage)}, after ${JSON.stringify(after)}, overlapping after ${JSON.stringify(overlappingAfter)}`)
+    await placeOrder()
+
+    expect({ before: before.map(({ status }) => status), held: before[1].ms >= holdMs && before[0].ms < holdMs }).toEqual({ before: [200, 200], held: true })
+    expect(duringOutage.status).toBe(504)
+    expect(after.map(({ status }) => status)).toEqual(after.length === 1 ? [200] : [504, 200])
+    expect({ overlappingAfter: overlappingAfter.map(({ status }) => status), held: overlappingAfter[1].ms >= holdMs && overlappingAfter[0].ms < holdMs })
+      .toEqual({ overlappingAfter: [200, 200], held: true })
+  }, 120_000)
+
+  /* ---- dmi-api#399 guard ----
+   *
+   * Before dmi-api#399 a SIGTERM (what every pod stop sends) ended dmi-api at once, and a request in
+   * flight lost its connection. Since, dmi-api handles SIGTERM: it goes on accepting requests for
+   * SHUTDOWN_DELAY_MS (4 s by default) while Kubernetes takes the pod out of the Service, then stops
+   * listening and waits for the requests in flight to be answered, and closes its MQTT clients and
+   * databases only after them, so a request waiting on the engine still gets the engine's reply. A
+   * shutdown still running SHUTDOWN_TIMEOUT_MS (10 s) after the signal exits with code 1. The harness
+   * sets neither variable, so dmi-api runs with both defaults (its src/config/configuration.ts).
+   *
+   * What this asserts is that the answer arrives during the drain, and that dmi-api exits within the
+   * bound dmi-api#399 promises, SHUTDOWN_TIMEOUT_MS after the signal; not whether it exits by the
+   * signal or by the deadline. Every run so far has had the deadline: exit code 1, about 10 s after
+   * the signal, with the lookup answered at about 6.9 s. The lookup's keep-alive connection is busy
+   * when the shutdown begins, so it is not among the idle connections the server closes then, and
+   * the server's close waits on it until the deadline. The same lookup sent with `Connection: close`
+   * lets dmi-api exit by the signal about 20 ms after its answer; with nothing in flight it exits
+   * at about 4 s.
+   *
+   * The request held in flight is a device lookup: one provider call, which the integration gives
+   * IDEXX_HTTP_TIMEOUT_MS (30 s) and dmi-api ENGINE_RESPONSE_TIMEOUT (10 s here). A placement would
+   * not do: its create is capped at IDEXX_CREATE_ORDER_TIMEOUT_MS (5 s, docker-compose.yml), and its
+   * other calls share dmi-api's 10 s with the hold. The mock holds the device list for 7 s, so the
+   * answer comes after dmi-api has stopped listening (about 4 s after the signal, which is sent once
+   * the held call is at the mock) and inside both timeouts.
+   *
+   * Last in the describe: it stops dmi-api, which the restore (in the test's `finally`, and again in
+   * afterEach) starts again before anything else runs. */
+  it('a SIGTERM lets a device lookup in flight finish with its answer, and dmi-api exits within SHUTDOWN_TIMEOUT_MS (dmi-api#399)', async () => {
+    const faults = serviceFaults()
+    const app = appEnv()
+    const engineTimeoutMs = Number(app.ENGINE_RESPONSE_TIMEOUT)
+    const shutdownDelayMs = Number(app.SHUTDOWN_DELAY_MS ?? 4_000)
+    const shutdownTimeoutMs = Number(app.SHUTDOWN_TIMEOUT_MS ?? 10_000)
+    const httpTimeoutMs = Number(process.env.HARNESS_IDEXX_HTTP_TIMEOUT_MS || 30_000)
+    const holdMs = 7_000
+    /* Refused at once, saying why, when the numbers cannot show the drain: the answer must come at
+     * least a second after dmi-api stops listening, and a second before any timeout. */
+    if (!(holdMs >= shutdownDelayMs + 2_000 && holdMs + 1_000 <= Math.min(engineTimeoutMs, shutdownTimeoutMs, httpTimeoutMs))) {
+      throw new Error(
+        `a ${holdMs} ms hold cannot show the drain with SHUTDOWN_DELAY_MS=${shutdownDelayMs}, SHUTDOWN_TIMEOUT_MS=${shutdownTimeoutMs}, ` +
+          `ENGINE_RESPONSE_TIMEOUT=${engineTimeoutMs} and IDEXX_HTTP_TIMEOUT_MS=${httpTimeoutMs}`,
+      )
+    }
+    type Hold = { hits: number, open: number, requests: Array<{ outcome: string, ms: number | null }> }
+    const dmiApiBefore = runningDmiApi()
+
+    const armed = expectOk<{ fault: { id: number } }>(
+      await mock.post('/__control__/scenarios', { key: 'ivlsDevices', fault: 'hold', delayMs: holdMs }),
+      'hold the next device list at the mock',
+    )
+    let hold: Hold | null = null
+    let answer: { status?: number, body?: unknown, error?: string, at: number } | undefined
+    let probe: { listening: boolean, answeredYet: boolean } | undefined
+    let exit: Awaited<ReturnType<typeof faults.stopDmiApi>> | undefined
+    let signalledAt = 0
+    try {
+      const inFlight = org.api.get(`/providers/idexx/devices?integrationId=${org.integrationId}`).then(
+        (response) => ({ status: response.status, body: response.body, at: Date.now() }),
+        (error) => ({ error: `${String(error)}${error?.cause != null ? ` (${String(error.cause)})` : ''}`, at: Date.now() }),
+      )
+      /* In flight: the integration's call has reached the mock, which holds it. */
+      const open = await pollUntil(
+        async () => expectOk<{ faults: Record<string, Hold> }>(await mock.get('/__control__/scenarios'), 'list what is armed at the mock').faults.ivlsDevices?.open,
+        (count) => count === 1,
+        engineTimeoutMs,
+        100,
+      )
+      if (open !== 1) throw new Error('the hold at the mock never took the device lookup')
+
+      signalledAt = Date.now()
+      const exiting = faults.stopDmiApi('SIGTERM')
+      let settled = false
+      void inFlight.then(() => { settled = true })
+      /* A second after the delay, whether dmi-api still takes new connections, and whether the held
+       * lookup has been answered yet. */
+      probe = await sleep(shutdownDelayMs + 1_000).then(async () => ({ listening: await appPortInUse(), answeredYet: settled }))
+      answer = await inFlight
+      exit = await exiting
+    } finally {
+      hold = expectOk<{ fault: Hold | null }>(
+        await mock.delete(`/__control__/scenarios/ivlsDevices?id=${armed.fault.id}`),
+        'disarm the device-list hold',
+      ).fault
+      await faults.restore(DMI_API)
+    }
+    console.log(`[idexx-scenario] SIGTERM with a lookup in flight -> answer ${JSON.stringify({ ...answer, at: (answer?.at ?? 0) - signalledAt })}, probe ${JSON.stringify(probe)}, exit ${JSON.stringify(exit)}, hold ${JSON.stringify(hold)}`)
+
+    /* THE POINT OF THIS TEST: the lookup in flight got its normal answer, the clinic's analyzer. */
+    expect({ status: answer?.status, error: answer?.error, devices: answer?.body }).toEqual({
+      status: 200,
+      error: undefined,
+      devices: [{ serialNumber: deviceSerial, status: 'ACTIVE', name: 'VetLab Station (mock)' }],
+    })
+    /* The hold fired: it took the one lookup, and its answer went out (a hold still open when the
+     * test disarms it is destroyed instead). */
+    expect({ hits: hold?.hits, outcomes: hold?.requests.map((request) => request.outcome) }).toEqual({ hits: 1, outcomes: ['answered'] })
+    /* And it was still in flight when dmi-api had stopped taking connections: the answer came during
+     * the drain, not during the delay. */
+    expect(probe).toEqual({ listening: false, answeredYet: false })
+    /* dmi-api exited after the answer, and within SHUTDOWN_TIMEOUT_MS of the signal: the second
+     * allowed past it is for an exit at the deadline to reach this process (which way it exits is
+     * not asserted; see above). */
+    expect({
+      exited: exit != null,
+      withinShutdownTimeout: exit != null && exit.exitedAfterMs <= shutdownTimeoutMs + 1_000,
+      afterTheAnswer: exit != null && answer != null && signalledAt + exit.exitedAfterMs >= answer.at - 50,
+    }).toEqual({ exited: true, withinShutdownTimeout: true, afterTheAnswer: true })
+
+    /* Started again, and healthy, before anything else runs. */
+    const dmiApiAfter = runningDmiApi()
+    const health = await ApiClient.create().get('/health').then((response) => response.status, (error) => String(error))
+    expect({ restarted: dmiApiAfter != null && dmiApiAfter.pid !== dmiApiBefore?.pid, health }).toEqual({ restarted: true, health: 200 })
+  }, 60_000 + 30_000)
+
+  afterAll(async () => {
+    try {
+      await restoreServices()
+    } finally {
+      if (admin != null && org?.integrationId != null) {
+        await admin.post(`/admin/integrations/${org.integrationId}/stop`).catch(() => undefined)
+      }
+      await closePool()
+    }
+  }, 180_000)
 })

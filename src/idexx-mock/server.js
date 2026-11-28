@@ -2,12 +2,13 @@
 
 /* VetConnect Plus (IDEXX) mock provider for the dmi-e2e full-stack harness. A zero-dependency Node
  * HTTP server that speaks IDEXX's public, documented dialect closely enough for the REAL
- * `dmi-engine-idexx-integration` container to drive it: ordering (`/api/v1/*`), the confirmOrder
- * browser handshake (`/ui` -> HTML+cookie -> XHR PUT), and results (`/api/v3/*`, latest-batch poll
- * + confirm/ack + search). A separate control plane (`/__control__/*`) lets tests seed results,
- * inspect received orders and inject error scenarios so the order->result->report loop is
- * deterministic and CI-safe. It NEVER talks to real IDEXX and never authenticates for real; the
- * integration's dummy Basic credentials and X-Pims-* headers are accepted as-is.
+ * `dmi-engine-idexx-integration` container to drive it: ordering (`/api/v1/*`, the order's form as
+ * a PDF at its `pdfURL` among it), the confirmOrder browser handshake (`/ui` -> HTML+cookie -> XHR
+ * PUT), and results (`/api/v3/*`, latest-batch poll + confirm/ack + search). A separate control
+ * plane (`/__control__/*`) lets tests seed results, inspect received orders and inject error
+ * scenarios so the order->result->report loop is deterministic and CI-safe. It NEVER talks to real
+ * IDEXX and never authenticates for real; the integration's dummy Basic credentials and X-Pims-*
+ * headers are accepted as-is.
  *
  * Control routes: `POST /__control__/orders/:requisitionId/results` seeds a result,
  * `GET /__control__/orders[/:requisitionId]` lists or reads the orders received,
@@ -15,8 +16,12 @@
  * requisition ids of the results it carried, how many results/latest responses carried it, how
  * each confirm of it was answered, and — for an answer held by the `resultsLatestDelay` scenario —
  * how many results/latest requests arrived while it was held), `POST /__control__/scenarios`
- * injects a canned answer or holds one results answer (see handleControlScenario), and
- * `POST /__control__/reset` clears all of it.
+ * injects a canned answer, holds one results answer, or arms a transport fault (see
+ * handleControlScenario), `GET /__control__/scenarios` lists everything armed,
+ * `DELETE /__control__/scenarios/:key` disarms a key, and `POST /__control__/reset` clears all of it.
+ *
+ * Transport faults (hold, reset, stall) come from the module the mocks share, `src/mock-faults`, and
+ * are armed on the keys in FAULT_KEYS.
  *
  * Data: every patient, client, veterinarian and clinic identifier here is INVENTED — no captured
  * clinic or patient data, ever. Provider vocabulary (analyte numbers, analyzer and test codes,
@@ -28,6 +33,7 @@
 
 const http = require('http')
 const crypto = require('crypto')
+const { createFaults } = require('../mock-faults')
 
 const PORT = Number(process.env.PORT || 3000)
 /* Origin baked into the uiURL and pdf/result links the mock hands back. The integration fetches
@@ -53,6 +59,21 @@ function log (message) {
   /* One-line, greppable, prefixed like the harness's other services. */
   console.log(`[idexx-mock] ${message}`)
 }
+
+/* The keys a status scenario can be armed on (handleControlScenario). Anything else is refused: a
+ * scenario on a key no route takes would never fire. */
+const SCENARIO_KEYS = ['authValidate', 'createOrder', 'resultsLatest', 'ivlsDevices', 'resultsLatestDelay']
+
+/* The keys a transport fault can be armed on, each one route: the order create, the three steps of
+ * the confirm handshake (`uiPage` the UI page, `uiOrderGet` the order setup, `uiOrderPut` the
+ * submission), the manifest PDF, the device list, and the results confirm. A fault is wired on a
+ * route only together with a test that uses it; adding one is a line in that route's handler and a
+ * name here. */
+const FAULT_KEYS = ['createOrder', 'uiPage', 'uiOrderGet', 'uiOrderPut', 'manifest', 'ivlsDevices', 'resultsConfirm']
+
+/* Outside the resettable state, like the order ids: POST /__control__/reset disarms every fault and
+ * destroys the connections they hold (see src/mock-faults). */
+const faults = createFaults({ keys: FAULT_KEYS, log })
 
 function uuid () {
   return crypto.randomUUID()
@@ -87,9 +108,10 @@ function freshState () {
     /* The holds whose answer is still being held (see handleResultsLatest); every results/latest
      * request that arrives meanwhile is counted on each of them. */
     held: new Set(),
-    /* Error/edge injection: { [key]: { status, body } }. Keys are logical operation names, e.g.
-     * 'createOrder', 'resultsLatest', 'authValidate', 'ivlsDevices' — plus 'resultsLatestDelay',
-     * { delayMs }, which holds an answer instead of replacing it. */
+    /* Error/edge injection: { [key]: { status, body, once, hits } }. Keys are logical operation
+     * names (SCENARIO_KEYS) — among them 'resultsLatestDelay', { delayMs, once, hits }, which holds
+     * an answer instead of replacing it. `hits` counts the calls a scenario answered; a `once`
+     * scenario leaves this map with its one call. Transport faults are kept apart, by `faults`. */
     scenarios: {},
   }
 }
@@ -144,10 +166,12 @@ function originFor (req) {
 }
 
 /* An injected scenario for `key` short-circuits the handler with a canned status/body. Cleared once
- * consumed when `once` is set, so a test can inject a single transient failure. */
+ * consumed when `once` is set, so a test can inject a single transient failure; one without it
+ * answers every call, counted in `hits`, until it is replaced or disarmed. */
 function takeScenario (key) {
   const scenario = state.scenarios[key]
   if (scenario == null) return null
+  scenario.hits += 1
   if (scenario.once) delete state.scenarios[key]
   return scenario
 }
@@ -155,14 +179,17 @@ function takeScenario (key) {
 /* ---- IDEXX response builders (SYNTHETIC data) ---- */
 
 /* The create-order response the integration expects (`IdexxOrder`). `uiURL` points back at this
- * mock so the confirmOrder browser flow lands here; `pdfURL` is intentionally omitted so the
- * integration skips the binary manifest fetch (kept simple — the loop doesn't need a PDF). */
+ * mock so the confirmOrder browser flow lands here, and so does `pdfURL`, the order's form as a PDF
+ * (the integration's manifest), in the shape IDEXX gives it: `/api/v1/pdf/<order id>` with the
+ * order's token and id in the query string. The origin is the one the order was created through,
+ * kept on the order, so the URL the integration was given is the URL the control plane reports. */
 function buildOrderResponse (order, origin) {
   return {
     idexxOrderId: order.idexxOrderId,
     corporateRequisitionId: order.corporateRequisitionId,
     editable: true,
     status: order.status,
+    pdfURL: order.pdfURL,
     uiURL: `${origin}/ui?token=${order.uiToken}&orderId=${order.idexxOrderId}`,
     veterinarian: order.veterinarian,
     patients: order.patients,
@@ -174,6 +201,41 @@ function buildOrderResponse (order, origin) {
     notes: order.notes ?? '',
     technician: order.technician ?? null,
   }
+}
+
+/* The order's form as IDEXX serves it from `pdfURL`: a real PDF (one page, Helvetica, a valid xref
+ * table), whose text names the order and nothing else. SYNTHETIC: the mock's own wording and the
+ * order's ids, no clinic or patient data. The same bytes for every fetch of one order, so the
+ * control plane can report their digest and a test can compare what dmi-api stored with it. */
+function pdfText (value) {
+  return String(value).replace(/[\\()]/g, (character) => `\\${character}`)
+}
+
+function buildManifestPdf (order) {
+  const lines = [
+    'VetConnect Plus (mock) - order form',
+    `IDEXX order ${order.idexxOrderId}`,
+    `Requisition ${order.corporateRequisitionId}`,
+  ]
+  const text = lines.map((line, i) => `BT /F1 12 Tf 72 ${720 - 18 * i} Td (${pdfText(line)}) Tj ET`).join('\n')
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${Buffer.byteLength(text, 'latin1')} >>\nstream\n${text}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = []
+  objects.forEach((body, i) => {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'))
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`
+  })
+  const xref = Buffer.byteLength(pdf, 'latin1')
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf, 'latin1')
 }
 
 /* Default synthetic result for an order: one Chemistry panel with NUMERIC analytes that exercise
@@ -477,6 +539,7 @@ async function handleAuthValidate (req, res) {
 }
 
 async function handleCreateOrder (req, res) {
+  if (faults.intercept('createOrder', req, res)) return
   const scenario = takeScenario('createOrder')
   if (scenario != null) {
     sendJson(res, scenario.status, scenario.body ?? { message: 'create order failed' })
@@ -497,10 +560,16 @@ async function handleCreateOrder (req, res) {
       ? String(payload.corporateRequisitionId)
       : `VCP-${idexxOrderId}`
 
+  /* One token per order, in both of its URLs, as IDEXX's own carry one. */
+  const uiToken = uuid().replace(/-/g, '')
   const order = {
     idexxOrderId,
     corporateRequisitionId,
-    uiToken: uuid().replace(/-/g, ''),
+    uiToken,
+    pdfURL: `${originFor(req)}/api/v1/pdf/${idexxOrderId}?token=${uiToken}&orderId=${idexxOrderId}`,
+    /* The order's status at each fetch of its PDF the mock answered, oldest first (see
+     * handleManifest). A fetch a transport fault took is the fault's to count, not this list's. */
+    manifestFetches: [],
     /* CREATED maps to WAITING_FOR_INPUT in the integration until confirmOrder submits it; the
      * confirmOrder PUT flips this to SUBMITTED. */
     status: 'CREATED',
@@ -549,6 +618,7 @@ async function handleExternalOrders (req, res) {
 function handleUiPage (req, res) {
   /* Step 1 of confirmOrder: the integration GETs uiURL and harvests Set-Cookie. The body is
    * irrelevant to it; the cookie is what matters (it replays it on the XHR GET/PUT). */
+  if (faults.intercept('uiPage', req, res)) return
   const session = uuid().replace(/-/g, '')
   sendHtml(res, 200, '<!doctype html><title>VetConnect Plus (mock)</title><body>order setup</body>', {
     'set-cookie': `VCPSESSION=${session}; Path=/`,
@@ -559,6 +629,7 @@ async function handleUiOrderGet (req, res, params) {
   /* Step 2: the integration GETs the order-setup payload it will transform and PUT back. It mutates
    * `notes.collectionDate` (so `notes` must be an object) and maps over `tests` (so `tests` must be
    * an array of `{ code, sd }`); the other fields it simply deletes. */
+  if (faults.intercept('uiOrderGet', req, res)) return
   const order = state.orders.get(params.orderId)
   const tests = (order?.tests || []).map((code) => ({ code: String(code), sd: 'ALL' }))
   sendJson(res, 200, {
@@ -581,7 +652,9 @@ async function handleUiOrderGet (req, res, params) {
 
 async function handleUiOrderPut (req, res, params) {
   /* Step 3: the integration PUTs the transformed order to submit it. We record the submission and
-   * return an empty confirm response (no pdfURL, so the integration skips a manifest fetch). */
+   * answer with the order's `pdfURL`, which the integration fetches again once the order is
+   * submitted. Whether the live confirm answers with one has not been probed here. */
+  if (faults.intercept('uiOrderPut', req, res)) return
   await readBody(req)
   const order = state.orders.get(params.orderId)
   if (order != null) {
@@ -589,7 +662,30 @@ async function handleUiOrderPut (req, res, params) {
     order.confirmedAt = nowIso()
     log(`confirmed (submitted) order idexxOrderId=${params.orderId}`)
   }
-  sendJson(res, 200, {})
+  sendJson(res, 200, order != null ? { pdfURL: order.pdfURL } : {})
+}
+
+/* The order's form, at its `pdfURL`. The integration fetches it the way it makes every ordering
+ * call — HTTP Basic and the X-Pims-* headers — with the token and order id the URL carries. Basic is
+ * required, as on auth/validate, and the token must be the order's: a URL rebuilt without it, or
+ * for another order, is answered 404 like an unknown order. The 404 body is this mock's own, as
+ * handleGetOrder's is; IDEXX's answer to a bad PDF token has not been seen. */
+function handleManifest (req, res, params, query) {
+  if (faults.intercept('manifest', req, res)) return
+  const hasBasic = String(req.headers.authorization || '').toLowerCase().startsWith('basic ')
+  if (!hasBasic) {
+    sendJson(res, 401, { valid: false, message: 'missing Basic credentials' })
+    return
+  }
+  const order = state.orders.get(params.orderId)
+  if (order == null || query.get('token') !== order.uiToken || query.get('orderId') !== order.idexxOrderId) {
+    sendJson(res, 404, { code: '404', message: 'Order not found' })
+    return
+  }
+  order.manifestFetches.push(order.status)
+  const pdf = buildManifestPdf(order)
+  res.writeHead(200, { 'content-type': 'application/pdf', 'content-length': pdf.length })
+  res.end(pdf)
 }
 
 /* ---- results handlers (/api/v3) ---- */
@@ -657,6 +753,10 @@ async function handleResultsLatest (req, res) {
 }
 
 async function handleResultsConfirm (req, res, params) {
+  /* A confirm a transport fault takes never reaches the batch: it stays the batch being served, as
+   * a confirm IDEXX never received leaves it there, and the ledger records only the confirms this
+   * route answered. */
+  if (faults.intercept('resultsConfirm', req, res)) return
   await readBody(req)
   const batch = state.activeBatch
   if (batch == null || batch.batchId !== params.batchId) {
@@ -696,6 +796,7 @@ async function handleResultsSearch (req, res, query) {
  * the `ErrorResponse` IDEXX's spec gives this endpoint's 500, under UNKNOWN_ERROR — a code from the
  * spec's list, and the envelope the integration's providerErrorMapper reads. */
 function handleIvlsDevices (req, res) {
+  if (faults.intercept('ivlsDevices', req, res)) return
   const scenario = takeScenario('ivlsDevices')
   if (scenario != null) {
     sendJson(res, scenario.status, scenario.body ?? { errors: [{ errorCode: 'UNKNOWN_ERROR', message: 'device list failed' }] })
@@ -758,6 +859,12 @@ function controlOrderView (order) {
     speciesCode: patient.speciesCode,
     breedCode: patient.breedCode,
     genderCode: patient.genderCode,
+    /* The order's `pdfURL` as the integration was given it, the order's status at each fetch of it
+     * the mock answered, and the SHA-256 of the PDF it serves there, so a scenario can tell which
+     * fetches ran and that dmi-api stored these bytes. */
+    pdfURL: order.pdfURL,
+    manifestFetches: [...order.manifestFetches],
+    pdfSha256: crypto.createHash('sha256').update(buildManifestPdf(order)).digest('hex'),
   }
 }
 
@@ -787,10 +894,32 @@ async function handleControlScenario (req, res) {
    *
    * `resultsLatestDelay` is the one key that holds an answer instead of replacing it:
    * { "key": "resultsLatestDelay", "delayMs": 9000, "once": true } holds the next results/latest
-   * answer that carries a batch for `delayMs` (see handleResultsLatest). */
+   * answer that carries a batch for `delayMs` (see handleResultsLatest). It is not the shared
+   * `hold` below: it waits for the first answer that carries a batch, letting empty polls through,
+   * and the batch ledger counts the polls that reach the mock while it holds, which is what the
+   * dmi-engine-idexx-integration#88 test reads. A `hold` takes the next request, whatever it answers.
+   *
+   * A body with `fault` arms a transport fault instead, on a key in FAULT_KEYS:
+   * { "key": "createOrder", "fault": "hold" | "reset" | "stall", "times": 1, ... } (the options are
+   * src/mock-faults'). It sits beside any status scenario on the same key: a held createOrder
+   * answers late with whatever the route, or its scenario, answers. Arming a key again replaces
+   * what was armed on it. */
   const body = await readBody(req)
   if (typeof body.key !== 'string') {
     sendJson(res, 400, { message: 'scenario requires a string "key"' })
+    return
+  }
+  if (body.fault !== undefined) {
+    const armed = faults.arm(body)
+    if (armed.error != null) {
+      sendJson(res, 400, { message: armed.error })
+      return
+    }
+    sendJson(res, 200, { ok: true, key: body.key, fault: armed.fault })
+    return
+  }
+  if (!SCENARIO_KEYS.includes(body.key)) {
+    sendJson(res, 400, { message: `unknown scenario key '${body.key}': this mock's scenario keys are ${SCENARIO_KEYS.join(', ')}` })
     return
   }
   if (body.key === 'resultsLatestDelay') {
@@ -798,14 +927,44 @@ async function handleControlScenario (req, res) {
       sendJson(res, 400, { message: 'the resultsLatestDelay scenario requires a positive number "delayMs"' })
       return
     }
-    state.scenarios[body.key] = { delayMs: body.delayMs, once: body.once === true }
+    state.scenarios[body.key] = { delayMs: body.delayMs, once: body.once === true, hits: 0 }
   } else {
-    state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true }
+    state.scenarios[body.key] = { status: body.status || 500, body: body.body, once: body.once === true, hits: 0 }
   }
   sendJson(res, 200, { ok: true, scenarios: Object.keys(state.scenarios) })
 }
 
+/* Everything armed in the mock, per key: the status scenarios (`status` or `delayMs`, `once`, `hits`;
+ * a `once` scenario listed here has not been reached yet) and the transport faults (src/mock-faults:
+ * `id`, `fault`, its options, `times`, `hits`, `remaining`, `open`, and what became of each request
+ * it took). A fault stays listed once spent, with what it took, until it is disarmed. */
+function handleControlListScenarios (req, res) {
+  sendJson(res, 200, {
+    scenarios: Object.fromEntries(
+      Object.entries(state.scenarios).map(([key, { body, ...scenario }]) => [key, scenario]),
+    ),
+    faults: faults.list(),
+  })
+}
+
+/* Disarm a key: its status scenario and its transport fault, with every connection the fault still
+ * holds or stalls. `?id=<n>` disarms the fault only while it is that arming (src/mock-faults), so a
+ * late cleanup cannot disarm a later test's fault. 200 either way; the answer carries what was
+ * disarmed, the fault with its final hits, or null for each. */
+function handleControlClearScenario (req, res, params, query) {
+  const id = query.get('id')
+  const scenario = id == null ? state.scenarios[params.key] ?? null : null
+  if (scenario != null) delete state.scenarios[params.key]
+  const fault = faults.disarm(params.key, id == null ? undefined : Number(id))
+  if (scenario != null) log(`control: scenario '${params.key}' cleared`)
+  sendJson(res, 200, {
+    scenario: scenario == null ? null : (({ body, ...rest }) => rest)(scenario),
+    fault,
+  })
+}
+
 function handleControlReset (req, res) {
+  faults.reset()
   state = freshState()
   log('state reset')
   sendJson(res, 200, { ok: true })
@@ -833,6 +992,7 @@ const routes = [
     sendJson(res, 200, refList(Object.entries(SPECIES_NAMES).map(([code, name]) => ({ code, name }))))],
   ['GET', /^\/api\/v1\/ref\/tests$/, (req, res) => sendJson(res, 200, refList(SERVICE_CATALOGUE))],
   ['GET', /^\/api\/v1\/ivls\/devices$/, handleIvlsDevices],
+  ['GET', /^\/api\/v1\/pdf\/(?<orderId>[^/]+)$/, handleManifest],
 
   ['GET', /^\/ui$/, handleUiPage],
   ['GET', /^\/ui\/order\/(?<orderId>[^/]+)$/, handleUiOrderGet],
@@ -847,6 +1007,8 @@ const routes = [
   ['GET', /^\/__control__\/orders\/(?<requisitionId>[^/]+)$/, handleControlGetOrder],
   ['GET', /^\/__control__\/batches$/, handleControlListBatches],
   ['POST', /^\/__control__\/scenarios$/, handleControlScenario],
+  ['GET', /^\/__control__\/scenarios$/, handleControlListScenarios],
+  ['DELETE', /^\/__control__\/scenarios\/(?<key>[^/]+)$/, handleControlClearScenario],
   ['POST', /^\/__control__\/reset$/, handleControlReset],
 ]
 
