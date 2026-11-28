@@ -498,7 +498,9 @@ create timeout, with a create held past it (`HARNESS_IDEXX_CREATE_ORDER_TIMEOUT_
 fetch that no longer fails the create;
 [dmi-engine-idexx-integration#83](https://github.com/nominal-systems/dmi-engine-idexx-integration/pull/83)'s
 named transport errors, with a create reset or stalled and a device list cut short after its headers;
-a failed confirm step that still reports the created order; a failed results confirm, whose batch a
+a failed confirm step that still reports the created order, `WAITING_FOR_INPUT` with IDEXX's id, as
+[dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)
+decided; a failed results confirm, whose batch a
 later poll delivers again and confirms, and which the PIMS sees as one `report:updated`
 ([dmi-api#409](https://github.com/nominal-systems/dmi-api/issues/409)); and
 [dmi-engine-idexx-integration#93](https://github.com/nominal-systems/dmi-engine-idexx-integration/issues/93)'s

@@ -1088,27 +1088,31 @@ describe('idexx full-stack (VetConnect Plus mock)', () => {
     }, 30_000)
 
     /* A failed step of the confirm handshake does not fail the create: the order exists at IDEXX
-     * by then, and failing would lose its id. dmi-engine-idexx-integration#93 calls that much right
-     * and leaves the rest open — what status the caller gets, and how the failure is made visible —
-     * so this asserts only the settled part: 201, with IDEXX's id stored. Each of the three steps in
-     * turn, each failing with a reset. */
+     * by then, and failing would lose its id. dmi-engine-idexx-integration#93 decided the caller's
+     * side (2026-11-27): no contract change, so the create keeps answering 201 with IDEXX's id and
+     * the status IDEXX gave the order, `WAITING_FOR_INPUT`, since it was never submitted. The fix
+     * the issue defers makes the failure visible to an operator and records it in the audit trail;
+     * that record can be asserted here once it exists. Each of the three steps in turn, each failing
+     * with a reset. */
     it.each([
       ['uiPage', 'the UI page'],
       ['uiOrderGet', 'the order setup'],
       ['uiOrderPut', 'the submission'],
-    ])('an auto-submitted order whose confirm step %s (%s) fails is still created, with IDEXX\'s id', async (key) => {
+    ])('an auto-submitted order whose confirm step %s (%s) fails is still created, with IDEXX\'s id and WAITING_FOR_INPUT', async (key) => {
       const { payload, requisitionId } = placement()
 
       const { result: response, fault } = await withFault(
         { key, fault: 'reset' },
         async () => await org.api.post('/orders', payload, { autoSubmitOrder: true }),
       )
-      console.log(`[idexx-scenario] create with a failed ${key} -> HTTP ${response.status}: ${response.text.slice(0, 200)}`)
+      console.log(`[idexx-scenario] create with a failed ${key} -> HTTP ${response.status}: status ${response.body?.status}, externalId ${response.body?.externalId}`)
       const provider = await atIdexx(requisitionId)
 
-      expect({ status: response.status, externalId: response.body?.externalId }).toEqual({ status: 201, externalId: provider.idexxOrderId })
+      expect({ status: response.status, orderStatus: response.body?.status, externalId: response.body?.externalId })
+        .toEqual({ status: 201, orderStatus: 'WAITING_FOR_INPUT', externalId: provider.idexxOrderId })
       expect(fired(fault)).toEqual({ hits: 1, outcomes: ['reset'] })
-      expect((await storedOrder(response.body.id)).externalId).toBe(provider.idexxOrderId)
+      const stored = await storedOrder(response.body.id)
+      expect({ externalId: stored.externalId, status: stored.status }).toEqual({ externalId: provider.idexxOrderId, status: 'WAITING_FOR_INPUT' })
     }, 30_000)
 
     /* Regression guard (dmi-api#409, fixed in dmi-api#410), through IDEXX's results confirm: a
