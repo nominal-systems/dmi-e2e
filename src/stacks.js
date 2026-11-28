@@ -37,8 +37,10 @@ const stacks = {
     composeProfile: 'idexx',
     /* The sibling checkouts this loop's containers are built from: for a loop like this one, the
      * real integration's repo; for a loop hosted by a shared engine container, the host repo plus
-     * the provider module(s) injected into it. Each variable overrides that checkout's location,
-     * with the same default docker-compose.yml uses, and the run report records every one of them.
+     * the provider module(s) injected into it. The first is always the repo the image is built
+     * from (the run report reads its lockfile for the published dmi-engine-common version). Each
+     * variable overrides that checkout's location, with the same default docker-compose.yml uses,
+     * and the run report records every one of them.
      * Several loops may list the same checkout (same repo, same variable): the nightly pulls it
      * once, and `verifyStacks()` refuses a variable that names different repos in different loops. */
     checkouts: [{ repo: 'dmi-engine-idexx-integration', dirVariable: 'DMI_IDEXX_INTEGRATION_DIR' }],
@@ -141,6 +143,89 @@ const stacks = {
 
 /* The loop HARNESS_FULL_STACK=1 runs when HARNESS_STACK is unset. */
 const defaultStack = 'idexx'
+
+/* dmi-engine-common, the library every loop's integration code is built on. It is no loop's
+ * checkout: each image installs it from GitHub Packages at the version its lockfile pins. It is
+ * built from a checkout only on request, when `dirVariable` names one (README, "Running a common
+ * candidate"), and so it is in no entry's `checkouts` — the nightly would pull it, every workflow
+ * would have to set it, and every slot tree would carry it. Every loop honours the variable:
+ * docker-compose.yml builds the engine image against it itself, and `composeFile` is the override
+ * the harness adds for the images built from their own repos' Dockerfiles. `service`, `context` and
+ * `setArg` name where compose's own resolution of the variable can be read back (see
+ * composeCommonCheckout below). */
+const commonCheckout = {
+  repo: 'dmi-engine-common',
+  dirVariable: 'DMI_ENGINE_COMMON_DIR',
+  composeFile: 'docker-compose.common-checkout.yml',
+  service: 'dmi-engine-api',
+  context: 'engine-common',
+  setArg: 'COMMON_CHECKOUT',
+}
+
+/* DMI_ENGINE_COMMON_DIR as compose resolves it, read back from compose rather than re-derived: the
+ * engine service rendered by `docker compose config` (a named service renders whatever profiles are
+ * active), its `engine-common` build context and its COMMON_CHECKOUT build arg, which compose sets
+ * to 1 exactly when the variable is set and not empty. Compose takes the variable from the
+ * environment, else from the project's .env in any form it accepts there (`export`, `KEY: value`,
+ * quotes, the last of several definitions), so no second reading of .env can disagree with what it
+ * builds. Every loop honours it, the standalone images included: the harness adds their override
+ * exactly when this says the variable is set, and the override interpolates the same variable with
+ * the same rule for an empty value. Returns the context's absolute path when set, else undefined.
+ * @param {string} harnessRoot @param {NodeJS.ProcessEnv} [environment]
+ * @returns {string | undefined} */
+function composeCommonCheckout (harnessRoot, environment = process.env) {
+  const { service, context, setArg, dirVariable } = commonCheckout
+  const build = composeConfig(harnessRoot, ['config', '--format', 'json', service], environment, `how it resolves ${dirVariable}`)
+    .services?.[service]?.build
+  if (typeof build?.additional_contexts?.[context] !== 'string') {
+    throw new Error(`docker compose config renders no '${context}' build context on ${service}: the compose file predates ${dirVariable}`)
+  }
+  return build.args?.[setArg] === '1' ? build.additional_contexts[context] : undefined
+}
+
+/* The services a loop would build without the checkout `dir`, as compose renders the loop with the
+ * override the harness adds for it (`-f <composeFile> --profile <profile>`). Every image built from
+ * outside dmi-e2e must have `dir` as its build context or as an additional one; dmi-e2e's own (the
+ * broker, the mocks) are not meant to, and an override's `<service>-published` base is covered by the
+ * image built FROM it (`service:<name>`). A loop with no block in the override is named here, so a
+ * run can be refused before its report records a checkout that loop's image never got.
+ * @param {string} harnessRoot @param {string} profile @param {string} dir
+ * @param {NodeJS.ProcessEnv} [environment]
+ * @returns {string[]} */
+function composeBuildsWithoutCommon (harnessRoot, profile, dir, environment = process.env) {
+  const args = ['-f', path.join(harnessRoot, commonCheckout.composeFile), '--profile', profile, 'config', '--format', 'json']
+  const services = Object.entries(composeConfig(harnessRoot, args, environment, `which images the ${profile} loop builds`).services ?? {})
+  const contexts = (build) => [build.context, ...Object.values(build.additional_contexts ?? {})].filter((value) => typeof value === 'string')
+  const bases = new Set(services.flatMap(([, { build }]) => build == null ? [] : contexts(build))
+    .filter((value) => value.startsWith('service:'))
+    .map((value) => value.slice('service:'.length)))
+  const inHarness = (context) => {
+    const relative = path.relative(harnessRoot, path.resolve(context))
+    return !relative.startsWith('..') && !path.isAbsolute(relative)
+  }
+  const target = path.resolve(dir)
+  return services
+    .filter(([name, { build }]) => build != null && !bases.has(name) && !inHarness(build.context) &&
+      !contexts(build).some((value) => !value.startsWith('service:') && path.resolve(value) === target))
+    .map(([name]) => name)
+}
+
+/* `docker compose -f docker-compose.yml <args>` with `environment` (so compose reads the project's
+ * .env as it would for a run), parsed as the JSON `config --format json` prints. `question` says, in
+ * the error, what the harness was asking. */
+function composeConfig (harnessRoot, args, environment, question) {
+  /* eslint-disable-next-line @typescript-eslint/no-var-requires */
+  const { execFileSync } = require('child_process')
+  const full = ['compose', '-f', path.join(harnessRoot, 'docker-compose.yml'), ...args]
+  let rendered
+  try {
+    rendered = execFileSync('docker', full, { cwd: harnessRoot, env: environment, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (error) {
+    /* stderr is '' (not null) when compose failed without a word, and null when docker never ran. */
+    throw new Error(`could not ask compose ${question} (docker compose ${args.join(' ')}): ${String(error.stderr ?? '').trim() || error.message}`)
+  }
+  return JSON.parse(rendered)
+}
 
 /* Validates a raw HARNESS_STACK value against the registry. Both parsers — jest.config.js and
  * src/env.ts — go through here, so an unknown value is refused by both; one can no longer
@@ -271,6 +356,19 @@ function verifyStacks () {
     }
   }
 
+  /* The common checkout must be an input to the engine build and to the override, or setting its
+   * variable would record a checkout in the run report that some image was not built from. */
+  const override = path.join(root, commonCheckout.composeFile)
+  if (!compose.includes(`\${${commonCheckout.dirVariable}`)) problems.push(`commonCheckout: ${commonCheckout.dirVariable} is referenced by no build context in docker-compose.yml`)
+  if (!compose.includes(`${commonCheckout.setArg}: \${${commonCheckout.dirVariable}:+1}`)) {
+    problems.push(`commonCheckout: docker-compose.yml passes no ${commonCheckout.setArg}: \${${commonCheckout.dirVariable}:+1} build arg, which the harness reads back`)
+  }
+  if (!fs.existsSync(override)) {
+    problems.push(`commonCheckout: no ${commonCheckout.composeFile}`)
+  } else if (!fs.readFileSync(override, 'utf8').includes(`\${${commonCheckout.dirVariable}`)) {
+    problems.push(`commonCheckout: ${commonCheckout.composeFile} does not build from ${commonCheckout.dirVariable}`)
+  }
+
   /* The validator itself: a registry whose gate stopped throwing would pass everything above. */
   let refused = false
   try { resolveStack('no-such-stack') } catch { refused = true }
@@ -281,12 +379,18 @@ function verifyStacks () {
   }
 }
 
-module.exports = { stacks, defaultStack, resolveStack, suiteName, verifyStacks }
+module.exports = { stacks, defaultStack, commonCheckout, composeCommonCheckout, composeBuildsWithoutCommon, resolveStack, suiteName, verifyStacks }
 
-/* CLI for shell callers (scripts/nightly.sh), so no script re-derives what the registry knows:
+/* CLI for shell callers (scripts/nightly.sh, scripts/slot-tree.sh), so no script re-derives what
+ * the registry knows:
  *   node src/stacks.js list                → one key per line
  *   node src/stacks.js checkouts <key>     → one "<repo> <dirVariable>" line per checkout the loop
  *                                            is built from — exit 1 naming the key if unknown
+ *   node src/stacks.js common              → "<repo> <dirVariable> <composeFile>" of the opt-in
+ *                                            dmi-engine-common checkout
+ *   node src/stacks.js common-dir [<dir>]  → the checkout compose would build the engine against
+ *                                            from the dmi-e2e checkout <dir> (default: this one),
+ *                                            or nothing when DMI_ENGINE_COMMON_DIR is unset there
  *   node src/stacks.js check               → verifyStacks(), exit 1 with the problems if any */
 if (require.main === module) {
   const [command, key] = process.argv.slice(2)
@@ -296,11 +400,16 @@ if (require.main === module) {
     } else if (command === 'checkouts') {
       const { checkouts } = stacks[resolveStack(key)]
       console.log(checkouts.map(({ repo, dirVariable }) => `${repo} ${dirVariable}`).join('\n'))
+    } else if (command === 'common') {
+      console.log(`${commonCheckout.repo} ${commonCheckout.dirVariable} ${commonCheckout.composeFile}`)
+    } else if (command === 'common-dir') {
+      const dir = composeCommonCheckout(path.resolve(key ?? path.join(__dirname, '..')))
+      if (dir != null) console.log(dir)
     } else if (command === 'check') {
       verifyStacks()
       console.log(`stack registry ok: ${Object.keys(stacks).join(', ')}`)
     } else {
-      throw new Error('usage: node src/stacks.js list | checkouts <key> | check')
+      throw new Error('usage: node src/stacks.js list | checkouts <key> | common | common-dir [<dir>] | check')
     }
   } catch (error) {
     console.error(error.message)

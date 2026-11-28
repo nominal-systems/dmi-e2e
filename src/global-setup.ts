@@ -1,9 +1,10 @@
 import { ChildProcess } from 'child_process'
 import { assertProjectIsOurs, composeUp, runMigrations, waitForDependencies } from './containers'
 import { assertAppPortFree, startDmiApi } from './dmi-api'
-import { env } from './env'
+import { commonUnderTest, env } from './env'
 import { beginRun } from './report/report'
 import { acquireSlot, releaseSlot } from './slots'
+import { commonCheckout } from './stacks'
 
 /* Jest runs globalSetup and globalTeardown in the same process, so the app handle can be parked
  * on globalThis for teardown to reclaim. Test files run in workers and never see it. */
@@ -37,6 +38,8 @@ async function setUp (log: (message: string) => void): Promise<void> {
   const run = beginRun()
   log(`suite '${run.suite}' — under test: ${Object.entries(run.versions).map(([name, version]) => `${name} ${version}`).join(', ')}`)
   log(`from: ${Object.entries(run.locations ?? {}).map(([name, location]) => `${name} ${location}`).join(', ')}`)
+  const ignored = commonUnderTest().ignored
+  if (ignored != null) log(`${commonCheckout.dirVariable} is set (compose resolves it to ${ignored}), but the fast suite builds no image: ignored`)
 
   /* Before minutes of containers and migrations: a port taken now would only fail the run later. */
   if (env.manageApp) await assertAppPortFree()

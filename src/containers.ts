@@ -1,9 +1,10 @@
 import { execFile, spawn } from 'child_process'
 import { realpathSync } from 'fs'
 import * as net from 'net'
+import * as path from 'path'
 import { promisify } from 'util'
-import { appEnv, env, mockBaseUrlFor, requireDmiApiDir } from './env'
-import { stacks } from './stacks'
+import { appEnv, commonUnderTest, env, mockBaseUrlFor, requireDmiApiDir } from './env'
+import { commonCheckout, stacks } from './stacks'
 import { waitForMysql } from './sql'
 
 /* Lifecycle for the dependency stack (MySQL, Mongo, ActiveMQ) and for dmi-api's schema
@@ -112,6 +113,10 @@ function composeProfile (): string {
 
 function composeBaseArgs (): string[] {
   const args = ['compose', '-f', env.composeFile]
+  /* Against a dmi-engine-common checkout, the images built from their own repos' Dockerfiles take
+   * it from the override; docker-compose.yml builds the engine image against it itself. Whether
+   * there is one is compose's own answer (commonUnderTest), so the two cannot disagree. */
+  if (env.fullStack && commonUnderTest().checkout != null) args.push('-f', path.join(env.harnessRoot, commonCheckout.composeFile))
   if (env.fullStack) args.push('--profile', composeProfile())
   return args
 }

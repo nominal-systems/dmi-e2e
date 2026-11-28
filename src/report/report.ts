@@ -12,8 +12,8 @@ import {
   writeFileSync,
 } from 'fs'
 import * as path from 'path'
-import { env } from '../env'
-import { stacks } from '../stacks'
+import { commonUnderTest, env } from '../env'
+import { commonCheckout, stacks } from '../stacks'
 
 /* Run reports.
  *
@@ -103,6 +103,8 @@ const HISTORY_MAX = 60
 const HISTORY_SHOWN = 20
 /* Commit links: every checkout under test lives in this GitHub organisation. */
 const GITHUB_ORG = 'nominal-systems'
+/* The "under test" line for the dmi-engine-common dmi-api runs with, kept apart from the images'. */
+const DMI_API_COMMON = 'dmi-engine-common in dmi-api'
 
 function git (dir: string, args: string[]): string | undefined {
   try {
@@ -131,6 +133,15 @@ export function versionsUnderTest (): Record<string, string> {
   /* Every checkout the registry lists for the loop — one for a self-contained integration, the
    * host engine plus the injected provider modules for a loop hosted by a shared container. */
   for (const checkout of env.checkouts) versions[checkout.name] = describeCheckout(checkout.dir)
+  /* dmi-engine-common as the images got it: a checkout like the others, or the published package —
+   * as compose resolves DMI_ENGINE_COMMON_DIR (commonUnderTest). */
+  const common = commonUnderTest()
+  if (common.checkout != null) versions[commonCheckout.repo] = describeCheckout(common.checkout.dir)
+  else if (common.published != null) versions[commonCheckout.repo] = `published ${common.published}`
+  else if (common.unknown != null) versions[commonCheckout.repo] = common.unknown
+  /* dmi-api's own copy, a line apart from the images': the harness runs dmi-api from its checkout's
+   * node_modules, so DMI_ENGINE_COMMON_DIR never changes it. */
+  if (env.dmiApiCommon != null) versions[DMI_API_COMMON] = env.dmiApiCommon.version
   return versions
 }
 
@@ -143,6 +154,10 @@ export function locationsUnderTest (): Record<string, string> {
   for (const checkout of env.checkouts) {
     locations[checkout.name] = `${checkout.dir}${checkout.fromVariable != null ? ` (${checkout.fromVariable})` : ''}`
   }
+  const common = commonUnderTest()
+  if (common.checkout != null) locations[commonCheckout.repo] = `${common.checkout.dir} (${common.checkout.fromVariable})`
+  else if (common.published != null) locations[commonCheckout.repo] = `GitHub Packages (${commonCheckout.dirVariable} unset)`
+  if (env.dmiApiCommon != null) locations[DMI_API_COMMON] = env.dmiApiCommon.location
   return locations
 }
 
@@ -216,9 +231,9 @@ function recordHistory (dir: string, run: RunInfo | undefined, summary: Summary 
  * summary beside a fresh run.json — the index shows such a run as incomplete instead. The run also
  * enters the history now, as incomplete, so a night that died early is still a grey mark later. */
 export function beginRun (): RunInfo {
-  const dir = suiteDir(env.report.dir, env.suite)
-  mkdirSync(dir, { recursive: true })
-  for (const stale of ['summary.json', 'index.html']) rmSync(path.join(dir, stale), { force: true })
+  /* What is under test first: reading it can refuse the run (a DMI_ENGINE_COMMON_DIR that names no
+   * checkout, compose failing to answer), and a refused run must leave the previous run's report as
+   * it was, not half-cleared under the previous run.json. */
   const run: RunInfo = {
     suite: env.suite,
     startedAt: new Date().toISOString(),
@@ -227,6 +242,9 @@ export function beginRun (): RunInfo {
     composeProject: env.composeProject,
     locations: locationsUnderTest(),
   }
+  const dir = suiteDir(env.report.dir, env.suite)
+  mkdirSync(dir, { recursive: true })
+  for (const stale of ['summary.json', 'index.html']) rmSync(path.join(dir, stale), { force: true })
   writeJson(path.join(dir, 'run.json'), run)
   recordHistory(dir, run, undefined)
   return run
@@ -351,7 +369,7 @@ function commitOf (version: string): string | undefined {
 function versionLink (name: string, version: string): string {
   const sha = commitOf(version)
   const text = escapeHtml(version)
-  if (sha == null) return text
+  if (sha == null) return /\s/.test(version) ? `<span class="prose">${text}</span>` : text
   return `<a href="https://github.com/${GITHUB_ORG}/${encodeURIComponent(name)}/commit/${sha}">${text}</a>`
 }
 
@@ -565,6 +583,11 @@ ${reports.map(testsBlock).join('\n')}`
   .badge.passed { background: var(--ok); } .badge.failed { background: var(--bad); } .badge.incomplete { background: var(--muted); }
   .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
   .versions { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; white-space: nowrap; }
+  /* A version given as a sentence (dmi-api's common, one the report cannot vouch for) wraps, under
+   * its own first line, rather than widening the table past the window; every other row stays one. */
+  .versions > div { padding-left: 1.5em; text-indent: -1.5em; }
+  .versions .chg { text-indent: 0; }
+  .versions .prose { white-space: normal; }
   .versions a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
   .versions a:hover { border-bottom-style: solid; }
   .chg { display: inline-block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .7rem; font-weight: 700; color: var(--warn); background: var(--warn-bg); border-radius: .3rem; padding: 0 .35rem; margin-left: .25rem; vertical-align: middle; }

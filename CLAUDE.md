@@ -131,7 +131,11 @@ that reading is wrong, mock and integration agree on a fiction and the test is g
   the real engine, as prod runs it (an `api` process for the MQTT handlers, a `worker` for the
   polling jobs), from one image that packs each module from its sibling checkout and installs it
   over the engine's published dependency. Test the working trees, not what `npm install` would
-  fetch; list every checkout in the registry entry so the run report records them all; the engine
+  fetch; list every checkout in the registry entry so the run report records them all (the one
+  deliberate exception is dmi-engine-common, an opt-in checkout through `DMI_ENGINE_COMMON_DIR` that
+  is `commonCheckout` in `src/stacks.js`, not in any entry, so that the nightly, the workflows and
+  slot trees do not take it up unasked; the report records it, or the published version, either
+  way); the engine
   has no health endpoint, so readiness is the mock's `/status` and the scenario's first poll wait
   absorbs the engine's start. Ref data for such a provider is seeded the operator's way — read it
   through the engine (`GET /refs/<kind>/<providerId>`), map it over the admin API — never from
